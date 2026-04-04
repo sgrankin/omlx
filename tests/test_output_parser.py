@@ -487,7 +487,7 @@ class TestGemma4OutputParserSession:
         full_stream = "".join(stream)
         full_visible = "".join(visible)
 
-        assert full_stream == "<think>\nreasoning</think>\nfinal answer"
+        assert full_stream == "<think>reasoning</think>final answer"
         assert full_visible == full_stream
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
@@ -506,7 +506,7 @@ class TestGemma4OutputParserSession:
             parts.append(session.process_token(token_id).stream_text)
         parts.append(session.finalize().stream_text)
 
-        assert "".join(parts) == "<think>\n</think>\nanswer"
+        assert "".join(parts) == "<think></think>answer"
 
     def test_partial_marker_across_tokens(self):
         token_map = {
@@ -525,7 +525,7 @@ class TestGemma4OutputParserSession:
         parts.append(session.finalize().stream_text)
 
         text = "".join(parts)
-        assert text == "<think>\nstep 1 and step 2</think>\ndone"
+        assert text == "<think>step 1 and step 2</think>done"
         assert "<|channel>thought" not in text
         assert "<channel|>" not in text
 
@@ -549,7 +549,7 @@ class TestGemma4OutputParserSession:
         parts.append(session.finalize().stream_text)
 
         text = "".join(parts)
-        assert text == "<think>\nreasoning</think>\nanswer"
+        assert text == "<think>reasoning</think>answer"
         assert "<turn|>" not in text
 
     def test_stray_close_marker_outside_thought_dropped(self):
@@ -573,7 +573,7 @@ class TestGemma4OutputParserSession:
         parts.append(session.finalize().stream_text)
 
         text = "".join(parts)
-        assert text == "<think>\nreasoning</think>\nanswermore"
+        assert text == "<think>reasoning</think>answermore"
         assert "<channel|>" not in text
 
     def test_prefilled_thought_closes_before_visible_content(self):
@@ -620,9 +620,9 @@ class TestGemma4OutputParserSession:
         parts.append(session.finalize().stream_text)
 
         text = "".join(parts)
-        assert text == "<think>\nstep 1step 2</think>\nanswer"
-        assert text.count("<think>\n") == 1
-        assert text.count("</think>\n") == 1
+        assert text == "<think>step 1step 2</think>answer"
+        assert text.count("<think>") == 1
+        assert text.count("</think>") == 1
 
     def test_tool_call_markers_pass_through(self):
         """Tool-call markup must reach the buffered output text untouched so
@@ -980,8 +980,8 @@ class TestOutputParserFactory:
         visible.append(final.visible_text)
 
         assert saw_stop is True
-        assert "<think>\n" in "".join(stream)
-        assert "</think>\n" in "".join(stream)
+        assert "<think>" in "".join(stream)
+        assert "</think>" in "".join(stream)
         assert "".join(visible) == "Answer"
 
     def test_harmony_non_streaming_preserves_reasoning(self):

@@ -17,8 +17,8 @@ _CLOSE_MARKER = "<channel|>"
 _TURN_END_MARKER = "<turn|>"
 _TOOL_RESPONSE_OPEN = "<|tool_response>"
 _TOOL_RESPONSE_CLOSE = "<tool_response|>"
-_THINK_OPEN = "<think>\n"
-_THINK_CLOSE = "</think>\n"
+_THINK_OPEN = "<think>"
+_THINK_CLOSE = "</think>"
 
 _LEADING_THOUGHT_RE = re.compile(
     r"\A\s*(?:(?:<think>.*?</think>|<\|channel>.*?<channel\|>)\s*)+",
