@@ -313,7 +313,7 @@ class TestGemma4OutputParserSession:
             "<|channel>thought\nreasoning\n<channel|>final answer",
             final=True,
         )
-        assert result.visible_text == "<think>\nreasoning\n</think>\nfinal answer"
+        assert result.visible_text == "<think>reasoning\n</think>final answer"
         assert sess._in_thought is False
 
     def test_empty_thought_block_per_spec(self):
@@ -322,7 +322,7 @@ class TestGemma4OutputParserSession:
         result = sess._consume_text(
             "<|channel>thought\n<channel|>the answer", final=True
         )
-        assert result.visible_text == "<think>\n</think>\nthe answer"
+        assert result.visible_text == "<think></think>the answer"
 
     def test_no_newline_open_marker_defensive(self):
         """``<|channel>thought<channel|>`` with no newline is recovered via
@@ -331,7 +331,7 @@ class TestGemma4OutputParserSession:
         result = sess._consume_text(
             "<|channel>thought<channel|>after", final=True
         )
-        assert result.visible_text == "<think>\n</think>\nafter"
+        assert result.visible_text == "<think></think>after"
 
     def test_bare_open_with_non_thought_channel(self):
         """A bare ``<|channel>X<channel|>`` (unknown channel name) is wrapped
@@ -340,7 +340,7 @@ class TestGemma4OutputParserSession:
         result = sess._consume_text(
             "<|channel>X<channel|>after", final=True
         )
-        assert result.visible_text == "<think>\nX</think>\nafter"
+        assert result.visible_text == "<think>X</think>after"
 
     def test_streaming_canonical_split_at_marker_boundary(self):
         """Open marker arriving across two chunks must still match canonical."""
@@ -353,7 +353,7 @@ class TestGemma4OutputParserSession:
             "thought\nreasoning\n<channel|>answer", final=True
         )
         assert r1.visible_text + r2.visible_text == (
-            "<think>\nreasoning\n</think>\nanswer"
+            "<think>reasoning\n</think>answer"
         )
 
     def test_streaming_defer_prefers_canonical_over_bare(self):
@@ -364,7 +364,7 @@ class TestGemma4OutputParserSession:
         assert r1.visible_text == ""
         r2 = sess._consume_text("\nreasoning\n<channel|>answer", final=True)
         assert r1.visible_text + r2.visible_text == (
-            "<think>\nreasoning\n</think>\nanswer"
+            "<think>reasoning\n</think>answer"
         )
 
     def test_stray_close_marker_dropped(self):
@@ -391,8 +391,8 @@ class TestGemma4OutputParserSession:
         first = sess._consume_text("<|channel>thought\nincomplete reasoning")
         final = sess.finalize()
         combined = first.visible_text + final.visible_text
-        assert "<think>\n" in combined
-        assert combined.endswith("</think>\n")
+        assert "<think>" in combined
+        assert combined.endswith("</think>")
         assert sess._in_thought is False
 
     def test_double_bare_open_does_not_re_emit_think(self):
@@ -405,6 +405,6 @@ class TestGemma4OutputParserSession:
             final=True,
         )
         # Exactly one <think> opener despite two <|channel>... opens.
-        assert result.visible_text.count("<think>\n") == 1
-        assert result.visible_text.count("</think>\n") == 1
+        assert result.visible_text.count("<think>") == 1
+        assert result.visible_text.count("</think>") == 1
         assert result.visible_text.endswith("after")
