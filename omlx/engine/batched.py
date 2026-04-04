@@ -194,6 +194,52 @@ class BatchedEngine(BaseEngine):
             return preprocess_harmony_messages(messages)
         return messages
 
+    @staticmethod
+    def _inject_tool_calling(tokenizer) -> None:
+        """Inject tool calling support if mlx-lm's load missed it.
+
+        mlx-lm's TokenizerWrapper only detects parsers known to mlx-lm.
+        This adds fallback detection via mlx-vlm's extended patterns
+        (e.g. gemma4 ``<|tool_call>``).
+        """
+        if getattr(tokenizer, "has_tool_calling", False):
+            return  # Already set by mlx-lm
+
+        chat_template = getattr(tokenizer, "chat_template", None)
+        if not chat_template:
+            return
+
+        try:
+            from mlx_vlm.tool_parsers import _infer_tool_parser, load_tool_module
+        except ImportError:
+            return
+
+        tool_parser_type = _infer_tool_parser(chat_template)
+        if tool_parser_type is None:
+            return
+
+        try:
+            tool_module = load_tool_module(tool_parser_type)
+        except (ImportError, ModuleNotFoundError):
+            logger.warning(f"Tool parser module not found: {tool_parser_type}")
+            return
+
+        tool_call_start = tool_module.tool_call_start
+        tool_call_end = tool_module.tool_call_end
+
+        # Validate tokens exist in vocab
+        vocab = tokenizer.get_vocab()
+        if (tool_call_start and tool_call_start not in vocab) or (
+            tool_call_end and tool_call_end not in vocab
+        ):
+            return
+
+        tokenizer._tool_call_start = tool_call_start
+        tokenizer._tool_call_end = tool_call_end
+        tokenizer._tool_parser = tool_module.parse_tool_call
+
+        logger.info(f"Text tool calling enabled: parser={tool_parser_type}")
+
     async def start(self) -> None:
         """Start the engine (load model if not loaded)."""
         if self._loaded:
@@ -246,6 +292,9 @@ class BatchedEngine(BaseEngine):
         self._model, self._tokenizer = await loop.run_in_executor(
             get_mlx_executor(), _load_model_sync
         )
+
+        # Inject tool calling support if mlx-lm missed it (e.g. gemma4)
+        self._inject_tool_calling(self._tokenizer)
 
         # Apply post-load transforms (e.g., IndexCache for DSA models)
         from ..utils.model_loading import apply_post_load_transforms
