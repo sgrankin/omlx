@@ -116,3 +116,6 @@ omlx/admin/tailwindcss-*
 
 # UV lockfile
 uv.lock
+
+# direnv
+.envrc
