@@ -59,6 +59,19 @@ class ContentBlockThinking(BaseModel):
     signature: str | None = None
 
 
+class ContentBlockRedactedThinking(BaseModel):
+    """Redacted thinking content block.
+
+    Clients echo these back when the original thinking content was
+    stripped or redacted.  omlx ignores the payload but must accept
+    the block so that multi-turn conversations don't 422.
+    """
+
+    type: Literal["redacted_thinking"] = "redacted_thinking"
+    data: str = ""
+    signature: str | None = None
+
+
 class ContentBlockDocument(BaseModel):
     """Document content block (PDF, plain text)."""
 
@@ -77,6 +90,7 @@ ContentBlock = (
     | ContentBlockToolUse
     | ContentBlockToolResult
     | ContentBlockThinking
+    | ContentBlockRedactedThinking
     | ContentBlockDocument
 )
 
