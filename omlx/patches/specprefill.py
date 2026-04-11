@@ -96,9 +96,14 @@ def _accepts_extractor_kwargs(extractor, kwargs) -> bool:
 def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
     """Qwen3.5: gate split + q_norm + RoPE."""
     B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
     q_out = attn.q_proj(x)
     queries, _gate = mx.split(
-        q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
+        q_out.reshape(B, L, n_heads, -1), 2, axis=-1
     )
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
     if cache is not None:
