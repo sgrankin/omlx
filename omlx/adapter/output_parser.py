@@ -9,8 +9,10 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
+import os
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -1289,6 +1291,7 @@ def detect_output_parser(
     if is_gemma4_model(model_name, model_config):
         from .gemma4 import (
             _CLOSE_MARKER,
+            _Gemma4LegacyOutputParserSession,
             _OPEN_MARKER_BARE,
             _TOOL_RESPONSE_CLOSE,
             _TOOL_RESPONSE_OPEN,
@@ -1296,12 +1299,29 @@ def detect_output_parser(
             Gemma4OutputParserSession,
         )
 
+        # OMLX_GEMMA4_PARSER=legacy keeps the old text-based parser for
+        # A/B comparison. Default ("new" or unset) uses the token-ID
+        # streaming parser with parse_response() tool-call extraction.
+        flag = os.environ.get("OMLX_GEMMA4_PARSER", "new").strip().lower()
+        if flag == "legacy":
+            logger.info("gemma4 parser: using legacy text-based session")
+            session_cls: Callable[[Any], OutputParserSession] = functools.partial(
+                _Gemma4LegacyOutputParserSession, model_path=session_model_path
+            )
+        else:
+            if flag not in ("new", ""):
+                logger.warning(
+                    "OMLX_GEMMA4_PARSER=%r not recognized; falling back to "
+                    "'new'. Expected 'new' or 'legacy'.",
+                    flag,
+                )
+            # The token-ID parser keys off special-token IDs only — it needs
+            # no streaming detokenizer, hence no model_path.
+            session_cls = Gemma4OutputParserSession
+
         return OutputParserFactory(
             kind="gemma4",
-            create_session=lambda session_tokenizer: Gemma4OutputParserSession(
-                session_tokenizer,
-                model_path=session_model_path,
-            ),
+            create_session=session_cls,
             stop_token_ids=set(),
             thinking_start_text="<|channel>thought",
             thinking_start_output_text="<think>\n",

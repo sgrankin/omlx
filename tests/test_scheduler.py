@@ -5137,17 +5137,25 @@ class TestOutputParserSmoke:
             self.last_segment = ""
 
     class _GemmaTokenizer:
-        def __init__(self, token_map):
+        def __init__(self, token_map, marker_ids=None):
             self._token_map = token_map
+            self._marker_ids = marker_ids or {}
+            self._id_to_marker = {tid: name for name, tid in self._marker_ids.items()}
             self.eos_token_id = 2
             self.pad_token_id = 0
             self.bos_token_id = 1
 
+        def _decode_one(self, token_id):
+            if token_id in self._id_to_marker:
+                return self._id_to_marker[token_id]
+            return self._token_map.get(token_id, "")
+
         @property
         def detokenizer(self):
-            return TestOutputParserSmoke._Detokenizer(
-                lambda token_id: self._token_map[token_id]
-            )
+            return TestOutputParserSmoke._Detokenizer(self._decode_one)
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return self._marker_ids.get(token, -1)
 
         def encode(self, text: str, add_special_tokens: bool = True):
             if text == "\n":
@@ -5159,7 +5167,14 @@ class TestOutputParserSmoke:
             return [10]
 
         def decode(self, token_ids, skip_special_tokens: bool = True):
-            return "".join(self._token_map.get(token_id, "") for token_id in token_ids)
+            parts = []
+            for tid in token_ids:
+                if tid in self._id_to_marker:
+                    if not skip_special_tokens:
+                        parts.append(self._id_to_marker[tid])
+                    continue
+                parts.append(self._token_map.get(tid, ""))
+            return "".join(parts)
 
     class _DeepSeekV4Tokenizer(_GemmaTokenizer):
         has_tool_calling = True
@@ -5174,14 +5189,19 @@ class TestOutputParserSmoke:
     def test_gemma4_session_selected_and_markers_hidden(self, mock_model):
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
-            {
-                11: "<|channel>",
-                12: "thought\n",
-                13: "reasoning",
-                14: "<channel|>",
+            token_map={
+                12: "thought",
+                13: "\n",
+                14: "reasoning",
                 15: "answer",
-                16: "<turn|>",
-            }
+            },
+            marker_ids={
+                "<|channel>": 100,
+                "<channel|>": 101,
+                "<turn|>": 106,
+                "<|tool_call>": 48,
+                "<tool_call|>": 49,
+            },
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -5206,24 +5226,26 @@ class TestOutputParserSmoke:
         scheduler.request_id_to_uid[request.request_id] = 99
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 100, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 12, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 101, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "length"})(),
+            type("Resp", (), {"uid": 99, "token": 106, "finish_reason": "length"})(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
         assert finished_ids == {"gemma-req"}
         assert outputs[-1].finished is True
-        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+        assert outputs[-1].output_text == "<think>reasoning</think>answer"
 
         full_stream = "".join(output.new_text for output in outputs)
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
-        assert full_stream == "<think>\nreasoning</think>\nanswer"
+        assert "<turn|>" not in full_stream
+        assert full_stream == "<think>reasoning</think>answer"
 
     def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
         """Tool continuations open the thought channel in the prompt.
