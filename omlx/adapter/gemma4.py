@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from typing import Any, List
 
@@ -14,6 +15,8 @@ except ImportError:
 
 from ..api.utils import _PRESERVE_BOUNDARY_KEY
 from .output_parser import OutputParserFinalizeResult, OutputParserTokenResult
+
+logger = logging.getLogger(__name__)
 
 _OPEN_MARKER = "<|channel>thought\n"
 _OPEN_MARKER_BARE = "<|channel>"
@@ -283,8 +286,14 @@ def _matching_prefix_len(text: str, marker: str) -> int:
     return 0
 
 
-class Gemma4OutputParserSession:
-    """Suppress Gemma 4 protocol markers and re-emit thought blocks as ``<think>`` tags."""
+class _Gemma4LegacyOutputParserSession:
+    """Legacy text-based parser. Kept behind a flag for A/B comparison.
+
+    Pattern-matches decoded marker strings. Has a structural limitation:
+    reasoning content that happens to contain the literal marker strings
+    (e.g. the model writing about ``<channel|>``) is misread as a state
+    transition. Prefer ``Gemma4OutputParserSession`` which keys off special
+    token IDs and can't be fooled by regular-token text."""
 
     def __init__(self, tokenizer: Any):
         self._tokenizer = tokenizer
@@ -473,4 +482,325 @@ class Gemma4OutputParserSession:
         return OutputParserFinalizeResult(
             stream_text=stream_text,
             visible_text=visible_text,
+        )
+
+
+_CHANNEL_OPEN_TOKEN = "<|channel>"
+_CHANNEL_CLOSE_TOKEN = "<channel|>"
+_TURN_END_TOKEN = "<turn|>"
+_TOOL_CALL_OPEN_TOKEN = "<|tool_call>"
+_TOOL_CALL_CLOSE_TOKEN = "<tool_call|>"
+
+
+def _resolve_token_id(tokenizer: Any, token: str) -> int | None:
+    """Look up a special-token ID by string, rejecting UNK collisions.
+
+    HF fast tokenizers return ``unk_token_id`` (a positive int) when a token
+    isn't in the vocabulary. Without filtering that out, a model whose
+    tokenizer is missing the Gemma 4 marker strings would collapse every
+    marker onto the same UNK id and route every generated UNK token into the
+    state machine. Return ``None`` in that case so the parser treats the
+    marker as absent and degrades to a plain passthrough.
+    """
+    try:
+        tid = tokenizer.convert_tokens_to_ids(token)
+    except Exception:
+        return None
+    if not isinstance(tid, int) or tid < 0:
+        return None
+    unk = getattr(tokenizer, "unk_token_id", None)
+    if unk is not None and tid == unk:
+        return None
+    return tid
+
+
+def _normalize_parse_response_tool_calls(parsed: dict) -> list[dict[str, str]]:
+    """Convert ``tokenizer.parse_response`` tool_calls to scheduler shape.
+
+    parse_response (Gemma 4 schema) returns::
+
+        [{"type": "function",
+          "function": {"name": str, "arguments": dict}}]
+
+    The scheduler and OpenAI/Anthropic response builders expect::
+
+        [{"name": str, "arguments": <json-string>}]
+    """
+    raw = parsed.get("tool_calls") if isinstance(parsed, dict) else None
+    if not raw:
+        return []
+    normalized: list[dict[str, str]] = []
+    for entry in raw:
+        if not isinstance(entry, dict):
+            continue
+        func = entry.get("function")
+        if not isinstance(func, dict):
+            continue
+        name = func.get("name") or ""
+        arguments = func.get("arguments", {})
+        if not isinstance(arguments, str):
+            try:
+                arguments = json.dumps(arguments)
+            except (TypeError, ValueError):
+                arguments = "{}"
+        normalized.append({"name": str(name), "arguments": arguments})
+    return normalized
+
+
+class Gemma4OutputParserSession:
+    """Token-ID streaming parser for Gemma 4.
+
+    Keys off the special-token IDs for ``<|channel>``, ``<channel|>``,
+    ``<turn|>``, ``<|tool_call>``, ``<tool_call|>`` rather than the decoded
+    text. That makes it immune to collisions where reasoning content contains
+    the literal marker strings — special and regular token IDs live in disjoint
+    spaces, so a state transition can't be forged by regular text.
+
+    After ``<|channel>`` the model emits ``thought\\n`` as regular tokens;
+    those are buffered in a header state until the first newline, then
+    ``<think>`` is emitted and subsequent thought content streams through.
+    If generation stops before the newline arrives (max-tokens mid-header),
+    finalize emits the buffered content wrapped in think tags so nothing
+    is silently dropped.
+
+    At finalize, the full raw token stream is decoded and handed to
+    ``tokenizer.parse_response`` so tool calls extracted from the
+    ``response_schema`` ``x-regex-iterator`` / ``x-parser`` chain flow through
+    as ``OutputParserFinalizeResult.tool_calls``. Works only when the tokenizer
+    ships a ``response_schema``; otherwise tool-call extraction is a no-op and
+    streaming behavior is unchanged.
+    """
+
+    _STATE_NORMAL = 0
+    _STATE_HEADER = 1
+    _STATE_THOUGHT = 2
+
+    def __init__(self, tokenizer: Any):
+        self._tokenizer = tokenizer
+
+        self._channel_open_id = _resolve_token_id(tokenizer, _CHANNEL_OPEN_TOKEN)
+        self._channel_close_id = _resolve_token_id(tokenizer, _CHANNEL_CLOSE_TOKEN)
+        self._turn_end_id = _resolve_token_id(tokenizer, _TURN_END_TOKEN)
+        self._tool_call_open_id = _resolve_token_id(tokenizer, _TOOL_CALL_OPEN_TOKEN)
+        self._tool_call_close_id = _resolve_token_id(tokenizer, _TOOL_CALL_CLOSE_TOKEN)
+
+        self._marker_ids = {
+            tid
+            for tid in (
+                self._channel_open_id,
+                self._channel_close_id,
+                self._turn_end_id,
+                self._tool_call_open_id,
+                self._tool_call_close_id,
+            )
+            if tid is not None
+        }
+
+        missing = [
+            name
+            for name, tid in (
+                (_CHANNEL_OPEN_TOKEN, self._channel_open_id),
+                (_CHANNEL_CLOSE_TOKEN, self._channel_close_id),
+                (_TURN_END_TOKEN, self._turn_end_id),
+            )
+            if tid is None
+        ]
+        if missing:
+            logger.warning(
+                "gemma4 parser: tokenizer missing marker tokens %s; streaming "
+                "marker suppression will degrade to passthrough",
+                ", ".join(missing),
+            )
+
+        self._state = self._STATE_NORMAL
+        self._in_tool_call = False
+        self._header_buffer = ""
+        self._raw_token_ids: list[int] = []
+
+        if hasattr(tokenizer, "detokenizer"):
+            self._detokenizer = tokenizer.detokenizer
+        elif NaiveStreamingDetokenizer is not None:
+            self._detokenizer = NaiveStreamingDetokenizer(tokenizer)
+        else:
+            self._detokenizer = None
+
+        if self._detokenizer is not None:
+            self._detokenizer.reset()
+
+    def _decode_token(self, token_id: int) -> str:
+        if self._detokenizer is not None:
+            self._detokenizer.add_token(token_id)
+            return self._detokenizer.last_segment
+        return self._tokenizer.decode([token_id])
+
+    def process_token(self, token_id: int) -> OutputParserTokenResult:
+        self._raw_token_ids.append(token_id)
+
+        if token_id in self._marker_ids:
+            return self._handle_marker(token_id)
+
+        text = self._decode_token(token_id)
+        if not text:
+            return OutputParserTokenResult()
+
+        if self._in_tool_call:
+            return OutputParserTokenResult()
+
+        if self._state == self._STATE_HEADER:
+            self._header_buffer += text
+            newline_idx = self._header_buffer.find("\n")
+            if newline_idx < 0:
+                return OutputParserTokenResult()
+            after = self._header_buffer[newline_idx + 1 :]
+            self._header_buffer = ""
+            self._state = self._STATE_THOUGHT
+            emitted = _THINK_OPEN + after
+            return OutputParserTokenResult(stream_text=emitted, visible_text=emitted)
+
+        return OutputParserTokenResult(stream_text=text, visible_text=text)
+
+    def _handle_marker(self, token_id: int) -> OutputParserTokenResult:
+        # Tool-call bracketing trumps channel state. Entering a tool call
+        # while we have a pending think block closes it cleanly; channel
+        # markers are ignored entirely while inside a tool call so weird
+        # model interleavings can't corrupt the state machine.
+        if token_id == self._tool_call_open_id:
+            stream = visible = ""
+            if self._state == self._STATE_THOUGHT:
+                stream = visible = _THINK_CLOSE
+            self._state = self._STATE_NORMAL
+            self._header_buffer = ""
+            self._in_tool_call = True
+            return OutputParserTokenResult(stream_text=stream, visible_text=visible)
+
+        if token_id == self._tool_call_close_id:
+            self._in_tool_call = False
+            return OutputParserTokenResult()
+
+        if self._in_tool_call:
+            return OutputParserTokenResult()
+
+        if token_id == self._channel_open_id:
+            # Consecutive ``<|channel>`` while already in THOUGHT: close the
+            # prior block first so the emitted stream stays well-formed.
+            stream = visible = ""
+            if self._state == self._STATE_THOUGHT:
+                stream = visible = _THINK_CLOSE
+            self._state = self._STATE_HEADER
+            self._header_buffer = ""
+            return OutputParserTokenResult(stream_text=stream, visible_text=visible)
+
+        if token_id == self._channel_close_id:
+            if self._state == self._STATE_THOUGHT:
+                self._state = self._STATE_NORMAL
+                return OutputParserTokenResult(
+                    stream_text=_THINK_CLOSE,
+                    visible_text=_THINK_CLOSE,
+                )
+            if self._state == self._STATE_HEADER:
+                # Header never saw its newline terminator. Emit whatever
+                # was buffered as thought content rather than dropping it.
+                body = _THINK_OPEN + self._header_buffer + _THINK_CLOSE
+                self._state = self._STATE_NORMAL
+                self._header_buffer = ""
+                return OutputParserTokenResult(stream_text=body, visible_text=body)
+            return OutputParserTokenResult()
+
+        if token_id == self._turn_end_id:
+            return OutputParserTokenResult()
+
+        # Unreachable: _marker_ids only contains the five ids resolved above.
+        return OutputParserTokenResult()
+
+    def _finalize_detokenizer(self) -> str:
+        if self._detokenizer is None:
+            return ""
+        try:
+            self._detokenizer.finalize()
+        except Exception:
+            return ""
+        return self._detokenizer.last_segment or ""
+
+    def _extract_tool_calls(self) -> list[dict[str, str]]:
+        parse_response = getattr(self._tokenizer, "parse_response", None)
+        if parse_response is None:
+            return []
+        if not getattr(self._tokenizer, "response_schema", None):
+            return []
+        if not self._raw_token_ids:
+            return []
+        # Must keep special tokens in the decoded string so parse_response's
+        # x-regex can find the <|tool_call>...<tool_call|> brackets. If the
+        # tokenizer wrapper doesn't accept the kwarg, skipping specials would
+        # silently produce empty tool_calls — surface it instead of guessing.
+        try:
+            full_text = self._tokenizer.decode(
+                self._raw_token_ids, skip_special_tokens=False
+            )
+        except Exception:
+            logger.warning(
+                "gemma4: tokenizer.decode(skip_special_tokens=False) failed; "
+                "tool-call extraction skipped",
+                exc_info=True,
+            )
+            return []
+        try:
+            parsed = parse_response(full_text)
+        except Exception:
+            logger.warning(
+                "gemma4: tokenizer.parse_response() raised; "
+                "tool-call extraction skipped",
+                exc_info=True,
+            )
+            return []
+        if not isinstance(parsed, dict):
+            return []
+        return _normalize_parse_response_tool_calls(parsed)
+
+    def finalize(self) -> OutputParserFinalizeResult:
+        trailing = self._finalize_detokenizer()
+        stream_text = ""
+        visible_text = ""
+
+        if trailing:
+            if self._in_tool_call:
+                pass  # suppressed
+            elif self._state == self._STATE_HEADER:
+                self._header_buffer += trailing
+                newline_idx = self._header_buffer.find("\n")
+                if newline_idx >= 0:
+                    after = self._header_buffer[newline_idx + 1 :]
+                    self._header_buffer = ""
+                    self._state = self._STATE_THOUGHT
+                    stream_text += _THINK_OPEN + after
+                    visible_text += _THINK_OPEN + after
+            else:
+                stream_text += trailing
+                visible_text += trailing
+
+        # Unterminated header (e.g. max-tokens hit before the header newline
+        # arrived): emit whatever is buffered wrapped in think tags rather
+        # than dropping it silently. Better to show partial reasoning than
+        # lose it.
+        if self._state == self._STATE_HEADER:
+            if self._header_buffer:
+                body = _THINK_OPEN + self._header_buffer + _THINK_CLOSE
+                stream_text += body
+                visible_text += body
+            self._header_buffer = ""
+            self._state = self._STATE_NORMAL
+
+        if self._state == self._STATE_THOUGHT:
+            stream_text += _THINK_CLOSE
+            visible_text += _THINK_CLOSE
+            self._state = self._STATE_NORMAL
+
+        tool_calls = self._extract_tool_calls()
+        finish_reason = "tool_calls" if tool_calls else None
+
+        return OutputParserFinalizeResult(
+            stream_text=stream_text,
+            visible_text=visible_text,
+            tool_calls=tool_calls,
+            finish_reason=finish_reason,
         )

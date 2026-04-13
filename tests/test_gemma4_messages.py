@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 from omlx.adapter.gemma4 import (
-    Gemma4OutputParserSession,
+    _Gemma4LegacyOutputParserSession,
     _strip_thinking,
     extract_gemma4_messages,
 )
@@ -300,11 +300,11 @@ class _FakeTokenizer:
         return ""
 
 
-class TestGemma4OutputParserSession:
+class TestGemma4LegacyOutputParserSession:
     """Output parser converts Gemma 4 channel markers to ``<think>`` tags."""
 
     def _make_session(self):
-        return Gemma4OutputParserSession(_FakeTokenizer())
+        return _Gemma4LegacyOutputParserSession(_FakeTokenizer())
 
     def test_canonical_thought_block_per_spec(self):
         """``<|channel>thought\\n[reasoning]<channel|>[answer]`` per Gemma 4 spec."""

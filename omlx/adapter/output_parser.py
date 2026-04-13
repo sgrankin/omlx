@@ -9,6 +9,8 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import logging
+import os
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Protocol
 
@@ -19,6 +21,8 @@ except ImportError:
 
 from .harmony import HarmonyStreamingParser, parse_tool_calls_from_tokens
 from ..utils.tokenizer import is_gemma4_model, is_harmony_model
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -158,11 +162,32 @@ def detect_output_parser(
         )
 
     if is_gemma4_model(model_name, model_config):
-        from .gemma4 import Gemma4OutputParserSession
+        from .gemma4 import (
+            Gemma4OutputParserSession,
+            _Gemma4LegacyOutputParserSession,
+        )
+
+        # OMLX_GEMMA4_PARSER=legacy keeps the old text-based parser for
+        # A/B comparison. Default ("new" or unset) uses the token-ID
+        # streaming parser with parse_response() tool-call extraction.
+        flag = os.environ.get("OMLX_GEMMA4_PARSER", "new").strip().lower()
+        if flag == "legacy":
+            logger.info("gemma4 parser: using legacy text-based session")
+            session_cls: Callable[[Any], OutputParserSession] = (
+                _Gemma4LegacyOutputParserSession
+            )
+        else:
+            if flag not in ("new", ""):
+                logger.warning(
+                    "OMLX_GEMMA4_PARSER=%r not recognized; falling back to "
+                    "'new'. Expected 'new' or 'legacy'.",
+                    flag,
+                )
+            session_cls = Gemma4OutputParserSession
 
         return OutputParserFactory(
             kind="gemma4",
-            create_session=Gemma4OutputParserSession,
+            create_session=session_cls,
             stop_token_ids=set(),
         )
 

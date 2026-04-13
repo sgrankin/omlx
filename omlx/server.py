@@ -2334,9 +2334,10 @@ async def create_chat_completion(
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-        # For other models, parse from text output
-        if engine.model_type == "gpt_oss" and output.tool_calls:
+        # When a protocol parser already extracted tool_calls (Harmony gpt-oss,
+        # Gemma 4 via parse_response), use them directly. Otherwise parse from
+        # text output.
+        if engine.model_type in ("gpt_oss", "gemma4") and output.tool_calls:
             from .api.openai_models import ToolCall, FunctionCall
             tool_calls = [
                 ToolCall(
@@ -3637,9 +3638,10 @@ async def create_anthropic_message(
         thinking_content, regular_content = extract_thinking(raw_text)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
-        # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
-        # For other models, parse from text output
-        if engine.model_type == "gpt_oss" and output.tool_calls:
+        # When a protocol parser already extracted tool_calls (Harmony gpt-oss,
+        # Gemma 4 via parse_response), use them directly. Otherwise parse from
+        # text output.
+        if engine.model_type in ("gpt_oss", "gemma4") and output.tool_calls:
             from .api.openai_models import ToolCall, FunctionCall
             tool_calls = [
                 ToolCall(
@@ -4049,7 +4051,7 @@ async def create_response(
         )
 
         # Parse tool calls
-        if engine.model_type == "gpt_oss" and output.tool_calls:
+        if engine.model_type in ("gpt_oss", "gemma4") and output.tool_calls:
             tool_calls = output.tool_calls
             cleaned_text = regular_content
         else:
