@@ -371,6 +371,51 @@ class TestGemma4OutputParserSession:
         assert stream == "<think>first</think><think>second</think>answer"
         assert stream.count("<think>") == stream.count("</think>")
 
+    def test_malformed_header_metadata_discarded(self):
+        """Header tokens containing garbage before the newline are discarded.
+
+        Regression: Gemma 4 was observed emitting
+        ``<|channel>thought|thought\\n <channel|>`` instead of the canonical
+        ``<|channel>thought\\n ... <channel|>``. The HEADER state buffers
+        all regular tokens until the first newline and discards them as
+        channel-name metadata, so garbled metadata never reaches the visible
+        stream. Content after the newline (even a lone space) becomes the
+        thought body.
+        """
+        tok = TokenIdGemmaTokenizer(
+            token_map={
+                200: "thought|thought\n ",  # whole header+leading space in one token
+                201: "In the OpenAI Chat Completions API.",
+            },
+            marker_ids=_GEMMA4_MARKER_IDS,
+        )
+        stream, visible, _ = self._run(tok, [100, 200, 101, 201, 106])
+        # Visible answer preserved verbatim.
+        assert "In the OpenAI Chat Completions API." in visible
+        # No raw channel markers leak through.
+        assert "<|channel>" not in stream
+        assert "<channel|>" not in stream
+        # Garbage metadata up to \n is stripped; only the trailing space
+        # survives as thought content.
+        assert "thought|thought" not in stream
+        assert stream == "<think> </think>In the OpenAI Chat Completions API."
+
+    def test_malformed_header_metadata_split_across_tokens(self):
+        """Garbled header split across multiple tokens still discards pre-\\n content."""
+        tok = TokenIdGemmaTokenizer(
+            token_map={
+                200: "thought",
+                201: "|thought",
+                202: "\n",
+                203: "answer",
+            },
+            marker_ids=_GEMMA4_MARKER_IDS,
+        )
+        stream, _, _ = self._run(tok, [100, 200, 201, 202, 101, 203, 106])
+        # Everything before \n discarded as metadata; thought body empty.
+        assert stream == "<think></think>answer"
+        assert "thought|thought" not in stream
+
     def test_unterminated_header_at_finalize_emits_buffered_content(self):
         """Generation cut off mid-header does not silently lose content."""
         tok = TokenIdGemmaTokenizer(
@@ -536,7 +581,7 @@ class TestGemma4LegacyOutputParserSession:
             6: "more",
         }
         tokenizer = GemmaTokenizer(token_map)
-        session = Gemma4OutputParserSession(tokenizer)
+        session = _Gemma4LegacyOutputParserSession(tokenizer)
 
         parts = []
         for token_id in [1, 2, 3, 4, 5, 6]:
@@ -560,7 +605,7 @@ class TestGemma4LegacyOutputParserSession:
             6: "answer",
         }
         tokenizer = GemmaTokenizer(token_map)
-        session = Gemma4OutputParserSession(tokenizer)
+        session = _Gemma4LegacyOutputParserSession(tokenizer)
 
         parts = []
         for token_id in [1, 2, 3, 4, 5, 6]:
