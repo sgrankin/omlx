@@ -49,7 +49,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 from fastapi import Depends, FastAPI, HTTPException, Request as FastAPIRequest
 from fastapi.middleware.cors import CORSMiddleware
@@ -153,7 +153,7 @@ from .api.tool_calling import (
     parse_tool_calls_with_thinking_fallback,
     sanitize_tool_call_markup,
 )
-from .api.thinking import ThinkingParser, extract_thinking
+from .api.thinking import ThinkingParser, extract_thinking, prompt_ends_in_open_think
 from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
@@ -975,6 +975,38 @@ def get_sampling_params(
         f"{f' (model: {model_id})' if model_id else ''}"
     )
     return temperature, top_p, top_k, repetition_penalty, min_p, presence_penalty, frequency_penalty, max_tokens, xtc_probability, xtc_threshold
+
+
+def _resolve_initially_thinking(
+    engine: Any,
+    messages: list,
+    kwargs: dict,
+) -> bool:
+    """Check whether the chat-templated prompt ends with an unclosed ``<think>``.
+
+    Qwen3-family templates append ``<think>\\n`` to the assistant prefix when
+    thinking is on; generation then starts already inside the think block and
+    never emits the opener. Downstream parsers need to know this so they can
+    attribute the opening stream to reasoning rather than content.
+
+    Safe to call on any engine — returns False if the template can't be
+    rendered or doesn't use think tags.
+    """
+    tokenizer = getattr(engine, "tokenizer", None)
+    if tokenizer is None or not hasattr(tokenizer, "apply_chat_template"):
+        return False
+    template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+    if kwargs.get("tools"):
+        template_kwargs["tools"] = kwargs["tools"]
+    if kwargs.get("chat_template_kwargs"):
+        template_kwargs.update(kwargs["chat_template_kwargs"])
+    try:
+        prompt = tokenizer.apply_chat_template(messages, **template_kwargs)
+    except Exception:
+        return False
+    if not isinstance(prompt, str):
+        return False
+    return prompt_ends_in_open_think(prompt)
 
 
 def _resolve_thinking_budget(request, model_id: str | None) -> int | None:
@@ -2331,7 +2363,8 @@ async def create_chat_completion(
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
-        thinking_content, regular_content = extract_thinking(raw_text)
+        initially_thinking = _resolve_initially_thinking(engine, messages, chat_kwargs)
+        thinking_content, regular_content = extract_thinking(raw_text, initially_thinking)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
         # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser
@@ -2770,7 +2803,8 @@ async def stream_chat_completion(
     last_output = None
     accumulated_text = ""
     has_tools = bool(kwargs.get("tools"))
-    thinking_parser = ThinkingParser()
+    initially_thinking = _resolve_initially_thinking(engine, messages, kwargs)
+    thinking_parser = ThinkingParser(start_in_thinking=initially_thinking)
 
     response_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
@@ -2924,7 +2958,7 @@ async def stream_chat_completion(
     elif has_tools and accumulated_text:
         # Separate thinking from content, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(accumulated_text, initially_thinking)
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -3099,7 +3133,8 @@ async def stream_anthropic_messages(
     accumulated_text = ""
 
     # Track content blocks with thinking separation
-    thinking_parser = ThinkingParser()
+    initially_thinking = _resolve_initially_thinking(engine, messages, kwargs)
+    thinking_parser = ThinkingParser(start_in_thinking=initially_thinking)
     thinking_block_started = False
     text_block_started = False
     block_index = 0
@@ -3301,7 +3336,7 @@ async def stream_anthropic_messages(
     elif kwargs.get("tools"):
         # Non-Harmony: separate thinking, then parse tool calls from content
         # (falls back to thinking content for small models)
-        thinking_content, regular_content = extract_thinking(accumulated_text)
+        thinking_content, regular_content = extract_thinking(accumulated_text, initially_thinking)
         extraction = extract_tool_calls_with_thinking(
             thinking_content,
             regular_content,
@@ -3634,7 +3669,8 @@ async def create_anthropic_message(
 
         # Separate thinking from content
         raw_text = clean_special_tokens(output.text) if output.text else ""
-        thinking_content, regular_content = extract_thinking(raw_text)
+        initially_thinking = _resolve_initially_thinking(engine, messages, chat_kwargs)
+        thinking_content, regular_content = extract_thinking(raw_text, initially_thinking)
         cleaned_thinking = sanitize_tool_call_markup(thinking_content, engine.tokenizer)
 
         # For Harmony (gpt-oss) models, tool_calls are already extracted by the parser

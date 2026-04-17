@@ -3,7 +3,11 @@
 
 import pytest
 
-from omlx.api.thinking import ThinkingParser, extract_thinking
+from omlx.api.thinking import (
+    ThinkingParser,
+    extract_thinking,
+    prompt_ends_in_open_think,
+)
 
 
 class TestExtractThinking:
@@ -406,6 +410,107 @@ class TestCleanSpecialTokens:
             "<|im_start|><think>reasoning</think>Answer<|im_end|>"
         )
         assert "<think>reasoning</think>Answer" == result
+
+
+class TestInitiallyThinking:
+    """Tests for ``start_in_thinking`` (Qwen3-style prompt pre-opens <think>)."""
+
+    def test_stream_starts_in_thinking_until_close(self):
+        parser = ThinkingParser(start_in_thinking=True)
+        t, c = parser.feed("reasoning</think>answer")
+        assert t == "reasoning"
+        assert c == "answer"
+
+    def test_stream_truncated_mid_think(self):
+        parser = ThinkingParser(start_in_thinking=True)
+        t, c = parser.feed("reasoning so far")
+        assert t == "reasoning so far"
+        assert c == ""
+
+    def test_stream_redundant_open_tag_is_idempotent(self):
+        parser = ThinkingParser(start_in_thinking=True)
+        t, c = parser.feed("<think>\nreasoning</think>answer")
+        assert t == "\nreasoning"
+        assert c == "answer"
+
+    def test_extract_truncated_mid_think(self):
+        t, c = extract_thinking("reasoning so far", start_in_thinking=True)
+        assert t == "reasoning so far"
+        assert c == ""
+
+    def test_extract_closed_without_opener(self):
+        t, c = extract_thinking("reasoning</think>answer", start_in_thinking=True)
+        assert t == "reasoning"
+        assert c == "answer"
+
+    def test_extract_with_proper_open_close(self):
+        # Flag is idempotent when the text is well-formed.
+        t, c = extract_thinking("<think>reasoning</think>answer", start_in_thinking=True)
+        assert t == "reasoning"
+        assert c == "answer"
+
+    def test_stream_strips_close_tag_separator(self):
+        """Qwen emits ``</think>\\n\\n`` — swallow the separator before answer."""
+        parser = ThinkingParser(start_in_thinking=True)
+        t, c = parser.feed("reasoning</think>\n\nThanks for asking!")
+        assert t == "reasoning"
+        assert c == "Thanks for asking!"
+
+    def test_stream_strips_separator_across_chunks(self):
+        """Separator may arrive in a later chunk."""
+        parser = ThinkingParser(start_in_thinking=True)
+        t1, c1 = parser.feed("reasoning</think>")
+        t2, c2 = parser.feed("\n\n")
+        t3, c3 = parser.feed("Answer")
+        assert (t1, c1) == ("reasoning", "")
+        assert (t2, c2) == ("", "")
+        assert (t3, c3) == ("", "Answer")
+
+    def test_stream_strips_separator_with_explicit_open(self):
+        """Strip applies regardless of whether ``<think>`` was in the stream."""
+        parser = ThinkingParser()
+        t, c = parser.feed("<think>reasoning</think>\n\nAnswer")
+        assert t == "reasoning"
+        assert c == "Answer"
+
+    def test_extract_default_false_preserves_behavior(self):
+        # Plain text with no tags should stay as content when flag is off.
+        t, c = extract_thinking("plain text")
+        assert t == ""
+        assert c == "plain text"
+
+
+class TestPromptEndsInOpenThink:
+    """Tests for ``prompt_ends_in_open_think`` detection."""
+
+    def test_qwen_style_tail(self):
+        assert prompt_ends_in_open_think(
+            "<|im_start|>user\nhi<|im_end|>\n<|im_start|>assistant\n<think>\n"
+        )
+
+    def test_closed_think_pair(self):
+        assert not prompt_ends_in_open_think(
+            "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+        )
+
+    def test_no_think_tag(self):
+        assert not prompt_ends_in_open_think(
+            "<|im_start|>assistant\n"
+        )
+
+    def test_empty(self):
+        assert not prompt_ends_in_open_think("")
+
+    def test_multiple_blocks_last_open(self):
+        # An earlier closed block then a new open one — still open.
+        assert prompt_ends_in_open_think(
+            "prior <think>a</think> then <think>\n"
+        )
+
+    def test_multiple_blocks_last_closed(self):
+        assert not prompt_ends_in_open_think(
+            "<think>a</think> middle <think>b</think>"
+        )
 
 
 class TestCleanOutputTextBackwardCompat:

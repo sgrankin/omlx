@@ -96,6 +96,19 @@ def extract_thinking(
     return ("", text)
 
 
+def prompt_ends_in_open_think(prompt: str) -> bool:
+    """Return True if the prompt ends with an unclosed ``<think>`` tag.
+
+    Qwen3/3.5/3.6 chat templates append ``<think>\\n`` to the assistant
+    prefix when thinking is enabled, so the model's generation starts
+    already inside a think block and never emits the opening tag.
+    """
+    if not prompt or "<think>" not in prompt:
+        return False
+    tail = prompt[prompt.rfind("<think>"):]
+    return "</think>" not in tail
+
+
 class ThinkingParser:
     """Stateful streaming parser for separating <think>...</think> from content.
 
@@ -130,6 +143,10 @@ class ThinkingParser:
         self._close_seen: bool = False
         self._thinking_accumulated: List[str] = []
         self._content_emitted: bool = False
+        # Swallow the whitespace separator that follows ``</think>``.  Qwen
+        # models canonicalize this as ``\n\n``, but we strip any leading
+        # whitespace until the first non-space character of the real answer.
+        self._strip_content_leading_ws: bool = False
 
     def feed(self, text: str) -> Tuple[str, str]:
         """Feed a text chunk, return (thinking_delta, content_delta).
@@ -166,6 +183,7 @@ class ThinkingParser:
                 if remaining.startswith(_CLOSE_TAG):
                     self._in_thinking = False
                     self._close_seen = True
+                    self._strip_content_leading_ws = True
                     i += _CLOSE_LEN
                     continue
 
@@ -179,13 +197,13 @@ class ThinkingParser:
                 if self._in_thinking:
                     thinking_out.append('<')
                 else:
-                    content_out.append('<')
+                    self._emit_content('<', content_out)
                 i += 1
             else:
                 if self._in_thinking:
                     thinking_out.append(text[i])
                 else:
-                    content_out.append(text[i])
+                    self._emit_content(text[i], content_out)
                 i += 1
 
         thinking_delta = "".join(thinking_out)
@@ -240,6 +258,14 @@ class ThinkingParser:
         else:
             self._content_emitted = True
             return ("", partial)
+
+    def _emit_content(self, ch: str, out: List[str]) -> None:
+        """Append ``ch`` to the content stream, swallowing the ``</think>`` separator."""
+        if self._strip_content_leading_ws:
+            if ch.isspace():
+                return
+            self._strip_content_leading_ws = False
+        out.append(ch)
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:
