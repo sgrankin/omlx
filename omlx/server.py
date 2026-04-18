@@ -2149,7 +2149,6 @@ async def create_chat_completion(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
@@ -2291,6 +2290,7 @@ async def create_chat_completion(
         and "preserve_thinking" not in merged_ct_kwargs
     ):
         merged_ct_kwargs["preserve_thinking"] = True
+
 
     # Add compiled grammar for logit-level structured output.
     # When a reasoning_parser is configured, the structural tag includes
@@ -3491,7 +3491,6 @@ async def create_anthropic_message(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
     # Per-request kwargs override model settings (except forced keys)
@@ -3580,6 +3579,7 @@ async def create_anthropic_message(
         and "preserve_thinking" not in merged_ct_kwargs
     ):
         merged_ct_kwargs["preserve_thinking"] = True
+
 
     # Merge MCP tools with user-provided Anthropic tools
     user_internal = convert_anthropic_tools_to_internal(request.tools)
@@ -3902,7 +3902,6 @@ async def create_response(
         # Dedicated enable_thinking toggle takes precedence over chat_template_kwargs
         if ms.enable_thinking is not None:
             merged_ct_kwargs["enable_thinking"] = ms.enable_thinking
-        # preserve_thinking: keep <think> blocks in historical turns (Qwen 3.6+)
         if ms.preserve_thinking is not None:
             merged_ct_kwargs["preserve_thinking"] = ms.preserve_thinking
 
@@ -4019,6 +4018,7 @@ async def create_response(
         and "preserve_thinking" not in merged_ct_kwargs
     ):
         merged_ct_kwargs["preserve_thinking"] = True
+
 
     # Add compiled grammar for logit-level structured output.
     if compiled_grammar is not None:

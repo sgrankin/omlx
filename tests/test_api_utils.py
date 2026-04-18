@@ -427,39 +427,19 @@ class TestExtractTextContent:
         assert result[0]["content"] == "You are a coding assistant."
 
 
-class TestExtractTextContentReasoningReconstruction:
-    """Tests that extract_text_content reassembles <think> from reasoning_content.
+class TestReasoningContentReconstruction:
+    """Reasoning echoed back by clients must reassemble into <think> blocks.
 
-    External clients (e.g. Pi) receive reasoning in the OpenAI reasoning_content
-    field but echo it back alongside normal content on subsequent turns.  For
-    models whose chat template exposes preserve_thinking=True (Qwen 3.6+), we
-    must inject <think>…</think> back into the assistant message so the
-    template has something to preserve — otherwise thinking is silently dropped
-    from conversation history.
+    Without this, preserve_thinking=True in the chat template has nothing
+    to preserve and prior reasoning silently drops out of history.
     """
 
-    def test_reasoning_and_content_merged_on_assistant(self):
-        """reasoning_content + content string should produce a <think>…</think> prefix."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content="A"),
-        ]
+    def test_assistant_string_content_gets_think_prefix(self):
+        messages = [Message(role="assistant", reasoning_content="R", content="A")]
         result = extract_text_content(messages)
-        assert len(result) == 1
-        assert result[0]["role"] == "assistant"
         assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
 
-    def test_reasoning_with_none_content(self):
-        """reasoning_content with content=None should still emit the <think> block."""
-        messages = [
-            Message(role="assistant", reasoning_content="R", content=None),
-        ]
-        result = extract_text_content(messages)
-        # Non-empty content after reconstruction keeps the message alive.
-        assert len(result) == 1
-        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
-
-    def test_reasoning_with_content_list(self):
-        """reasoning_content + list content should extract text parts and prefix <think>."""
+    def test_assistant_list_content_extracted_then_prefixed(self):
         messages = [
             Message(
                 role="assistant",
@@ -468,26 +448,73 @@ class TestExtractTextContentReasoningReconstruction:
             ),
         ]
         result = extract_text_content(messages)
-        assert len(result) == 1
         assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
 
-    def test_reasoning_on_non_assistant_passthrough(self):
-        """reasoning_content on a user message must NOT trigger reconstruction."""
+    def test_assistant_none_content_still_emits_think(self):
+        messages = [Message(role="assistant", reasoning_content="R", content=None)]
+        result = extract_text_content(messages)
+        assert result[0]["content"] == "<think>\nR\n</think>\n\n"
+
+    def test_assistant_with_tool_calls_carries_think(self):
+        """Qwen 3.6 agent flow: assistant turns with tool_calls also need <think>."""
         messages = [
-            Message(role="user", reasoning_content="R", content="A"),
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="picking the weather tool",
+                tool_calls=[{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": "{}"},
+                }],
+            ),
         ]
         result = extract_text_content(messages)
-        assert len(result) == 1
-        # User content left untouched — no <think> wrapper.
+        assert result[0]["content"].startswith("<think>\nR\n</think>")
+        assert "picking the weather tool" in result[0]["content"]
+
+    def test_user_role_passthrough(self):
+        messages = [Message(role="user", reasoning_content="R", content="A")]
+        result = extract_text_content(messages)
         assert result[0]["content"] == "A"
 
-    def test_no_reasoning_content_passthrough(self):
-        """Without reasoning_content the assistant message should pass through unchanged."""
+    def test_no_reasoning_unchanged(self):
+        messages = [Message(role="assistant", content="A")]
+        result = extract_text_content(messages)
+        assert result[0]["content"] == "A"
+
+    def test_multimodal_extractor_also_reconstructs(self):
+        messages = [Message(role="assistant", reasoning_content="R", content="A")]
+        result = extract_multimodal_content(messages)
+        assert result[0]["content"] == "<think>\nR\n</think>\n\nA"
+
+    def test_skip_when_content_already_has_think_block(self):
+        """Avoid emitting two consecutive <think> blocks if client inlined one."""
         messages = [
-            Message(role="assistant", content="A"),
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="<think>X</think>\n\nA",
+            ),
         ]
         result = extract_text_content(messages)
-        assert len(result) == 1
+        # Helper bails out and we keep the client's inline form intact.
+        assert result[0]["content"] == "<think>X</think>\n\nA"
+
+    def test_consecutive_reasoning_assistants_not_merged(self):
+        """Two assistant turns with reasoning must not merge — single </think> per turn."""
+        messages = [
+            Message(role="assistant", reasoning_content="R1", content="A1"),
+            Message(role="assistant", reasoning_content="R2", content="A2"),
+        ]
+        result = extract_text_content(messages)
+        assert len(result) == 2
+        assert result[0]["content"] == "<think>\nR1\n</think>\n\nA1"
+        assert result[1]["content"] == "<think>\nR2\n</think>\n\nA2"
+
+    def test_empty_reasoning_string_no_think_emitted(self):
+        messages = [Message(role="assistant", reasoning_content="", content="A")]
+        result = extract_text_content(messages)
         assert result[0]["content"] == "A"
 
 

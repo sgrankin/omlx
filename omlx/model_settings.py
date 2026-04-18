@@ -114,7 +114,7 @@ class ModelSettings:
     model_alias: Optional[str] = None  # API-visible name (alternative to directory name)
     index_cache_freq: Optional[int] = None  # IndexCache: every Nth layer keeps indexer (DSA models only)
     enable_thinking: Optional[bool] = None  # Explicit toggle for thinking/reasoning mode (None = auto)
-    preserve_thinking: Optional[bool] = None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
+    preserve_thinking: Optional[bool] = None  # Keep <think> from prior turns (Qwen 3.6+); None = auto-on when thinking active
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None
     reasoning_parser: Optional[str] = None  # xgrammar builtin name: "qwen", "harmony", "llama", etc.
