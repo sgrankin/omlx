@@ -691,16 +691,26 @@ class HFDownloader:
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 
+                # Start progress polling before dry_run so the UI reflects
+                # byte-level progress during both the dry_run and the real
+                # download. total_size stays 0 until dry_run fills it in;
+                # the poller handles that by showing downloaded bytes only.
+                self._progress_tasks[task_id] = asyncio.create_task(
+                    self._poll_progress(task_id, target_dir)
+                )
+
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                # No asyncio.wait_for wrapper: it cannot cancel the
+                # underlying thread, so its timeout would just spawn a
+                # second snapshot_download racing on the HF cache and
+                # block shutdown. etag_timeout in dl_kwargs bounds the
+                # per-request network waits inside the thread itself.
                 try:
-                    dry_result = await asyncio.wait_for(
-                        asyncio.to_thread(
-                            snapshot_download,
-                            **dl_kwargs,
-                            dry_run=True,
-                        ),
-                        timeout=30,
+                    dry_result = await asyncio.to_thread(
+                        snapshot_download,
+                        **dl_kwargs,
+                        dry_run=True,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
                 except Exception as e:
@@ -708,11 +718,6 @@ class HFDownloader:
                         f"Dry run failed for {task.repo_id}: {e}. "
                         "Progress estimation will be unavailable."
                     )
-
-                # Start progress polling
-                self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
-                )
 
                 # Run snapshot_download in a thread (blocking call)
                 await asyncio.to_thread(
