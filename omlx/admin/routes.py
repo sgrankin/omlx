@@ -129,6 +129,7 @@ class ModelSettingsRequest(BaseModel):
     ttl_seconds: int | None = None
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
+    preserve_thinking: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
@@ -2281,6 +2282,8 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "preserve_thinking" in sent:
+        current_settings.preserve_thinking = request.preserve_thinking
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False

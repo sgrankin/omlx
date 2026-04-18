@@ -915,6 +915,10 @@ def _apply_reasoning_reconstruction(
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    # Client already inlined <think>...</think> into content — trust their
+    # form and skip reconstruction to avoid emitting two consecutive blocks.
+    if "<think>" in text and "</think>" in text:
+        return content, None
     if native:
         return text, reasoning
     return f"<think>\n{reasoning}\n</think>\n\n{text}", None
@@ -1082,6 +1086,11 @@ def extract_text_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
+        # Reasoning assistants must not merge — each turn has its own
+        # <think>…</think> block, and merging concatenates two into one
+        # message.
+        if role == "assistant" and reasoning:
+            _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         # Handle None content
         if content is None:
@@ -1251,6 +1260,11 @@ def extract_multimodal_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
+        # Reasoning assistants must not merge — each turn has its own
+        # <think>…</think> block, and merging concatenates two into one
+        # message.
+        if role == "assistant" and reasoning:
+            _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         if content is None:
             processed_messages.append({"role": role, "content": "", **_extra})
