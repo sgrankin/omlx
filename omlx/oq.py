@@ -896,30 +896,41 @@ class _TrackedTensor:
     def astype(self, dtype):
         return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
 
-    def moveaxis(self, src_ax, dst_ax):
-        src_ax = src_ax % self.ndim if src_ax < 0 else src_ax
-        dst_ax = dst_ax % self.ndim if dst_ax < 0 else dst_ax
-        dims = list(range(self.ndim))
-        dims.insert(dst_ax, dims.pop(src_ax))
-        new_shape = tuple(self.shape[d] for d in dims)
-        return _TrackedTensor(new_shape, self.dtype, list(self.sources),
-                              f"moveaxis_{src_ax}_{dst_ax}")
-
-    def transpose(self, *axes):
-        if not axes:
-            axes_list = list(reversed(range(self.ndim)))
-        elif len(axes) == 1 and isinstance(axes[0], (list, tuple)):
-            axes_list = list(axes[0])
-        else:
-            axes_list = list(axes)
-        axes_list = [a % self.ndim if a < 0 else a for a in axes_list]
-        new_shape = tuple(self.shape[a] for a in axes_list)
-        return _TrackedTensor(new_shape, self.dtype, list(self.sources),
-                              "transpose_" + "_".join(str(a) for a in axes_list))
-
     @property
     def T(self):
-        return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), "transpose")
+        perm = tuple(range(len(self.shape) - 1, -1, -1))
+        tag = "transpose_" + "_".join(str(a) for a in perm)
+        return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), tag)
+
+    def moveaxis(self, source, destination):
+        ndim = len(self.shape)
+        src = source % ndim
+        dst = destination % ndim
+        dims = list(self.shape)
+        moved = dims.pop(src)
+        dims.insert(dst, moved)
+        tag = f"moveaxis_{src}_{dst}"
+        return _TrackedTensor(tuple(dims), self.dtype, list(self.sources), tag)
+
+    def swapaxes(self, axis1, axis2):
+        ndim = len(self.shape)
+        a, b = axis1 % ndim, axis2 % ndim
+        dims = list(self.shape)
+        dims[a], dims[b] = dims[b], dims[a]
+        tag = f"swapaxes_{a}_{b}"
+        return _TrackedTensor(tuple(dims), self.dtype, list(self.sources), tag)
+
+    def transpose(self, *axes):
+        if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
+            axes = tuple(axes[0])
+        ndim = len(self.shape)
+        if not axes:
+            perm = tuple(range(ndim - 1, -1, -1))
+        else:
+            perm = tuple(a % ndim for a in axes)
+        new_shape = tuple(self.shape[i] for i in perm)
+        tag = "transpose_" + "_".join(str(a) for a in perm)
+        return _TrackedTensor(new_shape, self.dtype, list(self.sources), tag)
 
     @property
     def size(self):
@@ -1058,23 +1069,24 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
-            src_ax = src_ax % tensor.ndim if src_ax < 0 else src_ax
-            dst_ax = dst_ax % tensor.ndim if dst_ax < 0 else dst_ax
+            src = src_ax % tensor.ndim
+            dst = dst_ax % tensor.ndim
             dims = list(range(tensor.ndim))
-            dims.insert(dst_ax, dims.pop(src_ax))
+            dims.insert(dst, dims.pop(src))
             new_shape = tuple(tensor.shape[d] for d in dims)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources),
-                                  f"moveaxis_{src_ax}_{dst_ax}")
+            tag = f"moveaxis_{src}_{dst}"
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), tag)
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
         if isinstance(tensor, _TrackedTensor):
             if axes is None:
-                axes = list(reversed(range(tensor.ndim)))
-            axes = [a % tensor.ndim if a < 0 else a for a in axes]
-            new_shape = tuple(tensor.shape[a] for a in axes)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources),
-                                  "transpose_" + "_".join(str(a) for a in axes))
+                perm = tuple(range(tensor.ndim - 1, -1, -1))
+            else:
+                perm = tuple(a % tensor.ndim for a in axes)
+            new_shape = tuple(tensor.shape[a] for a in perm)
+            tag = "transpose_" + "_".join(str(a) for a in perm)
+            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), tag)
         return _orig["transpose"](tensor, axes=axes)
 
     def _noop(*a, **kw): pass
@@ -1259,16 +1271,24 @@ class _DiscoveredPlan:
             arr = self._materialize_source(sources[0])
             return arr + 1.0  # norm weight += 1.0 pattern
 
-        if transform.startswith("transpose_"):
-            axes = [int(a) for a in transform.split("_")[1:]]
+        if transform == "transpose" or transform.startswith("transpose_"):
             arr = self._materialize_source(sources[0])
+            if transform == "transpose":
+                return mx.transpose(arr)  # legacy: full axis reverse
+            axes = tuple(int(p) for p in transform.split("_")[1:])
             return mx.transpose(arr, axes=axes)
 
-        if transform.startswith("moveaxis_"):
-            parts = transform.split("_")
-            src_ax, dst_ax = int(parts[1]), int(parts[2])
+        if transform == "moveaxis" or transform.startswith("moveaxis_"):
             arr = self._materialize_source(sources[0])
+            if transform == "moveaxis":
+                return mx.moveaxis(arr, 2, 1)  # legacy: conv1d weight permute
+            src_ax, dst_ax = (int(p) for p in transform.split("_")[1:])
             return mx.moveaxis(arr, src_ax, dst_ax)
+
+        if transform.startswith("swapaxes_"):
+            arr = self._materialize_source(sources[0])
+            a, b = (int(p) for p in transform.split("_")[1:])
+            return mx.swapaxes(arr, a, b)
 
         if "split_" in transform:
             # split_N_M means take part N of M
@@ -1462,7 +1482,13 @@ def estimate_bpw_and_size(
         default=0,
     )
 
-    streaming_peak = int(source_total * 1.5) + 5 * 1024**3
+    # Peak memory differs by level:
+    # - oQ8 skips sensitivity (see quantize_oq_streaming); only true streaming cost.
+    # - oQ2-oQ6 run sensitivity forward pass over the source, which dominates.
+    if oq_level == 8:
+        streaming_peak = max_shard_size * 2 + 7 * 1024**3
+    else:
+        streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
         "effective_bpw": round(effective_bpw, 2),
@@ -2271,7 +2297,15 @@ def quantize_oq_streaming(
         # Model.sanitize which corrupts mutable state in the MTP sanitize
         # patch (weights.pop on tracked objects). Running sensitivity first
         # ensures vlm_load_model sees a pristine patch chain.
-        if sensitivity_model_path:
+        #
+        # oQ8 has no budget plan (level 8 is not in _OQ_BPW_TARGETS) and every
+        # sensitivity-driven boost in universal_quant_predicate is clamped by
+        # bits(n)=max(n, base_bits=8) — the measurement cannot change any
+        # output bits, so skip the load+forward cost.
+        if oq_level == 8:
+            logger.info(f"oQ{oq_level:g}: sensitivity skipped (no effect at base=8)")
+            sensitivity_map = {}
+        elif sensitivity_model_path:
             logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
             sensitivity_map = _measure_sensitivity_from_quantized_model(
                 sensitivity_model_path, config, oq_level,
@@ -2326,8 +2360,9 @@ def quantize_oq_streaming(
     # Single enforcement point. Inner measurement helpers may return {} on
     # load / calibration / layer-discovery failure; treat that as a hard
     # error here so the rest of quantize_oq_streaming never runs without a
-    # data-driven sensitivity map.
-    if not sensitivity_map:
+    # data-driven sensitivity map. oQ8 deliberately produces an empty map
+    # (see above) — exempt it from this check.
+    if oq_level != 8 and not sensitivity_map:
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
             "Check the preceding log lines for the root cause (model load, "
