@@ -95,6 +95,19 @@ def filter_profile_fields(data: dict[str, Any]) -> dict[str, Any]:
     return {k: v for k, v in data.items() if k in allowed}
 
 
+def profile_values_equivalent(a: Any, b: Any) -> bool:
+    """Compare two ModelSettings field values for profile drift detection.
+
+    The admin UI normalizes "disabled"/"absent" fields inconsistently between
+    save (sends 0) and profile snapshot (stores null), so strict equality
+    produces false-positive drift. Treat both values as equivalent when they
+    are equal OR both falsy (None/0/False/empty).
+    """
+    if a == b:
+        return True
+    return not a and not b
+
+
 @dataclass
 class ModelProfile:
     """A per-model saved bundle of ModelSettings values."""

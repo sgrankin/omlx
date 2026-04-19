@@ -283,3 +283,32 @@ class TestActiveProfileDriftClearing:
         r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.5})
         assert r.status_code == 200
         assert r.json()["settings"].get("active_profile_name") is None
+
+    def test_active_preserved_when_disabled_field_varies_between_null_and_zero(
+        self, client
+    ):
+        # UI's formValuesForProfile stores null for disabled toggles, but
+        # saveModelSettings sends 0 for the same disabled state. The two
+        # shouldn't count as drift.
+        c, _ = client
+        c.post("/admin/api/models/model-a/profiles", json={
+            "name": "coding", "display_name": "Coding",
+            "settings": {
+                "temperature": 0.7,
+                "thinking_budget_tokens": None,
+                "max_tool_result_tokens": None,
+                "index_cache_freq": None,
+            },
+        })
+        c.post("/admin/api/models/model-a/profiles/coding/apply")
+        r = c.put(
+            "/admin/api/models/model-a/settings",
+            json={
+                "temperature": 0.7,
+                "thinking_budget_tokens": 0,
+                "max_tool_result_tokens": 0,
+                "index_cache_freq": 0,
+            },
+        )
+        assert r.status_code == 200
+        assert r.json()["settings"]["active_profile_name"] == "coding"
