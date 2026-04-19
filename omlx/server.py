@@ -5007,7 +5007,7 @@ async def stream_chat_completion(
         logger.info(
             f"Chat completion: model={resolved_model or request.model}, "
             f"{last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({speed_text}), "
+            f"{total_duration:.2f}s ({speed_text}, ttft {ttft:.2f}s), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
             f"request_max_tokens={request.max_tokens}"
@@ -5454,6 +5454,11 @@ async def stream_anthropic_messages(
             f"Anthropic message: model={serving_model}, "
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
             f"({tokens_per_sec:.1f} tok/s)"
+        )
+        gen_tps = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(
+            f"Anthropic message (stream): {last_output.completion_tokens} tokens in "
+            f"{total_duration:.2f}s ({gen_tps:.1f} tok/s gen, ttft {ttft:.2f}s)"
         )
 
     # 7. Send message_stop
