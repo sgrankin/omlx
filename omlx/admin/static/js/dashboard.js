@@ -11516,8 +11516,9 @@
             oqEstimatedMemory() {
                 // Use precise estimate from API if available
                 if (this.oqEstimate) {
-                    // If sensitivity model selected, memory ≈ sensitivity model size × 1.5
-                    if (this.oqSensitivityModelPath) {
+                    // oQ8 skips sensitivity entirely (see oq.py:1942) — estimate
+                    // only the streaming quant cost regardless of proxy selection.
+                    if (this.oqSensitivityModelPath && this.oqLevel !== 8) {
                         const sensModel = this.oqAllModels.find(m => m.path === this.oqSensitivityModelPath);
                         if (sensModel) {
                             const bytes = Math.round(sensModel.size * 1.5) + 5 * 1024 * 1024 * 1024;

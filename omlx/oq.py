@@ -2555,6 +2555,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "add_if_mean_lt_0_5",
         "transpose_",
         "moveaxis_",
+        "swapaxes_",
         "split_",
         "slice",
         "reshape",
@@ -2938,16 +2939,24 @@ class _DiscoveredPlan:
             arr = self._materialize_source(sources[0])
             return arr.astype(info["dtype"])
 
-        if transform.startswith("transpose_"):
-            axes = [int(a) for a in transform.split("_")[1:]]
+        if transform == "transpose" or transform.startswith("transpose_"):
             arr = self._materialize_source(sources[0])
+            if transform == "transpose":
+                return mx.transpose(arr)  # legacy: full axis reverse
+            axes = tuple(int(p) for p in transform.split("_")[1:])
             return mx.transpose(arr, axes=axes)
 
-        if transform.startswith("moveaxis_"):
-            parts = transform.split("_")
-            src_ax, dst_ax = int(parts[1]), int(parts[2])
+        if transform == "moveaxis" or transform.startswith("moveaxis_"):
             arr = self._materialize_source(sources[0])
+            if transform == "moveaxis":
+                return mx.moveaxis(arr, 2, 1)  # legacy: conv1d weight permute
+            src_ax, dst_ax = (int(p) for p in transform.split("_")[1:])
             return mx.moveaxis(arr, src_ax, dst_ax)
+
+        if transform.startswith("swapaxes_"):
+            arr = self._materialize_source(sources[0])
+            a, b = (int(p) for p in transform.split("_")[1:])
+            return mx.swapaxes(arr, a, b)
 
         if "split_" in transform:
             # split_N_M means take part N of M
@@ -3283,7 +3292,18 @@ def estimate_bpw_and_size(
             total_output_bytes = int(effective_bpw * total_params / 8)
 
     source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
-    streaming_peak = int(source_total * 1.5) + 5 * 1024**3
+    max_shard_size = max(
+        (sf.stat().st_size for sf in source.glob("*.safetensors")),
+        default=0,
+    )
+
+    # Peak memory differs by level:
+    # - oQ8 skips sensitivity (see quantize_oq_streaming); only true streaming cost.
+    # - oQ2-oQ6 run sensitivity forward pass over the source, which dominates.
+    if oq_level == 8:
+        streaming_peak = max_shard_size * 2 + 7 * 1024**3
+    else:
+        streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
         "effective_bpw": round(effective_bpw, 2),
@@ -5672,7 +5692,15 @@ def quantize_oq_streaming(
         # Model.sanitize which corrupts mutable state in the MTP sanitize
         # patch (weights.pop on tracked objects). Running sensitivity first
         # ensures vlm_load_model sees a pristine patch chain.
-        if sensitivity_model_path:
+        #
+        # oQ8 has no budget plan (level 8 is not in _OQ_BPW_TARGETS) and every
+        # sensitivity-driven boost in universal_quant_predicate is clamped by
+        # bits(n)=max(n, base_bits=8) — the measurement cannot change any
+        # output bits, so skip the load+forward cost.
+        if oq_level == 8:
+            logger.info(f"oQ{oq_level:g}: sensitivity skipped (no effect at base=8)")
+            sensitivity_map = {}
+        elif sensitivity_model_path:
             logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
             sensitivity_map = _measure_sensitivity_from_quantized_model(
                 sensitivity_model_path,
@@ -5754,8 +5782,9 @@ def quantize_oq_streaming(
     # Single enforcement point. Inner measurement helpers may return {} on
     # load / calibration / layer-discovery failure; treat that as a hard
     # error here so the rest of quantize_oq_streaming never runs without a
-    # data-driven sensitivity map.
-    if not sensitivity_map:
+    # data-driven sensitivity map. oQ8 deliberately produces an empty map
+    # (see above) — exempt it from this check.
+    if oq_level != 8 and not sensitivity_map:
         _cleanup_ram_safe_proxy()
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
