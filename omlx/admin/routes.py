@@ -2752,6 +2752,8 @@ async def update_model_settings(
     # settings that the profile doesn't have are silently merged in, and
     # removed fields (no longer in the profile) are skipped.
     if current_settings.active_profile_name:
+        from ..model_profiles import profile_values_equivalent
+
         profile = settings_manager.get_profile(
             model_id, current_settings.active_profile_name
         )
@@ -2770,7 +2772,7 @@ async def update_model_settings(
                 if key not in candidate:
                     diverged = True
                     break
-                if candidate[key] != expected:
+                if not profile_values_equivalent(candidate[key], expected):
                     diverged = True
                     break
             if diverged:
