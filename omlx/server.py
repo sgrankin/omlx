@@ -173,6 +173,7 @@ from .api.utils import (
     has_nonleading_system_message,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    summarize_message_content,
     uses_native_reasoning_content,
 )
 from .engine import BaseEngine, VLMBatchedEngine
@@ -3460,6 +3461,10 @@ async def create_chat_completion(
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}, temp={request.temperature}"
     )
+    logger.info(
+        "Chat completion content: %s",
+        summarize_message_content(request.messages),
+    )
     if logger.isEnabledFor(5):
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
@@ -5484,6 +5489,10 @@ async def create_anthropic_message(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
+    )
+    logger.info(
+        "Anthropic Messages content: %s",
+        summarize_message_content(request.messages),
     )
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:
