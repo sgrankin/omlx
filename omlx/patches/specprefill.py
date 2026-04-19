@@ -542,10 +542,24 @@ def score_tokens(
             ),
         )
 
-    # Record cache offset before lookahead so we can trim afterwards.
-    # Lookahead decode appends n_lookahead+1 tokens to the cache which
-    # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    # Snapshot cache state before lookahead so we can restore afterwards.
+    # Lookahead decode appends n_lookahead+1 tokens to the cache which must
+    # NOT be persisted when the caller stores the cache to SSD. Use the
+    # (state, meta_state) property pair each mlx-lm cache class defines for
+    # its from_state serialisation: covers KVCache keys/values, RotatingKVCache
+    # _idx (inside meta_state), ArraysCache recurrent state, and CacheList
+    # nesting — all handled by the cache's own setters.
+    #
+    # ArraysCache.state returns its live ``self.cache`` list (and CacheList.state
+    # nests such lists), so in-place mutation of the list would corrupt the
+    # snapshot. Shallow-copy every list we encounter; MLX arrays and tuples
+    # are immutable so references are safe.
+    def _freeze(v):
+        if isinstance(v, list):
+            return [_freeze(e) for e in v]
+        return v
+
+    cache_snapshots = [(_freeze(c.state), _freeze(c.meta_state)) for c in cache]
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -561,6 +575,8 @@ def score_tokens(
         _unpatch_attention_capture(model, patches)
 
     # Phase 3: Compute importance
+    # (Reads cache.keys[..., :n_prompt, :]; lookahead-appended keys past
+    # n_prompt are ignored, so the snapshot-based restore below is safe.)
     layer_to_cache = _build_layer_to_cache_map(model)
     attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
     importance = _compute_importance(
@@ -575,16 +591,11 @@ def score_tokens(
     if progress_callback is not None:
         progress_callback(n_prompt, n_prompt, "importance")
 
-    # Trim lookahead tokens from cache before returning.
-    # KVCache stores keys/values as contiguous tensors; slicing back
-    # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    # Restore pre-lookahead cache state via each cache's own state/meta_state
+    # setters — mirrors _BaseCache.from_state and handles every cache class.
+    for c, (saved_state, saved_meta) in zip(cache, cache_snapshots):
+        c.state = saved_state
+        c.meta_state = saved_meta
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()
