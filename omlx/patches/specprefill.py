@@ -349,13 +349,40 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
-    """Prefill draft model with all prompt tokens. Returns last logits."""
+def _prefill_draft(
+    model,
+    tokens,
+    cache,
+    step_size=2048,
+    progress_callback=None,
+    block_size: Optional[int] = None,
+    starting_offset: int = 0,
+    capture_fn: Optional[Callable[[List[Any]], Any]] = None,
+) -> Tuple[Any, Dict[int, Any]]:
+    """Prefill draft model with all prompt tokens.
+
+    When ``block_size`` and ``capture_fn`` are both provided, chunks are
+    shrunk as needed to land on every block boundary in the absolute token
+    sequence (starting_offset + processed) so that ``capture_fn`` can record
+    a per-boundary cache snapshot. The returned ``snapshots`` dict is keyed
+    by absolute token position (``starting_offset + processed``) and holds
+    whatever ``capture_fn`` returned. Returns (last_logits, snapshots).
+    """
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
+    snapshots: Dict[int, Any] = {}
+    capture = block_size is not None and capture_fn is not None
+
     while n - processed > 1:
-        chunk = min(step_size, n - processed - 1)
+        chunk_max = min(step_size, n - processed - 1)
+        if capture:
+            current_pos = starting_offset + processed
+            # Distance to the next block boundary strictly after current_pos.
+            dist_to_boundary = block_size - (current_pos % block_size)
+            chunk = min(chunk_max, dist_to_boundary)
+        else:
+            chunk = chunk_max
         if progress_callback is not None:
             # Mark the chunk as active before the MLX eval without advancing
             # completed-token progress. Advancing here makes tok/s math lie
@@ -366,12 +393,21 @@ def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None)
         processed += chunk
         if progress_callback is not None:
             progress_callback(processed, n)
+        if capture:
+            end_pos = starting_offset + processed
+            if end_pos % block_size == 0:
+                snapshots[end_pos] = capture_fn(cache)
         mx.clear_cache()
+
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
     if progress_callback is not None:
         progress_callback(n, n)
-    return logits
+    if capture:
+        end_pos = starting_offset + n
+        if end_pos % block_size == 0:
+            snapshots[end_pos] = capture_fn(cache)
+    return logits, snapshots
 
 
 def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
@@ -460,8 +496,11 @@ def score_tokens(
     prefill_step_size: int = 2048,
     query_extractor: Optional[Callable] = None,
     existing_cache: Optional[List[Any]] = None,
+    existing_cache_tokens: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
-) -> Tuple[mx.array, Any]:
+    block_size: Optional[int] = None,
+    capture_snapshot_fn: Optional[Callable[[List[Any]], Any]] = None,
+) -> Tuple[mx.array, Any, Dict[int, Any]]:
     """Score token importance using attention patterns on a draft model.
 
     Pipeline:
@@ -480,10 +519,26 @@ def score_tokens(
         query_extractor: custom function(attn, x, cache) -> queries
         existing_cache: pre-populated cache from paged cache restore.
             If provided, only the suffix beyond cached tokens is prefilled.
+        existing_cache_tokens: number of prompt tokens already represented
+            by ``existing_cache``. Required for hybrid caches where layer 0
+            may be an ArraysCache without an ``.offset`` attribute — the
+            old inspection-based detection returns 0 for those and re-
+            prefills every token on top of restored state, producing
+            garbage. Falls back to ``cache[0].offset`` when unset.
+        block_size: when provided together with ``capture_snapshot_fn``,
+            prefill chunks are aligned to every ``block_size`` boundary and
+            the callback is invoked after each one. Enables per-block
+            boundary snapshots for non-sliceable caches so prefix-cache
+            fetches at arbitrary block counts reconstruct correctly.
+        capture_snapshot_fn: callable taking the live cache list and
+            returning an opaque snapshot to record. Only invoked at block
+            boundaries.
 
     Returns:
-        (importance, cache) — importance scores (M,) and the draft cache
-        for storage in paged cache.
+        (importance, cache, boundary_snapshots) — importance scores (M,),
+        the draft cache for storage in paged cache, and a dict mapping
+        absolute-token-position to the snapshot returned by
+        ``capture_snapshot_fn`` (empty when capture is disabled).
     """
     from mlx_lm.models.cache import make_prompt_cache
 
@@ -508,12 +563,16 @@ def score_tokens(
         query_extractor = _detect_query_extractor(attn_obj)
 
     # Phase 1: Prefill (full or suffix-only if cache provided)
+    boundary_snapshots: Dict[int, Any] = {}
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
+        if existing_cache_tokens is not None:
+            cached_len = existing_cache_tokens
+        else:
+            cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
-            logits = _prefill_draft(
+            logits, boundary_snapshots = _prefill_draft(
                 model,
                 suffix,
                 cache,
@@ -523,6 +582,9 @@ def score_tokens(
                     if progress_callback is not None
                     else None
                 ),
+                block_size=block_size,
+                starting_offset=cached_len,
+                capture_fn=capture_snapshot_fn,
             )
         else:
             # Exact cache hit — run last token to get logits
@@ -530,7 +592,7 @@ def score_tokens(
             mx.eval(logits)
     else:
         cache = make_prompt_cache(model)
-        logits = _prefill_draft(
+        logits, boundary_snapshots = _prefill_draft(
             model,
             tokens,
             cache,
@@ -540,6 +602,9 @@ def score_tokens(
                 if progress_callback is not None
                 else None
             ),
+            block_size=block_size,
+            starting_offset=0,
+            capture_fn=capture_snapshot_fn,
         )
 
     # Snapshot cache state before lookahead so we can restore afterwards.
@@ -600,7 +665,7 @@ def score_tokens(
     del logits, query_buffer, attn_caches
     mx.clear_cache()
 
-    return importance, cache
+    return importance, cache, boundary_snapshots
 
 
 def select_chunks(

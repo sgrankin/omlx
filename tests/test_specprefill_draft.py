@@ -98,6 +98,7 @@ class _DraftCache:
         tokens: list[int],
         cache_data: list[Any],
         model_cache_config: Any = None,
+        boundary_snapshots: Any = None,
     ) -> None:
         self.stores.append(
             (request_id, list(tokens), cache_data, model_cache_config)
@@ -144,9 +145,10 @@ def _run(
 
     def default_score_tokens(
         model: Any, tokens: list[int], **kwargs: Any
-    ) -> tuple[Any, list[str]]:
+    ) -> tuple[Any, list[str], dict[int, Any]]:
         trace["score_calls"].append(kwargs)
-        return mx.zeros(plan.n_to_score), ["draft-cache"]
+        # oMLX's score_tokens also returns per-block boundary snapshots.
+        return mx.zeros(plan.n_to_score), ["draft-cache"], {}
 
     def select_chunks(importance: Any, keep_pct: float) -> Any:
         return selected_indices

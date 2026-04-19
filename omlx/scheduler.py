@@ -8504,6 +8504,7 @@ class Scheduler:
             draft_prefix_cache=self._draft_prefix_cache,
             model_id=self.config.model_name,
             prefill_step_size=self.config.prefill_step_size,
+            block_size=self.config.paged_cache_block_size,
             stream=self._stream,
             extract_cache_states=self._extract_cache_states,
             sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),

@@ -32,6 +32,7 @@ class DraftPrefixCache(Protocol):
         tokens: Sequence[int],
         cache_data: list[Any],
         model_cache_config: Any = ...,
+        boundary_snapshots: Any = ...,
     ) -> Any: ...
 
 
@@ -51,6 +52,7 @@ def run_specprefill_draft_scoring(
     extract_cache_states: ExtractCacheStates,
     sync_and_clear_cache: SyncAndClearCache,
     log: logging.Logger,
+    block_size: int | None = None,
 ) -> None:
     """Score draft tokens, persist reusable cache state, and update ``request``."""
     tokens_to_score = plan.tokens_to_score
@@ -109,14 +111,39 @@ def run_specprefill_draft_scoring(
             detail="scoring draft tokens",
             extra=tracker_extra,
         )
+        # Capture per-block cache snapshots so non-sliceable recurrent caches
+        # (Qwen3.5 GatedDeltaNet linear-attn) can be prefix-cached correctly.
+        # Without snapshots the last-block-only storage represents the full
+        # tokens_to_score while claiming a block-aligned count, so a later
+        # exact-block-count fetch returns a state misaligned by the partial-
+        # block remainder and generation collapses into leaked KV fragments.
+        def capture_snapshot(live_cache: list[Any]) -> Any:
+            extracted, _ = extract_cache_states(live_cache)
+            # extract_cache_states returns live refs for ArraysCache state
+            # lists (self.cache); shallow-copy every list so later prefill
+            # chunks or the lookahead decode can't mutate our snapshot.
+            def freeze(value: Any) -> Any:
+                if isinstance(value, list):
+                    return [freeze(element) for element in value]
+                return value
+
+            return [
+                {**layer, "state": freeze(layer.get("state"))} for layer in extracted
+            ]
+
         scoring_started_at = time.monotonic()
         with mx.stream(stream):
-            importance, used_cache = score_tokens(
+            importance, used_cache, boundary_snapshots = score_tokens(
                 draft_model,
                 tokens_to_score,
                 prefill_step_size=prefill_step_size,
                 existing_cache=draft_cache,
+                existing_cache_tokens=draft_cached_tokens or None,
                 progress_callback=report_score_progress,
+                block_size=block_size,
+                capture_snapshot_fn=(
+                    capture_snapshot if draft_prefix_cache is not None else None
+                ),
             )
             # Keep the lazy selection ops on the scoring stream (#2183, #2197).
             selected_indices = select_chunks(importance, keep_pct=plan.keep_pct)
@@ -170,6 +197,7 @@ def run_specprefill_draft_scoring(
                         tokens_to_score,
                         extracted_cache,
                         model_cache_config=model_cache_config,
+                        boundary_snapshots=boundary_snapshots or None,
                     )
             except Exception as error:
                 log.debug(f"SpecPrefill: draft cache store failed: {error}")
