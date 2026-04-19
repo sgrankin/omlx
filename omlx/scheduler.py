@@ -3247,6 +3247,21 @@ class Scheduler:
             )
             return [], None
 
+        # Freeze any list-valued state (ArraysCache returns self.cache by
+        # reference; CacheList nests such lists) so downstream consumers —
+        # notably BoundarySnapshotSSDStore's pending_writes cache and the
+        # in-memory boundary fallback — see a stable snapshot rather than
+        # live state that gets mutated by subsequent prefill/decode steps.
+        def _freeze(v):
+            if isinstance(v, list):
+                return [_freeze(e) for e in v]
+            return v
+
+        for layer in extracted:
+            state = layer.get("state")
+            if isinstance(state, list):
+                layer["state"] = _freeze(state)
+
         return extracted, model_cache_config
 
     def add_request(self, request: Request) -> None:
@@ -3848,18 +3863,7 @@ class Scheduler:
             # collapses into leaked KV fragments.
             def _capture_snapshot(live_cache):
                 extracted, _ = self._extract_cache_states(live_cache)
-                # _extract_cache_states returns live refs for ArraysCache
-                # state lists (self.cache); shallow-copy every list so later
-                # prefill chunks or the lookahead decode can't mutate our
-                # snapshot under us.
-                def _freeze(v):
-                    if isinstance(v, list):
-                        return [_freeze(e) for e in v]
-                    return v
-                return [
-                    {**layer, "state": _freeze(layer.get("state"))}
-                    for layer in extracted
-                ]
+                return extracted
 
 
             t0 = time.monotonic()

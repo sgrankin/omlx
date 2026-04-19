@@ -2102,3 +2102,72 @@ class TestBuildStateMachineStopStrings:
                 assert tok in node
                 node = node[tok]
             assert "__match__" in node
+
+
+class TestExtractCacheStatesFreeze:
+    """The ArraysCache state mutation guarantee.
+
+    _extract_cache_states must return a snapshot whose list state cannot be
+    corrupted by subsequent in-place mutation of the source cache object.
+    BoundarySnapshotSSDStore caches the extracted dict in _pending_writes
+    for fast-path reads; if the fast path returned a live reference,
+    ongoing prefill/decode would leak post-boundary state into stored
+    intermediate blocks and corrupt hybrid-model prefix caches.
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        from omlx.scheduler import Scheduler
+
+        mock_scheduler = MagicMock(spec=Scheduler)
+        mock_scheduler.model_name = "test"
+        mock_scheduler._extract_cache_states = Scheduler._extract_cache_states.__get__(
+            mock_scheduler, Scheduler
+        )
+        return mock_scheduler
+
+    def test_arrays_cache_state_snapshot_isolated_from_mutation(self, scheduler):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        ac = ArraysCache(size=2)
+        ac.cache[0] = mx.array([1.0, 2.0, 3.0])
+        ac.cache[1] = mx.array([10.0, 20.0, 30.0])
+
+        extracted, _ = scheduler._extract_cache_states([ac])
+        snap_state = extracted[0]["state"]
+
+        # Simulate a post-extraction prefill chunk that replaces the state
+        # in place via the usual cache[i] = new_array pattern.
+        ac.cache[0] = mx.array([99.0, 99.0, 99.0])
+        ac.cache[1] = mx.array([88.0, 88.0, 88.0])
+
+        # Snapshot still points at the pre-mutation arrays.
+        assert float(mx.sum(snap_state[0]).item()) == 6.0
+        assert float(mx.sum(snap_state[1]).item()) == 60.0
+
+    def test_cache_list_nested_state_isolated_from_mutation(self, scheduler):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal(shape=(1, 4, 10, 64)),
+            mx.random.normal(shape=(1, 4, 10, 64)),
+        )
+        ac = ArraysCache(size=2)
+        ac.cache[0] = mx.array([7.0, 8.0])
+        ac.cache[1] = mx.array([70.0, 80.0])
+        cl = CacheList(kv, ac)
+
+        extracted, _ = scheduler._extract_cache_states([cl])
+        snap_state = extracted[0]["state"]
+
+        # Mutate the inner ArraysCache after extraction.
+        ac.cache[0] = mx.array([99.0, 99.0])
+
+        # CacheList snapshot's nested state preserves the original list
+        # entries — the sub-cache state for ac appears at index 1.
+        ac_snapshot = snap_state[1]
+        assert isinstance(ac_snapshot, list)
+        assert float(mx.sum(ac_snapshot[0]).item()) == 15.0
