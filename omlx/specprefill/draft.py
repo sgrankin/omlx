@@ -119,17 +119,7 @@ def run_specprefill_draft_scoring(
         # block remainder and generation collapses into leaked KV fragments.
         def capture_snapshot(live_cache: list[Any]) -> Any:
             extracted, _ = extract_cache_states(live_cache)
-            # extract_cache_states returns live refs for ArraysCache state
-            # lists (self.cache); shallow-copy every list so later prefill
-            # chunks or the lookahead decode can't mutate our snapshot.
-            def freeze(value: Any) -> Any:
-                if isinstance(value, list):
-                    return [freeze(element) for element in value]
-                return value
-
-            return [
-                {**layer, "state": freeze(layer.get("state"))} for layer in extracted
-            ]
+            return extracted
 
         scoring_started_at = time.monotonic()
         with mx.stream(stream):

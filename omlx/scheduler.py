@@ -7513,6 +7513,21 @@ class Scheduler:
             )
             return [], None
 
+        # Freeze any list-valued state (ArraysCache returns self.cache by
+        # reference; CacheList nests such lists) so downstream consumers —
+        # notably BoundarySnapshotSSDStore's pending_writes cache and the
+        # in-memory boundary fallback — see a stable snapshot rather than
+        # live state that gets mutated by subsequent prefill/decode steps.
+        def _freeze(v):
+            if isinstance(v, list):
+                return [_freeze(e) for e in v]
+            return v
+
+        for layer in extracted:
+            state = layer.get("state")
+            if isinstance(state, list):
+                layer["state"] = _freeze(state)
+
         return extracted, model_cache_config
 
     @staticmethod
