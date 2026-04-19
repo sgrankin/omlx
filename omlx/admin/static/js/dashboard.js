@@ -1585,6 +1585,7 @@
                     index_cache_freq: settings.index_cache_freq || null,
                     turboquant_kv_enabled: settings.turboquant_kv_enabled || false,
                     turboquant_kv_bits: settings.turboquant_kv_bits || 4,
+                    turboquant_skip_last: settings.turboquant_skip_last ?? true,
                     specprefill_enabled: settings.specprefill_enabled || false,
                     specprefill_draft_model: settings.specprefill_draft_model || '',
                     specprefill_keep_pct: settings.specprefill_keep_pct ? String(settings.specprefill_keep_pct) : '0.2',
@@ -1687,6 +1688,7 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                turboquant_skip_last: this.modelSettings.turboquant_skip_last !== false,
                                 specprefill_enabled: this.modelSettings.specprefill_enabled,
                                 specprefill_draft_model: this.modelSettings.specprefill_draft_model || null,
                                 specprefill_keep_pct: this.modelSettings.specprefill_enabled
@@ -1811,6 +1813,7 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.turboquant_skip_last = true;
                         this.modelSettings.specprefill_enabled = false;
                         this.modelSettings.specprefill_draft_model = null;
                         this.modelSettings.specprefill_keep_pct = 0.2;

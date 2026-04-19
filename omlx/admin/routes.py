@@ -122,6 +122,7 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    turboquant_skip_last: bool | None = None
     # SpecPrefill (experimental)
     specprefill_enabled: bool | None = None
     specprefill_draft_model: str | None = None
@@ -1878,6 +1879,10 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    if "turboquant_skip_last" in sent:
+        current_settings.turboquant_skip_last = (
+            True if request.turboquant_skip_last is None else request.turboquant_skip_last
+        )
     # SpecPrefill settings
     if "specprefill_enabled" in sent:
         current_settings.specprefill_enabled = request.specprefill_enabled or False
