@@ -134,6 +134,7 @@ class ModelSettingsRequest(BaseModel):
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    turboquant_skip_last: bool | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
@@ -2309,6 +2310,12 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    if "turboquant_skip_last" in sent:
+        current_settings.turboquant_skip_last = (
+            True
+            if request.turboquant_skip_last is None
+            else request.turboquant_skip_last
+        )
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.

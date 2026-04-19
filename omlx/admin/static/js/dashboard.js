@@ -7380,6 +7380,7 @@
                     index_cache_freq: s.index_cache_freq || null,
                     turboquant_kv_enabled: s.turboquant_kv_enabled || false,
                     turboquant_kv_bits: s.turboquant_kv_bits || 4,
+                    turboquant_skip_last: s.turboquant_skip_last ?? true,
                     qwen35_ane_prefill_enabled: s.qwen35_ane_prefill_enabled || false,
                     qwen35_ane_prefill_sequence_length: s.qwen35_ane_prefill_sequence_length || 2048,
                     qwen35_ane_prefill_tail_padding_min_tokens: s.qwen35_ane_prefill_tail_padding_min_tokens ?? 0,
@@ -8302,6 +8303,7 @@
                                 turboquant_kv_bits: this.modelSettings.turboquant_kv_enabled
                                     ? (parseFloat(this.modelSettings.turboquant_kv_bits) || 4)
                                     : 4,
+                                turboquant_skip_last: this.modelSettings.turboquant_skip_last !== false,
                                 qwen35_ane_prefill_enabled: !!this.modelSettings.qwen35_ane_prefill_enabled,
                                 // Validation only runs when the feature is enabled, so a
                                 // blank numeric input must fall back to the server default
@@ -8520,6 +8522,7 @@
                         this.modelSettings.ctKwargEntries = [];
                         this.modelSettings.turboquant_kv_enabled = false;
                         this.modelSettings.turboquant_kv_bits = 4;
+                        this.modelSettings.turboquant_skip_last = true;
                         this.modelSettings.qwen35_ane_prefill_enabled = false;
                         this.modelSettings.qwen35_ane_prefill_sequence_length = 2048;
                         this.modelSettings.qwen35_ane_prefill_tail_padding_min_tokens = 0;
