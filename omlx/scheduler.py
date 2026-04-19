@@ -3839,13 +3839,43 @@ class Scheduler:
                 extra=spec_extra,
             )
 
+            # Capture per-block cache snapshots so non-sliceable recurrent
+            # caches (Qwen3.5 GatedDeltaNet linear-attn) can be prefix-cached
+            # correctly. Without snapshots the last-block-only storage
+            # represents the full tokens_to_score while claiming a block-
+            # aligned count, so a later exact-block-count fetch returns a
+            # state misaligned by the partial-block remainder and generation
+            # collapses into leaked KV fragments.
+            def _capture_snapshot(live_cache):
+                extracted, _ = self._extract_cache_states(live_cache)
+                # _extract_cache_states returns live refs for ArraysCache
+                # state lists (self.cache); shallow-copy every list so later
+                # prefill chunks or the lookahead decode can't mutate our
+                # snapshot under us.
+                def _freeze(v):
+                    if isinstance(v, list):
+                        return [_freeze(e) for e in v]
+                    return v
+                return [
+                    {**layer, "state": _freeze(layer.get("state"))}
+                    for layer in extracted
+                ]
+
+
             t0 = time.monotonic()
-            importance, used_cache = score_tokens(
+            importance, used_cache, boundary_snapshots = score_tokens(
                 self._specprefill_draft_model,
                 tokens_to_score,
                 prefill_step_size=self.config.prefill_step_size,
                 existing_cache=draft_cache,
+                existing_cache_tokens=draft_cached_tokens or None,
                 progress_callback=_score_progress,
+                block_size=self.config.paged_cache_block_size,
+                capture_snapshot_fn=(
+                    _capture_snapshot
+                    if self._draft_prefix_cache is not None
+                    else None
+                ),
             )
             selected = select_chunks(importance, keep_pct=keep_pct)
             t_score = time.monotonic() - t0
@@ -3901,6 +3931,7 @@ class Scheduler:
                             tokens_to_score,
                             extracted,
                             model_cache_config=mcc,
+                            boundary_snapshots=boundary_snapshots or None,
                         )
                 except Exception as e:
                     logger.debug(f"SpecPrefill: draft cache store failed: {e}")
