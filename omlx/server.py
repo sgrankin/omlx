@@ -3066,8 +3066,12 @@ async def stream_chat_completion(
             generation_duration=gen_duration,
             model_id=resolved_model or request.model,
         )
-        tokens_per_sec = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(f"Chat completion: {last_output.completion_tokens} tokens in {end_time - start_time:.2f}s ({tokens_per_sec:.1f} tok/s), prompt: {last_output.prompt_tokens}")
+        total = end_time - start_time
+        gen_tps = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(
+            f"Chat completion (stream): {last_output.completion_tokens} tokens in "
+            f"{total:.2f}s ({gen_tps:.1f} tok/s gen, ttft {ttft:.2f}s)"
+        )
 
         # Emit usage chunk if requested
         if request.stream_options and request.stream_options.include_usage:
@@ -3427,13 +3431,20 @@ async def stream_anthropic_messages(
     if last_output:
         end_time = time.perf_counter()
         ttft = (first_token_time - start_time) if first_token_time else (end_time - start_time)
+        gen_duration = end_time - (first_token_time or start_time)
         get_server_metrics().record_request_complete(
             prompt_tokens=last_output.prompt_tokens,
             completion_tokens=last_output.completion_tokens,
             cached_tokens=last_output.cached_tokens,
             prefill_duration=ttft,
-            generation_duration=end_time - (first_token_time or start_time),
+            generation_duration=gen_duration,
             model_id=resolved_model or request.model,
+        )
+        total = end_time - start_time
+        gen_tps = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
+        logger.info(
+            f"Anthropic message (stream): {last_output.completion_tokens} tokens in "
+            f"{total:.2f}s ({gen_tps:.1f} tok/s gen, ttft {ttft:.2f}s)"
         )
 
     # 7. Send message_stop
