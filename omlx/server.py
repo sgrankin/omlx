@@ -154,7 +154,7 @@ from .api.tool_calling import (
     sanitize_tool_call_markup,
 )
 from .api.thinking import ThinkingParser, extract_thinking, prompt_ends_in_open_think
-from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content
+from .api.utils import clean_output_text, clean_special_tokens, detect_and_strip_partial, extract_multimodal_content, extract_text_content, summarize_message_content
 from .engine import BaseEngine, BatchedEngine, VLMBatchedEngine
 from .engine.embedding import EmbeddingEngine
 from .engine.reranker import RerankerEngine
@@ -2115,6 +2115,10 @@ async def create_chat_completion(
     logger.debug(f"Chat completion request received: model={request.model}, "
                  f"messages={len(request.messages)}, stream={request.stream}, "
                  f"max_tokens={request.max_tokens}, temp={request.temperature}")
+    logger.info(
+        "Chat completion content: %s",
+        summarize_message_content(request.messages),
+    )
     if logger.isEnabledFor(5):
         for i, msg in enumerate(request.messages):
             content_preview = str(msg.content)[:200] if msg.content else "(empty)"
@@ -3465,6 +3469,10 @@ async def create_anthropic_message(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
         f"max_tokens={request.max_tokens}"
+    )
+    logger.info(
+        "Anthropic Messages content: %s",
+        summarize_message_content(request.messages),
     )
 
     if _server_state.oq_manager and _server_state.oq_manager.is_quantizing:

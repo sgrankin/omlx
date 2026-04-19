@@ -52,6 +52,54 @@ SPECIAL_TOKENS_PATTERN = re.compile(
 )
 
 
+def summarize_message_content(messages: List[Any], tail: int = 3) -> str:
+    """Verbose tail-only content-block summary for diagnostic logging.
+
+    Shows the last ``tail`` messages in ``role=[type,type×N,...]`` form; any
+    earlier history is elided as ``[N earlier]``. ``×N`` suffixes appear only
+    for counts > 1 (single blocks are common and noisy otherwise). Nested
+    tool_result content surfaces as ``tool_result(text,image)``.
+
+    Example (9-turn conversation, tail=3):
+        [6 earlier] u=[tool_result(text,image)] a=[text] u=[text]
+    """
+    from collections import Counter
+
+    def _g(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _fmt_block(block) -> str:
+        btype = _g(block, "type") or "?"
+        if btype == "tool_result":
+            inner = _g(block, "content")
+            if isinstance(inner, list) and inner:
+                inner_types = [_g(sub, "type") or "?" for sub in inner]
+                return f"tool_result({','.join(inner_types)})"
+        return btype
+
+    def _fmt_msg(msg) -> str:
+        role = _g(msg, "role", "?")
+        content = _g(msg, "content")
+        if content is None or content == "":
+            return f"{role}=[empty]"
+        if isinstance(content, str):
+            return f"{role}=[text]"
+        if isinstance(content, list):
+            counts = Counter(_fmt_block(b) for b in content)
+            parts = [f"{k}×{v}" if v > 1 else k for k, v in counts.items()]
+            return f"{role}=[{','.join(parts)}]"
+        return f"{role}=[?]"
+
+    n = len(messages)
+    if n <= tail:
+        return " ".join(_fmt_msg(m) for m in messages)
+    elided = n - tail
+    shown = " ".join(_fmt_msg(m) for m in messages[-tail:])
+    return f"[{elided} earlier] {shown}"
+
+
 def clean_special_tokens(text: str) -> str:
     """Clean model output by removing only special tokens.
 
