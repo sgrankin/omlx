@@ -45,22 +45,26 @@ class TestIsOqModel:
             is True
         )
 
-    def test_oq_anywhere_in_name(self):
-        # 'oQ' anywhere in the folder name counts.
-        assert _is_oq_model("oQ-model-name") is True
-        assert _is_oq_model("oQ4") is True
-
     def test_non_oq_names(self):
         assert _is_oq_model("Qwen3.5-122B") is False
         assert _is_oq_model("Llama-3B-4bit") is False
         assert _is_oq_model("ABCDE") is False
+        # oQ tag requires a trailing digit — bare 'oQ' doesn't count.
+        assert _is_oq_model("oQ-model-name") is False
         # Case-sensitive: lowercase 'oq' or uppercase 'OQ' must not match.
         assert _is_oq_model("Llama-oq4") is False
         assert _is_oq_model("Llama-OQ4") is False
 
     def test_edge_cases(self):
         assert _is_oq_model("X-oQ2") is True
+        assert _is_oq_model("oQ4") is True
         assert _is_oq_model("12oQ4") is True
+
+    def test_quantizer_added_suffixes(self):
+        # The quantizer appends '-fp16', so the oQ tag is not the last token.
+        assert _is_oq_model("Qwen3.5-0.8B-oQ8-fp16") is True
+        assert _is_oq_model("Qwen3.6-27B-oQ6-fp16") is True
+        assert _is_oq_model("Qwen3.6-35B-A3B-oQ4e-fp16") is True
 
 
 class TestHasMeaningfulReadme:

@@ -9,6 +9,7 @@ import asyncio
 import enum
 import json
 import logging
+import re
 import shutil
 import tempfile
 import time
@@ -57,13 +58,16 @@ def _has_meaningful_readme(path: Path) -> bool:
     return True
 
 
+_OQ_TAG_RE = re.compile(r"oQ\d")
+
+
 def _is_oq_model(name: str) -> bool:
     """Check if a model name indicates an oQ-quantized model.
 
-    Any folder name containing 'oQ' (case-sensitive) is treated as an oQ model,
-    e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4e', 'Qwen3.6-27B-oQ3.5e'.
+    oQ models contain an 'oQ<digit>' tag (case-sensitive) anywhere in the
+    name, e.g. 'Qwen3.5-122B-oQ4', 'Llama-3B-oQ4e', 'Qwen3.6-27B-oQ8-fp16'.
     """
-    return "oQ" in name
+    return _OQ_TAG_RE.search(name) is not None
 
 
 def _generate_model_card(
