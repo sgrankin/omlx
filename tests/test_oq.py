@@ -1224,16 +1224,15 @@ class TestTrackedTensor:
         assert r.transform == "slice"
 
     def test_getitem_half_split(self):
+        # Ops-chain model records the slice verbatim; half-split detection
+        # is no longer needed because the materializer replays arr[idx].
         t = _TrackedTensor((256, 2048, 384), "F16", sources=["gate_up"])
         first = t[:, :1024, :]
         assert first.shape == (256, 1024, 384)
-        assert first.transform == "split_0_2"
-        assert first.axis == 1
+        assert first.transform == "slice"
         second = t[:, 1024:, :]
-        assert second.transform == "split_1_2"
-        # bare-slice path (axis 0)
-        t2 = _TrackedTensor((8, 4), "F16", sources=["a"])
-        assert t2[:4].transform == "split_0_2"
+        assert second.shape == (256, 1024, 384)
+        assert second.transform == "slice"
 
     def test_getitem_non_half_stays_slice(self):
         t = _TrackedTensor((256, 2048, 384), "F16", sources=["a"])
@@ -1263,29 +1262,27 @@ class TestTrackedTensor:
 
     def test_moveaxis_method(self):
         t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
-        assert t.moveaxis(0, 2).shape == (3, 4, 2)
-        assert t.moveaxis(0, 2).transform == "moveaxis_0_2"
-        # negative axes normalized
-        assert t.moveaxis(-1, 0).transform == "moveaxis_2_0"
+        r = t.moveaxis(0, 2)
+        assert r.shape == (3, 4, 2)
+        assert r.ops[-1] == ("moveaxis", (0, 2))
+        # negative axes normalized in the recorded args
+        assert t.moveaxis(-1, 0).ops[-1] == ("moveaxis", (2, 0))
 
     def test_transpose_method(self):
         t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
-        assert t.transpose(2, 0, 1).shape == (4, 2, 3)
-        assert t.transpose(2, 0, 1).transform == "transpose_2_0_1"
+        r = t.transpose(2, 0, 1)
+        assert r.shape == (4, 2, 3)
+        assert r.ops[-1] == ("transpose", (2, 0, 1))
         # no-args reverses all axes
-        assert t.transpose().transform == "transpose_2_1_0"
+        assert t.transpose().ops[-1] == ("transpose", (2, 1, 0))
 
-    def test_getitem_ellipsis_half_split(self):
-        # Sanitize patterns like gate_up[..., :mid, :] must round-trip through
-        # the tracked-tensor dry run so streaming discovery covers low-RAM
-        # quantization paths (see #1204).
-        t = _TrackedTensor((256, 2048, 384), "F16", sources=["gate_up"])
-        first = t[..., :1024, :]
-        assert first.shape == (256, 1024, 384)
-        assert first.transform == "split_0_2"
-        assert first.axis == 1
-        second = t[..., 1024:, :]
-        assert second.transform == "split_1_2"
+    def test_getitem_ellipsis_expanded(self):
+        # Ops-chain getitem expands Ellipsis to slices and records the
+        # normalized index verbatim; no error.
+        t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
+        r = t[..., :2]
+        assert r.shape == (2, 3, 2)
+        assert r.transform == "slice"
 
     def test_getitem_ellipsis_trailing(self):
         t = _TrackedTensor((4, 8, 16), "F16", sources=["a"])
@@ -1306,7 +1303,7 @@ class TestTrackedTensor:
 
     def test_getitem_multiple_ellipsis_raises(self):
         t = _TrackedTensor((2, 3, 4), "F16", sources=["a"])
-        with pytest.raises(ValueError):
+        with pytest.raises(IndexError):
             t[..., :2, ...]
 
     def test_size_property(self):
@@ -1344,7 +1341,7 @@ class TestDiscoverSanitizePlan:
         assert plan is not None
         assert set(plan.keys()) == set(tensors.keys())
         for k, info in plan.items():
-            assert info["transform"] == "passthrough"
+            assert info["ops"] == [("passthrough", ())]
             assert info["sources"] == [k]
 
     def test_rename_sanitize(self, sf_file):
@@ -1371,15 +1368,109 @@ class TestDiscoverSanitizePlan:
         assert "model.embed_tokens.weight" not in plan
         assert len(plan) == len(tensors) - 1
 
-    def test_non_replayable_slice_fails_discovery(self, sf_file):
-        path, tensors = sf_file
+    def test_chained_transforms_preserved(self, sf_file):
+        """Gemma 4 bug: sanitize chains swapaxes → slice → swapaxes per
+        gate/up output. Each op must append to the chain, not overwrite."""
+        path, _ = sf_file
         idx = _LazyTensorIndex([path])
 
-        def slice_sanitize(weights):
-            return {k: v[:, :3] for k, v in weights.items()}
+        # Mimic mlx_vlm/models/gemma4: split a fused (E, 2H, In) into
+        # gate (E, H, In) + up (E, H, In) via swapaxes/slice/swapaxes.
+        # Use the gate_proj tensor (16, 8) as a stand-in for a fused (16, 8)
+        # where 16 = 2*H so H=8. The expected gate result has shape (8, 8).
+        def chain_sanitize(weights):
+            v = weights["model.layers.0.mlp.gate_proj.weight"]  # (16, 8)
+            v = v.swapaxes(-1, -2)  # (8, 16)
+            mid = v.shape[-1] // 2
+            return {
+                "gate": v[..., :mid].swapaxes(-1, -2),  # (8, 8)
+                "up":   v[..., mid:].swapaxes(-1, -2),  # (8, 8)
+            }
 
-        with pytest.raises(ValueError, match="non-replayable"):
-            _discover_sanitize_plan(slice_sanitize, idx)
+        plan = _discover_sanitize_plan(chain_sanitize, idx)
+        assert plan is not None
+        # Both outputs must have the right shape (would be wrong with old
+        # single-transform tracking).
+        assert plan["gate"]["shape"] == (8, 8)
+        assert plan["up"]["shape"] == (8, 8)
+        # Chain must record all three ops (swapaxes, slice, swapaxes).
+        gate_ops = plan["gate"]["ops"]
+        assert [op for op, _ in gate_ops] == ["passthrough", "swapaxes", "slice", "swapaxes"]
+
+    def test_chain_replayed_at_materialize(self, sf_file):
+        """End-to-end: a chained sanitize should produce the SAME tensor as
+        eager evaluation of the same chain."""
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        src = mx.array(tensors["model.layers.0.mlp.gate_proj.weight"])  # (16, 8)
+
+        def chain_sanitize(weights):
+            v = weights["model.layers.0.mlp.gate_proj.weight"]
+            v = v.swapaxes(-1, -2)
+            mid = v.shape[-1] // 2
+            return {
+                "gate": v[..., :mid].swapaxes(-1, -2),
+                "up":   v[..., mid:].swapaxes(-1, -2),
+            }
+
+        # Eager reference.
+        ref_v = src.swapaxes(-1, -2)
+        ref_mid = ref_v.shape[-1] // 2
+        ref_gate = ref_v[..., :ref_mid].swapaxes(-1, -2)
+        ref_up = ref_v[..., ref_mid:].swapaxes(-1, -2)
+
+        plan = _discover_sanitize_plan(chain_sanitize, idx)
+        materialized = _DiscoveredPlan(plan, idx)
+        got_gate = materialized.pop("gate")
+        got_up = materialized.pop("up")
+
+        assert got_gate.shape == ref_gate.shape
+        assert got_up.shape == ref_up.shape
+        assert mx.allclose(got_gate, ref_gate).item()
+        assert mx.allclose(got_up, ref_up).item()
+        # Critical: gate and up must NOT be byte-identical (they were under
+        # the old code, which silently fell through to the source).
+        assert not mx.array_equal(got_gate, got_up).item()
+
+    def test_ellipsis_in_index(self, sf_file):
+        """Slice with Ellipsis must compute the right shape and replay."""
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        src = mx.array(tensors["model.layers.0.mlp.gate_proj.weight"])  # (16, 8)
+
+        def slice_sanitize(weights):
+            v = weights["model.layers.0.mlp.gate_proj.weight"]  # (16, 8)
+            return {"first_half": v[..., :4]}  # (16, 4)
+
+        plan = _discover_sanitize_plan(slice_sanitize, idx)
+        assert plan["first_half"]["shape"] == (16, 4)
+        materialized = _DiscoveredPlan(plan, idx)
+        got = materialized.pop("first_half")
+        assert mx.array_equal(got, src[..., :4]).item()
+
+    def test_unknown_op_raises_at_materialize(self, sf_file):
+        """An ops chain with an unknown op must raise — never silently
+        return the source tensor."""
+        path, tensors = sf_file
+        idx = _LazyTensorIndex([path])
+        # Build a plan by hand with a bogus op tag.
+        plan = {
+            "x": {
+                "sources": ["model.layers.0.mlp.gate_proj.weight"],
+                "ops": [("passthrough", ()), ("nonexistent_op", ())],
+                "shape": (16, 8),
+            }
+        }
+        materialized = _DiscoveredPlan(plan, idx)
+        with pytest.raises(ValueError, match="unknown op 'nonexistent_op'"):
+            materialized.pop("x")
+
+    def test_chain_onto_multi_source_raises(self):
+        """Chaining a unary op onto a multi-source result (e.g. after
+        stack) is not supported and must raise loudly."""
+        merged = _TrackedTensor((2, 4, 8), "F16", sources=["a", "b"], ops=[("stack", (0,))])
+        with pytest.raises(NotImplementedError, match="multi-source"):
+            merged.swapaxes(0, 1)
 
 
 # =============================================================================
@@ -2148,8 +2239,6 @@ class TestBuildModelSanitizerTextOnly:
             info_messages = [str(c) for c in mock_logger.info.call_args_list]
             all_messages = " ".join(debug_messages + info_messages)
             assert "mlx-vlm full sanitize" not in all_messages
-
-
 # =============================================================================
 # Test _build_proxy_for_sensitivity MTP patch integration
 # =============================================================================

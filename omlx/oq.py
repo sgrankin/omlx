@@ -749,128 +749,116 @@ def resolve_output_name(
 # ── Auto-discovery streaming sanitizer ──────────────────────────────────
 
 class _TrackedTensor:
-    """Fake tensor proxy that records shape, dtype, lineage, and transforms
-    applied during a sanitize() dry run. Holds no GPU data."""
+    """Fake tensor proxy that records shape, dtype, and a chain of unary ops
+    applied during a sanitize() dry run. Holds no GPU data.
 
-    __slots__ = ("shape", "ndim", "dtype", "sources", "transform", "axis")
+    Each unary op (swapaxes, transpose, slice, etc.) APPENDS to ``ops``
+    instead of overwriting, so chained calls like
+    ``v.swapaxes(-1,-2)[..., :n].swapaxes(-1,-2)`` survive intact.
 
-    def __init__(self, shape, dtype, sources=None, transform="passthrough", axis=None):
+    Multi-source ops (stack, concatenate) reset the chain — their inputs
+    must be passthrough tensors, since we don't track per-child chains
+    feeding into a merge.
+    """
+
+    __slots__ = ("shape", "ndim", "dtype", "sources", "ops")
+
+    def __init__(self, shape, dtype, sources=None, ops=None):
         self.shape = tuple(shape)
         self.ndim = len(self.shape)
         self.dtype = dtype
         self.sources = sources or []
-        self.transform = transform
-        self.axis = axis
+        # ops is a list of (op_name, args_tuple). [("passthrough", ())] means
+        # "load source as-is". Single-source unary ops append; multi-source
+        # ops (stack, concat) put their op as the sole entry.
+        self.ops = ops if ops is not None else [("passthrough", ())]
 
-    def _clone(self, shape=None, dtype=None, transform=None):
+    @property
+    def transform(self):
+        """Last op name — for back-compat with code that inspects a single tag."""
+        return self.ops[-1][0] if self.ops else "passthrough"
+
+    def _chain(self, op_name, args, new_shape, new_dtype=None):
+        """Append a unary op to the chain. Requires single-source input."""
+        if len(self.sources) != 1:
+            # Chaining unary ops on a multi-source result (e.g. after stack)
+            # would need per-child chain replay; we don't support that today.
+            # Fail loud rather than silently dropping the prior chain.
+            raise NotImplementedError(
+                f"_TrackedTensor: chaining {op_name!r} onto multi-source "
+                f"({len(self.sources)} sources) result not supported"
+            )
         return _TrackedTensor(
-            shape if shape is not None else self.shape,
-            dtype if dtype is not None else self.dtype,
+            new_shape,
+            new_dtype if new_dtype is not None else self.dtype,
             list(self.sources),
-            transform if transform is not None else self.transform,
+            list(self.ops) + [(op_name, args)],
         )
 
     # Arithmetic — recipe is "fp8_dequant" for the whole sanitize block if weight came from FP8
     def __add__(self, other):
-        return self._clone(transform="add")
+        return self._chain("add", (), self.shape)
     def __radd__(self, other):
         return self.__add__(other)
     def __sub__(self, other):
-        return self._clone(transform="sub")
+        return self._chain("sub", (), self.shape)
     def __mul__(self, other):
-        return self._clone(transform="mul")
+        return self._chain("mul", (), self.shape)
     def __rmul__(self, other):
         return self.__mul__(other)
     def __truediv__(self, other):
-        return self._clone(transform="div")
-
-    @staticmethod
-    def _slice_length(dim, sl):
-        start, stop, step = sl.indices(dim)
-        return len(range(start, stop, step))
-
-    @staticmethod
-    def _detect_half_split(dim, sl):
-        start, stop, step = sl.indices(dim)
-        if step != 1 or dim <= 0 or dim % 2 != 0:
-            return None
-        length = len(range(start, stop, step))
-        if length != dim // 2:
-            return None
-        if start == 0:
-            return 0
-        if start == dim // 2:
-            return 1
-        return None
+        return self._chain("div", (), self.shape)
 
     def __getitem__(self, idx):
-        new_shape = list(self.shape)
-        if isinstance(idx, tuple):
-            if Ellipsis in idx:
-                # Expand Ellipsis to explicit slice(None) for the missing axes
-                # so the tuple-handling branch below (incl. half-split detection)
-                # works for sanitize patterns like gate_up[..., :mid, :].
-                rank = len(new_shape)
-                explicit = sum(
-                    1 for p in idx if p is not Ellipsis and p is not None
-                )
-                pad = max(0, rank - explicit)
-                expanded: list = []
-                seen = False
-                for part in idx:
-                    if part is Ellipsis:
-                        if seen:
-                            raise ValueError(
-                                "only one Ellipsis allowed in index"
-                            )
-                        seen = True
-                        expanded.extend([slice(None)] * pad)
-                    else:
-                        expanded.append(part)
-                idx = tuple(expanded)
-            result_shape = []
-            axis = 0
-            split_info = None
-            for part in idx:
-                if part is None:
-                    result_shape.append(1)
-                elif isinstance(part, slice):
-                    if axis < len(new_shape):
-                        dim = new_shape[axis]
-                        length = self._slice_length(dim, part)
-                        result_shape.append(length)
-                        half = self._detect_half_split(dim, part)
-                        if half is not None:
-                            split_info = (axis, half, 2)
-                        axis += 1
-                    else:
-                        result_shape.append(1)
+        # Normalize to a tuple, expand Ellipsis to slice(None)*N, then
+        # compute the precise output shape. Store the normalized tuple in
+        # the ops chain so the materializer can replay arr[idx] verbatim.
+        if not isinstance(idx, tuple):
+            idx = (idx,)
+        n_ellipsis = sum(1 for p in idx if p is Ellipsis)
+        if n_ellipsis > 1:
+            raise IndexError("only one Ellipsis allowed in index")
+        if n_ellipsis == 1:
+            n_consumed = sum(1 for p in idx if p is not None and p is not Ellipsis)
+            n_pad = max(0, self.ndim - n_consumed)
+            expanded = []
+            for p in idx:
+                if p is Ellipsis:
+                    expanded.extend([slice(None)] * n_pad)
                 else:
-                    if axis < len(new_shape):
-                        axis += 1
-            while axis < len(new_shape):
-                result_shape.append(new_shape[axis])
-                axis += 1
-            if split_info is not None:
-                ax, idx_n, total = split_info
-                return _TrackedTensor(result_shape, self.dtype, list(self.sources),
-                                     f"split_{idx_n}_{total}", axis=ax)
-            return _TrackedTensor(result_shape, self.dtype, list(self.sources), "slice")
-        if isinstance(idx, slice):
-            dim = new_shape[0] if new_shape else 0
-            length = self._slice_length(dim, idx) if dim > 0 else 0
-            half = self._detect_half_split(dim, idx) if dim > 0 else None
-            if half is not None:
-                return _TrackedTensor([length] + new_shape[1:], self.dtype,
-                                     list(self.sources), f"split_{half}_2", axis=0)
-            result = list(new_shape)
-            if result:
-                result[0] = length
-            return _TrackedTensor(result, self.dtype, list(self.sources), "slice")
-        # int or other
-        if new_shape:
-            return _TrackedTensor(new_shape[1:], self.dtype, list(self.sources), "slice")
-        return self._clone(transform="slice")
+                    expanded.append(p)
+            idx = tuple(expanded)
+
+        new_shape = []
+        src_axis = 0
+        for p in idx:
+            if p is None:
+                new_shape.append(1)
+            elif isinstance(p, slice):
+                if src_axis >= self.ndim:
+                    raise IndexError(
+                        f"too many indices for tracked tensor ndim={self.ndim}"
+                    )
+                start, stop, step = p.indices(self.shape[src_axis])
+                new_shape.append(len(range(start, stop, step)))
+                src_axis += 1
+            elif isinstance(p, int):
+                if src_axis >= self.ndim:
+                    raise IndexError(
+                        f"too many indices for tracked tensor ndim={self.ndim}"
+                    )
+                src_axis += 1  # int removes a dim
+            else:
+                raise NotImplementedError(
+                    f"_TrackedTensor.__getitem__: unsupported index part "
+                    f"{type(p).__name__!r} ({p!r})"
+                )
+        # Append remaining unindexed dims unchanged.
+        while src_axis < self.ndim:
+            new_shape.append(self.shape[src_axis])
+            src_axis += 1
+
+        return self._chain("slice", (idx,), tuple(new_shape))
 
     def reshape(self, *new_shape):
         if len(new_shape) == 1 and isinstance(new_shape[0], (tuple, list)):
@@ -891,46 +879,44 @@ class _TrackedTensor:
                 known_prod *= d
         if unknown_idx >= 0 and known_prod > 0:
             resolved[unknown_idx] = total // known_prod
-        return _TrackedTensor(tuple(resolved), self.dtype, list(self.sources), "reshape")
+        resolved = tuple(resolved)
+        return self._chain("reshape", (resolved,), resolved)
 
     def astype(self, dtype):
-        return _TrackedTensor(self.shape, dtype, list(self.sources), "astype")
+        return self._chain("astype", (dtype,), self.shape, new_dtype=dtype)
 
     @property
     def T(self):
-        perm = tuple(range(len(self.shape) - 1, -1, -1))
-        tag = "transpose_" + "_".join(str(a) for a in perm)
-        return _TrackedTensor(tuple(reversed(self.shape)), self.dtype, list(self.sources), tag)
+        perm = tuple(range(self.ndim - 1, -1, -1))
+        new_shape = tuple(self.shape[i] for i in perm)
+        return self._chain("transpose", perm, new_shape)
 
     def moveaxis(self, source, destination):
-        ndim = len(self.shape)
+        ndim = self.ndim
         src = source % ndim
         dst = destination % ndim
         dims = list(self.shape)
         moved = dims.pop(src)
         dims.insert(dst, moved)
-        tag = f"moveaxis_{src}_{dst}"
-        return _TrackedTensor(tuple(dims), self.dtype, list(self.sources), tag)
+        return self._chain("moveaxis", (src, dst), tuple(dims))
 
     def swapaxes(self, axis1, axis2):
-        ndim = len(self.shape)
+        ndim = self.ndim
         a, b = axis1 % ndim, axis2 % ndim
         dims = list(self.shape)
         dims[a], dims[b] = dims[b], dims[a]
-        tag = f"swapaxes_{a}_{b}"
-        return _TrackedTensor(tuple(dims), self.dtype, list(self.sources), tag)
+        return self._chain("swapaxes", (a, b), tuple(dims))
 
     def transpose(self, *axes):
         if len(axes) == 1 and isinstance(axes[0], (tuple, list)):
             axes = tuple(axes[0])
-        ndim = len(self.shape)
+        ndim = self.ndim
         if not axes:
             perm = tuple(range(ndim - 1, -1, -1))
         else:
             perm = tuple(a % ndim for a in axes)
         new_shape = tuple(self.shape[i] for i in perm)
-        tag = "transpose_" + "_".join(str(a) for a in perm)
-        return _TrackedTensor(new_shape, self.dtype, list(self.sources), tag)
+        return self._chain("transpose", perm, new_shape)
 
     @property
     def size(self):
@@ -1023,25 +1009,36 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "pad": getattr(mx, "pad", None),
     }
 
+    def _require_passthrough(tensors, op):
+        """Multi-source ops can't replay per-child unary chains. Fail loud."""
+        for t in tensors:
+            if isinstance(t, _TrackedTensor) and t.ops != [("passthrough", ())]:
+                raise NotImplementedError(
+                    f"_TrackedTensor: {op} with non-passthrough input not supported "
+                    f"(child ops chain={t.ops!r})"
+                )
+
     def _fake_stack(tensors, axis=0):
         if tensors and isinstance(tensors[0], _TrackedTensor):
+            _require_passthrough(tensors, "stack")
             n = len(tensors)
             base = list(tensors[0].shape)
             new_shape = base[:axis] + [n] + base[axis:]
             all_src = []
             for t in tensors:
                 all_src.extend(t.sources)
-            return _TrackedTensor(new_shape, tensors[0].dtype, all_src, "stack", axis=axis)
+            return _TrackedTensor(new_shape, tensors[0].dtype, all_src, ops=[("stack", (axis,))])
         return _orig["stack"](tensors, axis=axis)
 
     def _fake_concatenate(tensors, axis=0):
         if tensors and isinstance(tensors[0], _TrackedTensor):
+            _require_passthrough(tensors, "concatenate")
             all_src = []
             for t in tensors:
                 all_src.extend(t.sources)
             base = list(tensors[0].shape)
             base[axis] = sum(t.shape[axis] for t in tensors)
-            return _TrackedTensor(base, tensors[0].dtype, all_src, "concatenate", axis=axis)
+            return _TrackedTensor(base, tensors[0].dtype, all_src, ops=[("concatenate", (axis,))])
         return _orig["concatenate"](tensors, axis=axis)
 
     def _fake_split(tensor, indices_or_sections, axis=0):
@@ -1051,42 +1048,34 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                 sz = tensor.shape[axis] // n
                 parts = []
                 for i in range(n):
-                    sh = list(tensor.shape)
-                    sh[axis] = sz
-                    parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}_{n}", axis=axis))
+                    sl = (slice(None),) * axis + (slice(i * sz, (i + 1) * sz),)
+                    new_shape = list(tensor.shape)
+                    new_shape[axis] = sz
+                    parts.append(tensor._chain("slice", (sl,), tuple(new_shape)))
                 return parts
-            # list of indices
+            # List of split indices.
             parts = []
             prev = 0
             idxs = list(indices_or_sections) + [tensor.shape[axis]]
-            for i, idx in enumerate(idxs):
-                sh = list(tensor.shape)
-                sh[axis] = idx - prev
-                parts.append(_TrackedTensor(sh, tensor.dtype, list(tensor.sources), f"split_{i}", axis=axis))
+            for idx in idxs:
+                sl = (slice(None),) * axis + (slice(prev, idx),)
+                new_shape = list(tensor.shape)
+                new_shape[axis] = idx - prev
+                parts.append(tensor._chain("slice", (sl,), tuple(new_shape)))
                 prev = idx
             return parts
         return _orig["split"](tensor, indices_or_sections, axis=axis)
 
     def _fake_moveaxis(tensor, src_ax, dst_ax):
         if isinstance(tensor, _TrackedTensor):
-            src = src_ax % tensor.ndim
-            dst = dst_ax % tensor.ndim
-            dims = list(range(tensor.ndim))
-            dims.insert(dst, dims.pop(src))
-            new_shape = tuple(tensor.shape[d] for d in dims)
-            tag = f"moveaxis_{src}_{dst}"
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), tag)
+            return tensor.moveaxis(src_ax, dst_ax)
         return _orig["moveaxis"](tensor, src_ax, dst_ax)
 
     def _fake_transpose(tensor, axes=None):
         if isinstance(tensor, _TrackedTensor):
             if axes is None:
-                perm = tuple(range(tensor.ndim - 1, -1, -1))
-            else:
-                perm = tuple(a % tensor.ndim for a in axes)
-            new_shape = tuple(tensor.shape[a] for a in perm)
-            tag = "transpose_" + "_".join(str(a) for a in perm)
-            return _TrackedTensor(new_shape, tensor.dtype, list(tensor.sources), tag)
+                return tensor.T
+            return tensor.transpose(*axes)
         return _orig["transpose"](tensor, axes=axes)
 
     def _noop(*a, **kw): pass
@@ -1102,7 +1091,8 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_from_fp8(x, dtype=None, **kw):
         if isinstance(x, _TrackedTensor):
-            return _TrackedTensor(x.shape, dtype or x.dtype, list(x.sources), "from_fp8")
+            out_dtype = dtype or x.dtype
+            return x._chain("from_fp8", (out_dtype,), x.shape, new_dtype=out_dtype)
         return _orig["from_fp8"](x, dtype=dtype, **kw) if _orig["from_fp8"] else x
 
     def _fake_pad(x, pad_width, **kw):
@@ -1114,7 +1104,7 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
                     new_shape.append(d + lo + hi)
                 else:
                     new_shape.append(d)
-            return _TrackedTensor(new_shape, x.dtype, list(x.sources), "pad")
+            return x._chain("pad", (tuple(pad_width),), tuple(new_shape))
         return _orig["pad"](x, pad_width, **kw) if _orig["pad"] else x
 
     if _orig["from_fp8"] is not None:
@@ -1128,32 +1118,20 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         for name, fn in _orig.items():
             setattr(mx, name, fn)
 
-    # Extract plan
-    _REPLAYABLE_PREFIXES = (
-        "passthrough", "literal", "stack", "concatenate", "add",
-        "transpose_", "moveaxis_", "split_",
-    )
+    # Extract plan: each output key gets its sources + ops chain.
     plan = {}
     for k, v in result.items():
         if isinstance(v, _TrackedTensor):
-            t = v.transform
-            if not any(t == p or t.startswith(p) for p in _REPLAYABLE_PREFIXES):
-                raise ValueError(
-                    f"non-replayable transform {t!r} for {k!r} — "
-                    "falling back to eager sanitize"
-                )
             plan[k] = {
                 "sources": v.sources,
-                "transform": t,
+                "ops": v.ops,
                 "shape": v.shape,
-                "axis": v.axis,
             }
         else:
             plan[k] = {
                 "sources": [],
-                "transform": "literal",
+                "ops": [("literal", ())],
                 "shape": getattr(v, "shape", ()),
-                "axis": None,
                 "value": v,
             }
 
@@ -1226,97 +1204,88 @@ class _DiscoveredPlan:
             raise KeyError(key)
 
         info = self._plan.pop(key)
-        transform = info["transform"]
+        ops = info["ops"]
         sources = info["sources"]
 
-        if transform == "literal":
+        # Literal: sanitize returned a non-tensor (e.g. scalar override).
+        if ops and ops[0][0] == "literal":
             return info["value"]
 
-        if transform == "passthrough" and len(sources) == 1:
-            arr = self._materialize_source(sources[0])
-            return arr
+        # Multi-source ops: handled before the unary chain.
+        if ops and ops[0][0] == "stack":
+            axis = ops[0][1][0]
+            arr = self._materialize_stack(sources, axis)
+            return self._apply_ops(arr, ops[1:], key)
 
-        if transform == "stack":
-            # Chunked stacking to bound peak memory
-            axis = info.get("axis", 0)
-            chunk = self._STACK_CHUNK
-            partials = []
-            for base in range(0, len(sources), chunk):
-                piece = []
-                for src in sources[base:base + chunk]:
-                    piece.append(self._materialize_source(src))
-                stk = mx.stack(piece, axis=axis)
-                mx.eval(stk)
-                del piece
-                mx.clear_cache()
-                partials.append(stk)
-            if len(partials) == 1:
-                return partials[0]
-            result = mx.concatenate(partials, axis=axis)
-            mx.eval(result)
-            del partials
-            mx.clear_cache()
-            return result
-
-        if transform == "concatenate":
-            axis = info.get("axis", 0)
+        if ops and ops[0][0] == "concatenate":
+            axis = ops[0][1][0]
             parts = [self._materialize_source(src) for src in sources]
-            result = mx.concatenate(parts, axis=axis)
-            mx.eval(result)
+            arr = mx.concatenate(parts, axis=axis)
+            mx.eval(arr)
             del parts
             mx.clear_cache()
-            return result
+            return self._apply_ops(arr, ops[1:], key)
 
-        if transform == "add":
-            arr = self._materialize_source(sources[0])
-            return arr + 1.0  # norm weight += 1.0 pattern
-
-        if transform == "transpose" or transform.startswith("transpose_"):
-            arr = self._materialize_source(sources[0])
-            if transform == "transpose":
-                return mx.transpose(arr)  # legacy: full axis reverse
-            axes = tuple(int(p) for p in transform.split("_")[1:])
-            return mx.transpose(arr, axes=axes)
-
-        if transform == "moveaxis" or transform.startswith("moveaxis_"):
-            arr = self._materialize_source(sources[0])
-            if transform == "moveaxis":
-                return mx.moveaxis(arr, 2, 1)  # legacy: conv1d weight permute
-            src_ax, dst_ax = (int(p) for p in transform.split("_")[1:])
-            return mx.moveaxis(arr, src_ax, dst_ax)
-
-        if transform.startswith("swapaxes_"):
-            arr = self._materialize_source(sources[0])
-            a, b = (int(p) for p in transform.split("_")[1:])
-            return mx.swapaxes(arr, a, b)
-
-        if "split_" in transform:
-            # split_N_M means take part N of M
-            parts = transform.split("_")
-            arr = self._materialize_source(sources[0])
-            axis = info.get("axis", 0)
-            if len(parts) == 3:  # split_idx_total
-                idx, total = int(parts[1]), int(parts[2])
-                chunks = mx.split(arr, total, axis=axis)
-                result = chunks[idx]
-                mx.eval(result)
-                del arr, chunks
-                mx.clear_cache()
-                return result
-            # split_idx (index-based split) — less common
-            return arr
-
-        if transform == "slice":
+        # Single-source unary chain.
+        if len(sources) != 1:
             raise ValueError(
-                f"cannot replay arbitrary slice for {key!r} — "
-                "discovery should fall back to eager sanitize"
+                f"cannot materialize {key!r}: ops={ops!r} with "
+                f"{len(sources)} sources (expected 1 for unary chain)"
             )
+        arr = self._materialize_source(sources[0])
+        return self._apply_ops(arr, ops, key)
 
-        # Fallback: passthrough (identity) — load first source unchanged
-        if transform == "passthrough" and sources:
-            return self._materialize_source(sources[0])
+    def _materialize_stack(self, sources, axis):
+        """Chunked stack to bound peak memory for huge MoE expert lists."""
+        chunk = self._STACK_CHUNK
+        partials = []
+        for base in range(0, len(sources), chunk):
+            piece = [self._materialize_source(src) for src in sources[base:base + chunk]]
+            stk = mx.stack(piece, axis=axis)
+            mx.eval(stk)
+            del piece
+            mx.clear_cache()
+            partials.append(stk)
+        if len(partials) == 1:
+            return partials[0]
+        result = mx.concatenate(partials, axis=axis)
+        mx.eval(result)
+        del partials
+        mx.clear_cache()
+        return result
 
-        raise ValueError(f"cannot materialize {key!r}: transform={transform}, no sources")
+    def _apply_ops(self, arr, ops, key):
+        """Replay a unary ops chain on ``arr``. Raise loud on unknown ops —
+        we never want to silently return a wrong-but-plausible tensor."""
+        for op_name, args in ops:
+            if op_name == "passthrough":
+                continue
+            elif op_name == "swapaxes":
+                arr = mx.swapaxes(arr, args[0], args[1])
+            elif op_name == "transpose":
+                arr = mx.transpose(arr, axes=args)
+            elif op_name == "moveaxis":
+                arr = mx.moveaxis(arr, args[0], args[1])
+            elif op_name == "slice":
+                arr = arr[args[0]]
+            elif op_name == "reshape":
+                arr = arr.reshape(args[0])
+            elif op_name == "astype":
+                arr = arr.astype(args[0])
+            elif op_name == "add":
+                arr = arr + 1.0  # legacy: norm weight += 1.0 pattern
+            elif op_name == "from_fp8":
+                arr = mx.from_fp8(arr, dtype=args[0])
+            elif op_name == "pad":
+                arr = mx.pad(arr, args[0])
+            else:
+                raise ValueError(
+                    f"cannot materialize {key!r}: unknown op {op_name!r} "
+                    f"(args={args!r}). Add a handler in _apply_ops or "
+                    f"reject in _TrackedTensor."
+                )
+        mx.eval(arr)
+        return arr
 
 
 
