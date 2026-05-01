@@ -3314,7 +3314,7 @@ def _measure_sensitivity_from_quantized_model(
     layer by re-quantizing at (bits-1). The relative MSE ranking matches
     fp16 qdq-MSE with ~90% top-10 overlap.
     """
-    from mlx_lm import load as lm_load
+    is_vlm = "vision_config" in config
 
     # Mirror the main quantize path's MTP patch sequence so an
     # MTP-bearing quantized proxy (e.g. a Qwen3.5 LLM oQ output with
@@ -3338,7 +3338,16 @@ def _measure_sensitivity_from_quantized_model(
         if _have_lm_patch:
             set_mtp_active(True)
         try:
-            model, tokenizer = lm_load(model_path, lazy=True)
+            if is_vlm:
+                from mlx_lm.utils import load_tokenizer
+                from mlx_vlm.utils import load_model as vlm_load_model
+
+                model = vlm_load_model(Path(model_path), lazy=True)
+                tokenizer = load_tokenizer(model_path)
+            else:
+                from mlx_lm import load as lm_load
+
+                model, tokenizer = lm_load(model_path, lazy=True)
         except Exception as e:
             logger.error(f"Sensitivity proxy load failed ({e})")
             return {}
