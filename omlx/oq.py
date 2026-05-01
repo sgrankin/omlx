@@ -3161,8 +3161,10 @@ def _measure_sensitivity_from_model(
         )
         out_quant = _forward_layer(block, inputs, layer_mask, position_ids)
         if out_quant is not None:
-            raw_mse = ((out_float - out_quant) ** 2).mean()
-            out_magnitude = (out_float ** 2).mean()
+            diff32 = (out_float - out_quant).astype(mx.float32)
+            base32 = out_float.astype(mx.float32)
+            raw_mse = (diff32 ** 2).mean()
+            out_magnitude = (base32 ** 2).mean()
             mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
             mx.eval(mse_val)
             sensitivity[layer_idx] = mse_val.item()
