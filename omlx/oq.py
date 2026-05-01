@@ -2473,10 +2473,21 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-    config["_oq_sensitivity_map"] = {
-        str(k): v for k, v in sensitivity_map.items()
+    finite_map = {
+        str(k): v for k, v in sensitivity_map.items() if v == v
     }
-    logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+    if not finite_map or max(finite_map.values()) == 0.0:
+        logger.warning(
+            f"oQ{oq_level:g}: sensitivity map degenerate "
+            f"({len(sensitivity_map) - len(finite_map)} NaN, "
+            f"max={max(finite_map.values(), default=0.0):.4f}); "
+            "falling back to position-based"
+        )
+    else:
+        config["_oq_sensitivity_map"] = finite_map
+        logger.info(
+            f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)"
+        )
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
