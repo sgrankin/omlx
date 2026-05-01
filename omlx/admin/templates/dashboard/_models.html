@@ -1493,6 +1493,20 @@
                                                 </button>
                                             </div>
                                         </div>
+                                        <!-- Skip Sensitivity (low-memory bootstrap) -->
+                                        <div class="flex items-center justify-between">
+                                            <div class="flex-1 min-w-0">
+                                                <span class="text-sm text-neutral-600">Skip Sensitivity</span>
+                                                <p class="text-xs text-neutral-400 mt-0.5 leading-relaxed">Use position-based fallback (early + late layers boosted). Output gets a <code>-nosens</code> suffix. Useful as a low-memory bootstrap when the source can't fit for sensitivity measurement.</p>
+                                            </div>
+                                            <button type="button"
+                                                    @click="oqSkipSensitivity = !oqSkipSensitivity"
+                                                    :class="oqSkipSensitivity ? 'bg-black' : 'bg-neutral-200'"
+                                                    class="relative w-11 h-6 rounded-full transition-colors duration-300 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-black shrink-0">
+                                                <span :class="oqSkipSensitivity ? 'translate-x-5' : 'translate-x-0'"
+                                                      class="block w-5 h-5 bg-white rounded-full shadow-sm transform transition-transform duration-300 absolute top-0.5 left-0.5"></span>
+                                            </button>
+                                        </div>
                                     </div>
                                 </div>
                                 <!-- Error -->

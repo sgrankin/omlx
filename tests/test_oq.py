@@ -695,6 +695,30 @@ class TestResolveOutputName:
             == "Model-oQ4-mtp"
         )
 
+    def test_skip_sensitivity_appends_nosens(self):
+        assert (
+            resolve_output_name("Model-7B", 6, skip_sensitivity=True)
+            == "Model-7B-oQ6-nosens"
+        )
+
+    def test_skip_sensitivity_with_float16(self):
+        assert (
+            resolve_output_name("Model-7B", 6, "float16", skip_sensitivity=True)
+            == "Model-7B-oQ6-nosens-fp16"
+        )
+
+    def test_strips_nosens_suffix(self):
+        assert (
+            resolve_output_name("Model-oQ6-nosens", 4)
+            == "Model-oQ4"
+        )
+
+    def test_strips_chained_nosens_fp16(self):
+        assert (
+            resolve_output_name("Model-oQ6-nosens-fp16", 4)
+            == "Model-oQ4"
+        )
+
 
 class TestOqDtypeModelSupport:
     def test_rejects_deepseek_v4_float16(self):
@@ -904,6 +928,7 @@ class TestSourceHasNextnTensors:
             )
             is False
         )
+
 
 
 # =============================================================================

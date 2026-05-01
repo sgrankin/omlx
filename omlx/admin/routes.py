@@ -402,6 +402,7 @@ class OQStartRequest(BaseModel):
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    skip_sensitivity: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -7461,6 +7462,7 @@ async def start_oq_quantization(
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
+            skip_sensitivity=request.skip_sensitivity,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

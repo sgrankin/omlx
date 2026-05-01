@@ -88,6 +88,7 @@ class QuantTask:
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    skip_sensitivity: bool = False
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -295,6 +296,7 @@ class OQManager:
         imatrix_num_samples: int = 128,
         imatrix_seq_length: int = 512,
         mtp_assistant_model_path: str = "",
+        skip_sensitivity: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -385,6 +387,7 @@ class OQManager:
             dtype,
             preserve_mtp=preserve_mtp,
             enhanced=enhanced,
+            skip_sensitivity=skip_sensitivity,
         )
         if mtp_assistant_model_path and not output_name.endswith("-mtp"):
             output_name += "-mtp"
@@ -449,6 +452,7 @@ class OQManager:
             imatrix_num_samples=imatrix_num_samples,
             imatrix_seq_length=imatrix_seq_length,
             mtp_assistant_model_path=mtp_assistant_model_path,
+            skip_sensitivity=skip_sensitivity,
         )
         self._tasks[task_id] = task
 
@@ -628,6 +632,7 @@ class OQManager:
                     imatrix_strict=task.imatrix_strict,
                     imatrix_num_samples=task.imatrix_num_samples,
                     imatrix_seq_length=task.imatrix_seq_length,
+                    skip_sensitivity=task.skip_sensitivity,
                 )
 
                 if task_id in self._cancelled:

@@ -681,6 +681,7 @@
             oqeReuseImatrixCache: true,
             oqeImatrixCachePath: '',
             oqeStrictImatrix: false,
+            oqSkipSensitivity: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -11352,6 +11353,7 @@
                         preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
                         mtp_assistant_model_path: this.oqMtpAssistantCandidates().some(m => m.path === this.oqMtpAssistantPath)
                             ? this.oqMtpAssistantPath : '',
+                        skip_sensitivity: this.oqSkipSensitivity,
                     };
                     if (this.oqEnhanced) {
                         payload.enhanced = true;
