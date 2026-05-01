@@ -7768,7 +7768,7 @@ def _measure_sensitivity_from_model(
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
         logger.info(
             f"oQ{oq_level:g}: layer sensitivity (descending): "
-            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+            + ", ".join(f"L{i}={s:.6f}" for i, s in ranked)
         )
 
     return sensitivity
@@ -8459,7 +8459,7 @@ def _measure_sensitivity_from_quantized_model(
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
         logger.info(
             f"oQ{oq_level:g}: proxy sensitivity (descending): "
-            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+            + ", ".join(f"L{i}={s:.6f}" for i, s in ranked)
         )
 
     return sensitivity
