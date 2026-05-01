@@ -805,6 +805,7 @@ def resolve_output_name(
     oq_level: int,
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
+    skip_sensitivity: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -813,6 +814,9 @@ def resolve_output_name(
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
     config fields were preserved through quantization.
 
+    Appends `-nosens` when sensitivity is skipped, so the bootstrap build
+    doesn't collide with a later sensitivity-targeted run of the same level.
+
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
         "Qwen3.5-122B-A10B" + 4 + float16  -> "Qwen3.5-122B-A10B-oQ4-fp16"
@@ -820,7 +824,7 @@ def resolve_output_name(
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp|nosens)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -831,6 +835,8 @@ def resolve_output_name(
         base = new
     level_str = f"{oq_level:g}"
     suffix = f"-oQ{level_str}"
+    if skip_sensitivity:
+        suffix += "-nosens"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_mtp:
@@ -2244,6 +2250,7 @@ def quantize_oq_streaming(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     auto_proxy_sensitivity: bool = True,
+    skip_sensitivity: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -2367,6 +2374,9 @@ def quantize_oq_streaming(
         if oq_level == 8:
             logger.info(f"oQ{oq_level:g}: sensitivity skipped (no effect at base=8)")
             sensitivity_map = {}
+        elif skip_sensitivity:
+            logger.info(f"oQ{oq_level:g}: sensitivity skipped (skip_sensitivity=True)")
+            sensitivity_map = {}
         elif sensitivity_model_path:
             logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
             sensitivity_map = _measure_sensitivity_from_quantized_model(
@@ -2419,12 +2429,12 @@ def quantize_oq_streaming(
                 num_samples=128, seq_length=256,
             )
 
-    # Single enforcement point. Inner measurement helpers may return {} on
-    # load / calibration / layer-discovery failure; treat that as a hard
-    # error here so the rest of quantize_oq_streaming never runs without a
-    # data-driven sensitivity map. oQ8 deliberately produces an empty map
-    # (see above) — exempt it from this check.
-    if oq_level != 8 and not sensitivity_map:
+    # Single enforcement point — but only when measurement was attempted.
+    # The oq_level==8 and skip_sensitivity branches intentionally set
+    # sensitivity_map={} and want the run to proceed to position-based
+    # weighting; the inner measurement helpers also return {} on
+    # load / calibration / layer-discovery failure, which IS a hard error.
+    if oq_level != 8 and not skip_sensitivity and not sensitivity_map:
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
             "Check the preceding log lines for the root cause (model load, "
@@ -2473,21 +2483,22 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-    finite_map = {
-        str(k): v for k, v in sensitivity_map.items() if v == v
-    }
-    if not finite_map or max(finite_map.values()) == 0.0:
-        logger.warning(
-            f"oQ{oq_level:g}: sensitivity map degenerate "
-            f"({len(sensitivity_map) - len(finite_map)} NaN, "
-            f"max={max(finite_map.values(), default=0.0):.4f}); "
-            "falling back to position-based"
-        )
-    else:
-        config["_oq_sensitivity_map"] = finite_map
-        logger.info(
-            f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)"
-        )
+    if oq_level != 8 and not skip_sensitivity:
+        finite_map = {
+            str(k): v for k, v in sensitivity_map.items() if v == v
+        }
+        if not finite_map or max(finite_map.values()) == 0.0:
+            logger.warning(
+                f"oQ{oq_level:g}: sensitivity map degenerate "
+                f"({len(sensitivity_map) - len(finite_map)} NaN, "
+                f"max={max(finite_map.values(), default=0.0):.4f}); "
+                "falling back to position-based"
+            )
+        else:
+            config["_oq_sensitivity_map"] = finite_map
+            logger.info(
+                f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)"
+            )
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:

@@ -78,6 +78,7 @@ class QuantTask:
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
+    skip_sensitivity: bool = False
 
     def to_dict(self) -> dict:
         """Serialize task to JSON-compatible dict."""
@@ -239,6 +240,7 @@ class OQManager:
         dtype: str = "bfloat16",
         preserve_mtp: bool = False,
         auto_proxy_sensitivity: bool = True,
+        skip_sensitivity: bool = False,
     ) -> QuantTask:
         """Start a quantization job.
 
@@ -272,6 +274,9 @@ class OQManager:
         model_name = source.name
         output_name = resolve_output_name(
             model_name, oq_level, dtype, preserve_mtp=preserve_mtp
+        )
+        output_name = resolve_output_name(
+            model_name, oq_level, dtype, skip_sensitivity=skip_sensitivity
         )
         output_path = self._output_dir / output_name
 
@@ -315,6 +320,7 @@ class OQManager:
             dtype=dtype,
             preserve_mtp=preserve_mtp,
             auto_proxy_sensitivity=auto_proxy_sensitivity,
+            skip_sensitivity=skip_sensitivity,
         )
         self._tasks[task_id] = task
 
@@ -473,6 +479,7 @@ class OQManager:
                     task.dtype,
                     task.preserve_mtp,
                     task.auto_proxy_sensitivity,
+                    task.skip_sensitivity,
                 )
 
                 if task_id in self._cancelled:

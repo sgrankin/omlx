@@ -342,6 +342,7 @@
             oqDtype: 'bfloat16',
             oqSensitivityModelPath: '',
             oqPreserveMtp: false,
+            oqSkipSensitivity: false,
 
             // oQ Uploader state
             uploadHfToken: localStorage.getItem('omlx-hf-upload-token') || '',
@@ -3850,6 +3851,7 @@
                             text_only: this.oqTextOnly,
                             dtype: this.oqDtype,
                             preserve_mtp: this.oqSelectedModelHasMtp() ? this.oqPreserveMtp : false,
+                            skip_sensitivity: this.oqSkipSensitivity,
                         }),
                     });
                     const data = await response.json().catch(() => ({}));

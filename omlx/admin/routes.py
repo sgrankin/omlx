@@ -312,6 +312,7 @@ class OQStartRequest(BaseModel):
     dtype: str = "bfloat16"
     preserve_mtp: bool = False
     auto_proxy_sensitivity: bool = True
+    skip_sensitivity: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -5337,6 +5338,7 @@ async def start_oq_quantization(
             dtype=request.dtype,
             preserve_mtp=request.preserve_mtp,
             auto_proxy_sensitivity=request.auto_proxy_sensitivity,
+            skip_sensitivity=request.skip_sensitivity,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:
