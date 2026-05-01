@@ -1473,6 +1473,75 @@ class TestDiscoverSanitizePlan:
             merged.swapaxes(0, 1)
 
 
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestValidatePlanAgainstModel:
+    """The model-shape cross-check is the safety net that catches discovery
+    bugs before they corrupt 50 GB of quantized weights."""
+
+    def test_mismatch_raises(self):
+        from omlx.oq import _validate_plan_against_model
+
+        # Synthetic Llama config so the model class actually loads.
+        config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": 100,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": False,
+        }
+        # Plan where one key has the wrong shape — must abort.
+        plan = {
+            "model.layers.0.self_attn.q_proj.weight": {
+                "sources": ["x"],
+                "ops": [("passthrough", ())],
+                "shape": (999, 999),  # wrong: model expects (64, 64)
+            },
+        }
+        with pytest.raises(ValueError, match="plan disagrees with model"):
+            _validate_plan_against_model(plan, config)
+
+    def test_match_passes(self):
+        from omlx.oq import _collect_param_shapes_from_model_class, _validate_plan_against_model
+
+        config = {
+            "architectures": ["LlamaForCausalLM"],
+            "model_type": "llama",
+            "hidden_size": 64,
+            "intermediate_size": 128,
+            "num_hidden_layers": 1,
+            "num_attention_heads": 4,
+            "num_key_value_heads": 4,
+            "vocab_size": 100,
+            "rms_norm_eps": 1e-5,
+            "max_position_embeddings": 128,
+            "rope_theta": 10000.0,
+            "tie_word_embeddings": False,
+        }
+        expected = _collect_param_shapes_from_model_class(config)
+        # Build a plan from the model's own declared shapes — must pass.
+        plan = {
+            k: {"sources": ["x"], "ops": [("passthrough", ())], "shape": shape}
+            for k, shape in expected.items()
+        }
+        _validate_plan_against_model(plan, config)  # no raise
+
+    def test_unloadable_model_class_warns_not_raises(self, caplog):
+        from omlx.oq import _validate_plan_against_model
+
+        # Bogus architecture — model class can't be loaded.
+        config = {"architectures": ["NoSuchModelForSomething"], "model_type": "nope"}
+        plan = {"x": {"sources": [], "ops": [("passthrough", ())], "shape": (1,)}}
+        # Best-effort: must not raise.
+        _validate_plan_against_model(plan, config)
+
+
 # =============================================================================
 # Test _model_exceeds_ram guard
 # =============================================================================

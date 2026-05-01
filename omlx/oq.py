@@ -431,6 +431,99 @@ def _collect_named_weight_shapes_from_weights(weights: dict[str, Any]) -> dict[s
     return named_shapes
 
 
+def _collect_param_shapes_from_model_class(config: dict) -> dict[str, tuple] | None:
+    """Instantiate the model class (no real weights) and walk every named
+    parameter to collect declared shapes. Used to validate the discovered
+    sanitize plan against the layout the model will actually accept at
+    load time. Returns None if the model class can't be loaded.
+
+    mlx is lazy, so instantiating a multi-billion-param model only builds
+    the unevaluated graph — no GPU allocation."""
+    architectures = config.get("architectures", [])
+    is_vlm = any("ForConditionalGeneration" in a for a in architectures)
+
+    try:
+        if is_vlm:
+            from mlx_vlm.utils import get_model_and_args
+
+            model_module, _ = get_model_and_args(config)
+            model_config = model_module.ModelConfig.from_dict(config)
+            # Some configs nest vision/text/audio configs as dicts; resolve.
+            for attr, cls_attr in (
+                ("vision_config", "VisionConfig"),
+                ("text_config", "TextConfig"),
+                ("audio_config", "AudioConfig"),
+            ):
+                v = getattr(model_config, attr, None)
+                if isinstance(v, dict):
+                    cls = getattr(model_module, cls_attr, None)
+                    if cls is not None:
+                        setattr(model_config, attr, cls.from_dict(v))
+            model = model_module.Model(model_config)
+        else:
+            from mlx_lm.utils import _get_classes
+
+            model_class, model_args_class = _get_classes(config)
+            args = model_args_class.from_dict(config)
+            model = model_class(args)
+    except Exception as e:
+        logger.debug(f"Plan validation: could not load model class: {e}")
+        return None
+
+    shapes = {}
+    for path, arr in tree_flatten(model.parameters()):
+        if hasattr(arr, "shape"):
+            shapes[path] = tuple(arr.shape)
+    return shapes
+
+
+def _validate_plan_against_model(plan: dict, config: dict) -> None:
+    """Cross-check discovered sanitize plan against the model class's
+    declared parameter shapes. Raises if any common key has a mismatch.
+
+    This is the safety net that makes the discovery sanitizer fail loud
+    instead of writing a corrupt model. The proxy layer can produce
+    wrong-but-plausible shapes if a sanitize op-chain isn't replayed
+    correctly; the model class is the ground truth.
+
+    Best-effort: silent return if the model class can't be loaded."""
+    expected = _collect_param_shapes_from_model_class(config)
+    if expected is None:
+        logger.warning(
+            "Plan shape validation skipped (model class not loadable). "
+            "Discovery output is not cross-checked — silent corruption is "
+            "possible if sanitize uses an unhandled op pattern."
+        )
+        return
+
+    mismatches = []
+    for key, info in plan.items():
+        exp = expected.get(key)
+        if exp is None:
+            continue  # Plan key not declared by the model — sanitize may legitimately add aux keys.
+        got = tuple(info.get("shape", ()))
+        if exp != got:
+            mismatches.append((key, exp, got))
+
+    if mismatches:
+        lines = ["Sanitize plan disagrees with model parameter shapes:"]
+        for key, exp, got in mismatches[:10]:
+            lines.append(f"  {key}: model expects {exp}, plan produced {got}")
+        if len(mismatches) > 10:
+            lines.append(f"  ... and {len(mismatches) - 10} more")
+        lines.append(
+            "This usually means _TrackedTensor / _DiscoveredPlan can't replay "
+            "an op chain in the model's sanitize() — fix discovery rather than "
+            "let quantization write corrupt weights."
+        )
+        raise ValueError("\n".join(lines))
+
+    logger.info(
+        f"Plan shape validation OK ({len(plan)} discovered keys, "
+        f"{sum(1 for k in plan if k in expected)} cross-checked)"
+    )
+
+
 def _is_routed_expert(path: str) -> bool:
     """Check if a tensor belongs to routed MoE experts (93-98% of params)."""
     if "switch_mlp" in path:
@@ -2350,6 +2443,10 @@ def quantize_oq_streaming(
     if sanitize_fn is not None:
         try:
             plan = _discover_sanitize_plan(sanitize_fn, all_weights)
+            # Cross-check before wrapping: if the proxy layer produced
+            # shapes the model wouldn't accept at load_weights time,
+            # fail HERE rather than after writing 50 GB of corrupt data.
+            _validate_plan_against_model(plan, config)
             all_weights = _DiscoveredPlan(plan, all_weights)
             logger.info(
                 f"oQ{oq_level:g}: discovered streaming sanitize plan, "
