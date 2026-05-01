@@ -3325,6 +3325,27 @@ def _build_proxy_for_sensitivity(
             set_mtp_active(prev_active)
 
 
+def _vlm_load_tolerant(vlm_load_fn, model_path: Path):
+    """Call mlx_vlm.utils.load_model with strict=False on the inner load_weights.
+
+    Quantized Gemma 3n outputs contain k/v tensors for KV-shared layers
+    that the runtime model class doesn't expose; the default strict load
+    rejects them. The proxy is a forward-only sensitivity measurement, so
+    a partial load is acceptable here.
+    """
+    orig_load = nn.Module.load_weights
+
+    def tolerant_load(self, weights, strict=True):
+        return orig_load(self, weights, strict=False)
+
+    nn.Module.load_weights = tolerant_load
+    try:
+        return vlm_load_fn(model_path, lazy=True)
+    finally:
+        nn.Module.load_weights = orig_load
+
+
+
 def _measure_sensitivity_from_quantized_model(
     model_path: str, config: dict, oq_level,
     calib_dataset="code_multilingual",
@@ -3364,7 +3385,7 @@ def _measure_sensitivity_from_quantized_model(
                 from mlx_lm.utils import load_tokenizer
                 from mlx_vlm.utils import load_model as vlm_load_model
 
-                model = vlm_load_model(Path(model_path), lazy=True)
+                model = _vlm_load_tolerant(vlm_load_model, Path(model_path))
                 tokenizer = load_tokenizer(model_path)
             else:
                 from mlx_lm import load as lm_load
