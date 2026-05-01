@@ -3393,8 +3393,10 @@ def _measure_sensitivity_from_quantized_model(
                 continue
             bits = getattr(m, "bits", 4)
             gs = getattr(m, "group_size", 64)
-            perturb_bits = bits - 1
-            if perturb_bits not in _REQUANT_VALID_BITS:
+            perturb_bits = max(
+                (b for b in _REQUANT_VALID_BITS if b < bits), default=None
+            )
+            if perturb_bits is None:
                 continue
             w_float = mx.dequantize(
                 m.weight, m.scales, getattr(m, "biases", None),
