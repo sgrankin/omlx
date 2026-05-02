@@ -2143,6 +2143,57 @@ def _quantize_chunked(w, group_size, bits, mode):
 # --- end chunked-quantize helpers ---
 
 
+_SHARD_PATTERN = re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$")
+
+
+def _validate_shard_set_complete(source: Path, weight_files: list[Path]) -> None:
+    """Refuse to quantize from an incomplete shard set.
+
+    If model.safetensors.index.json is present, every shard it references
+    must exist. Otherwise, parse the 'model-NNNNN-of-MMMMM' naming pattern
+    and require the full 1..MMMMM range. Single-file or custom-named layouts
+    skip validation.
+
+    A partial download otherwise streams successfully through whatever
+    shards are present and produces a silently corrupt output.
+    """
+    index_path = source / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            idx = json.load(f)
+        wm = idx.get("weight_map", {})
+        referenced = sorted({Path(v).name for v in wm.values()})
+        present = {p.name for p in weight_files}
+        missing = [r for r in referenced if r not in present]
+        if missing:
+            raise ValueError(
+                f"Incomplete model at {source}: index.json references "
+                f"{len(referenced)} shards but {len(missing)} are missing "
+                f"({', '.join(missing[:5])}{'…' if len(missing) > 5 else ''})"
+            )
+        return
+
+    matches = [_SHARD_PATTERN.match(p.name) for p in weight_files]
+    if not all(matches):
+        return
+    totals = {int(m.group(2)) for m in matches}
+    if len(totals) != 1:
+        raise ValueError(
+            f"Inconsistent shard naming at {source}: total counts "
+            f"{sorted(totals)}"
+        )
+    total = totals.pop()
+    present_idx = {int(m.group(1)) for m in matches}
+    missing = sorted(set(range(1, total + 1)) - present_idx)
+    if missing:
+        raise ValueError(
+            f"Incomplete model at {source}: {total} shards expected, "
+            f"missing {len(missing)} "
+            f"(indices {missing[:5]}{'…' if len(missing) > 5 else ''}). "
+            f"No model.safetensors.index.json — finish the download first."
+        )
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
@@ -2236,6 +2287,7 @@ def quantize_oq_streaming(
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
+    _validate_shard_set_complete(source, weight_files)
 
     cb("loading", 8.0)
 
