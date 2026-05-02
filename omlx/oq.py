@@ -1142,24 +1142,28 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
 
     def _fake_split(tensor, indices_or_sections, axis=0):
         if isinstance(tensor, _TrackedTensor):
+            # Negative axis would build a too-short slice tuple — and at replay
+            # time numpy/mlx slice indexing applies to leading dims, not the
+            # intended axis. Normalize first.
+            ax = axis if axis >= 0 else axis + len(tensor.shape)
             if isinstance(indices_or_sections, int):
                 n = indices_or_sections
-                sz = tensor.shape[axis] // n
+                sz = tensor.shape[ax] // n
                 parts = []
                 for i in range(n):
-                    sl = (slice(None),) * axis + (slice(i * sz, (i + 1) * sz),)
+                    sl = (slice(None),) * ax + (slice(i * sz, (i + 1) * sz),)
                     new_shape = list(tensor.shape)
-                    new_shape[axis] = sz
+                    new_shape[ax] = sz
                     parts.append(tensor._chain("slice", (sl,), tuple(new_shape)))
                 return parts
             # List of split indices.
             parts = []
             prev = 0
-            idxs = list(indices_or_sections) + [tensor.shape[axis]]
+            idxs = list(indices_or_sections) + [tensor.shape[ax]]
             for idx in idxs:
-                sl = (slice(None),) * axis + (slice(prev, idx),)
+                sl = (slice(None),) * ax + (slice(prev, idx),)
                 new_shape = list(tensor.shape)
-                new_shape[axis] = idx - prev
+                new_shape[ax] = idx - prev
                 parts.append(tensor._chain("slice", (sl,), tuple(new_shape)))
                 prev = idx
             return parts
