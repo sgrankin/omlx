@@ -1453,10 +1453,9 @@
             },
 
             async init() {
-
+                // Auto-inject API key from server (admin session already authenticated)
                 const serverApiKey = {{ api_key | tojson }};
-
-        if (serverApiKey) {
+                if (serverApiKey) {
             localStorage.setItem('omlx_chat_api_key', serverApiKey);
         }
 
