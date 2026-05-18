@@ -509,9 +509,11 @@ def test_generate_mean_matches_hidden_state_diff():
     negative = ["aaa", "bbb", "ccc"]
 
     sv = generate_steering_vector(
-        model, tok, positive, negative, method="mean", model_name="fake"
+        model, tok, positive, negative,
+        method="mean", scaling="unit", model_name="fake",
     )
-    assert sv.layers == list(range(N_LAYERS))
+    # Default skips the final layer.
+    assert sv.layers == list(range(N_LAYERS - 1))
     assert sv.n_embd == N_EMBD
     assert sv.method == "mean"
 
@@ -522,7 +524,7 @@ def test_generate_mean_matches_hidden_state_diff():
     ]
     expected = mx.stack(diffs).mean(axis=0)
     expected = expected / mx.linalg.norm(expected)
-    for il in range(N_LAYERS):
+    for il in sv.layers:
         assert mx.allclose(sv.directions[il], expected, atol=1e-5)
         assert abs(float(mx.linalg.norm(sv.directions[il])) - 1.0) < 1e-5
 
@@ -533,8 +535,10 @@ def test_generate_pca_direction_is_oriented_and_unit():
     positive = ["high", "more", "most", "peak"]
     negative = ["low", "less", "dips", "base"]
 
-    sv = generate_steering_vector(model, tok, positive, negative, method="pca")
-    for il in range(N_LAYERS):
+    sv = generate_steering_vector(
+        model, tok, positive, negative, method="pca", scaling="unit"
+    )
+    for il in sv.layers:
         d = sv.directions[il]
         assert abs(float(mx.linalg.norm(d)) - 1.0) < 1e-5
         # The diffs should project positively onto the oriented direction.
@@ -554,11 +558,11 @@ def test_generate_crosscov_direction_oriented_and_unit():
     negative = ["low", "less", "dips", "base", "tiny", "thin"]
 
     sv = generate_steering_vector(
-        model, tok, positive, negative, method="crosscov"
+        model, tok, positive, negative, method="crosscov", scaling="unit"
     )
     assert sv.method == "crosscov"
-    assert sv.layers == list(range(N_LAYERS))
-    for il in range(N_LAYERS):
+    assert sv.layers == list(range(N_LAYERS - 1))
+    for il in sv.layers:
         d = sv.directions[il]
         assert abs(float(mx.linalg.norm(d)) - 1.0) < 1e-5
         diffs = mx.stack(
@@ -620,11 +624,38 @@ def test_generate_with_orthogonalize():
         ["aa", "bb", "cc"],
         ["xx", "yy", "zz"],
         method="mean",
+        scaling="unit",
         orthogonalize=True,
     )
-    assert sv.layers == list(range(N_LAYERS))
+    assert sv.layers == list(range(N_LAYERS - 1))
     for d in sv.directions.values():
         assert abs(float(mx.linalg.norm(d)) - 1.0) < 1e-4
+
+
+def test_generate_skips_last_layer_by_default():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model, FakeTokenizer(), ["aa", "bb"], ["xx", "yy"], method="mean"
+    )
+    assert sv.layers == list(range(N_LAYERS - 1))
+    assert (N_LAYERS - 1) not in sv.directions
+
+
+def test_generate_explicit_layers_can_include_last():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model, FakeTokenizer(), ["aa", "bb"], ["xx", "yy"],
+        method="mean", layers=[0, N_LAYERS - 1],
+    )
+    assert sv.layers == [0, N_LAYERS - 1]
+
+
+def test_generate_default_scaling_is_magnitude():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model, FakeTokenizer(), ["aa", "bb"], ["xx", "yy"], method="mean"
+    )
+    assert sv.scaling == "magnitude"
 
 
 def test_generate_restores_model_after_run():
@@ -706,7 +737,7 @@ def test_generate_magnitude_scaling_equals_raw_mean_diff():
         for p, n in zip(positive, negative)
     ]
     expected = mx.stack(diffs).mean(axis=0)  # raw mean difference
-    for il in range(N_LAYERS):
+    for il in sv.layers:
         assert mx.allclose(sv.directions[il], expected, atol=1e-2, rtol=1e-4)
     # And the directions are not unit-norm (that is the point of "magnitude").
     norms = [float(mx.linalg.norm(d)) for d in sv.directions.values()]
@@ -724,7 +755,7 @@ def test_generate_on_vlm_uses_language_model():
         method="mean",
         model_name="fake-vlm",
     )
-    assert sv.layers == list(range(N_LAYERS))
+    assert sv.layers == list(range(N_LAYERS - 1))
     assert sv.n_embd == N_EMBD
     # The text decoder's blocks must be restored after capture.
     assert all(

@@ -35,9 +35,19 @@ per-layer last-token hidden state, then reduce:
 | `pca` | leading principal component of the differences | dominated by within-class variance — picks up confounds |
 | `crosscov` | eigenvector of the symmetrized cross-covariance `AᵀB` of baseline-centred classes, most-negative eigenvalue, Fisher-discriminant tie-break | cleanest separation of the trait from shared structure; wants many pairs (~`n_embd`) |
 
-`--scaling magnitude` scales each layer's direction by its mean projection
-magnitude (vs. unit norm) so one `strength` behaves consistently across
-layers of differing residual-stream magnitude.
+Scaling — `--scaling magnitude` (the **default**) scales each layer's
+direction by its mean projection magnitude rather than to unit norm, so a
+single `strength` behaves consistently across layers (see the calibration
+finding below). `--scaling unit` is available for the unit-norm form.
+
+`--orthogonalize` projects each layer's direction orthogonal to that
+layer's control-class mean (ds4's default generator step) — strips the
+component aligned with general activation drift. Composable with any
+method.
+
+By default the generator **skips the final layer** — steering it perturbs
+the pre-logit state directly and its direction is a magnitude outlier. An
+explicit `--layers` list is honoured exactly.
 
 ## Empirical comparison
 
@@ -61,8 +71,26 @@ steers toward the sensitive class (the model deflects harder).
 | `mean` add/unit | ±0.13 clean | symmetric: −0.13 engages, +0.13 hard-refuses |
 | `pca` add/unit | — | **incoherent** — sign does not map cleanly to behaviour; the axis is contaminated |
 | `crosscov` add/unit | ±0.1 (degrades by ±0.2) | symmetric and clean; −0.2 produced an English factual-historical answer |
-| `crosscov` add/magnitude | ±0.11 | ≈ unit here — the direction's mean projection magnitude was ~0.95, so magnitude scaling barely differed |
 | `crosscov` project | +0..1 coherent | stable even at strength 1 on the ablation (+) side; the amplify (−) side blows up fast; removes the component but does not *inject* the opposite |
+
+### Per-layer scaling — calibration measurement
+
+Measured across all 40 layers (crosscov direction, residual norm `|h|`
+from the captured activations):
+
+- `|h|` grows **35×** with depth (0.6 → 21.7); the mean projection
+  magnitude grows in lockstep — **corr(mag, |h|) = 0.99**.
+- A **unit**-scaled direction therefore lands a perturbation whose size
+  *relative to the activation* varies 35× across layers — coefficient of
+  variation **0.86**. One `strength` is badly mis-calibrated.
+- **Magnitude** scaling tracks `|h|`, flattening the relative
+  perturbation to CV **0.22** — ~4× better calibrated. Behaviourally, the
+  same strength on an early vs. late layer band gave consistent effects
+  under magnitude scaling and inconsistent ones under unit.
+
+This is why `magnitude` is the default. (The earlier method comparison
+above steered only layers 10–26, where `|h|` is mid-range, so it did not
+expose the difference — the spread is across the *full* depth.)
 
 ### Findings
 
@@ -76,9 +104,8 @@ steers toward the sensitive class (the model deflects harder).
   pairs — it is the principled default; `mean` is a fine cheap fallback.
 - **Additive** steering gives clean *bidirectional* control but a narrow
   window (±~0.1; ±0.2 starts to degrade). It both removes and injects.
-- **`magnitude` scaling** did not visibly help here because the
-  `crosscov` direction's per-layer projection magnitude happened to be
-  ≈1. It matters when per-layer magnitudes vary widely.
+- **`magnitude` scaling** calibrates the per-layer perturbation ~4× better
+  than unit (CV 0.86 → 0.22) — the default.
 - **Projection** is the most *coherence-stable* (fluent even at
   strength 1) but one-directional in practice — it ablates a behaviour
   rather than injecting its opposite, and its amplify (negative-strength)
@@ -86,10 +113,12 @@ steers toward the sensitive class (the model deflects harder).
 
 ### Recommendation
 
-`crosscov` generation, `add` mode, with a strength swept via
+`crosscov` generation with the default `magnitude` scaling (and the
+default last-layer skip), applied in `add` mode, with a strength swept via
 `omlx steering eval` (the window is model- and layer-band-specific).
-Use `project` when the goal is to *remove* a behaviour and coherence at
-high strength matters more than bidirectional control.
+`--orthogonalize` is a cheap, well-motivated extra for confounded prompt
+sets. Use `project` when the goal is to *remove* a behaviour and coherence
+at high strength matters more than bidirectional control.
 
 ## Known limitations
 

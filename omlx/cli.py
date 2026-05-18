@@ -1687,12 +1687,12 @@ Example directory structure:
     steering_gen.add_argument(
         "--scaling",
         type=str,
-        default="unit",
+        default="magnitude",
         choices=["unit", "magnitude"],
         help=(
-            "Per-layer scaling: 'unit' (unit-norm directions) or 'magnitude' "
-            "(scale by mean projection, so one strength works across layers). "
-            "Default: unit"
+            "Per-layer scaling: 'magnitude' (scale by mean projection so one "
+            "strength works across layers — recommended) or 'unit' (unit-norm "
+            "directions). Default: magnitude"
         ),
     )
     steering_gen.add_argument(
