@@ -195,7 +195,7 @@ def generate_steering_vector(
     method: str = "pca",
     model_name: str = "",
     layers: list[int] | None = None,
-    scaling: str = "unit",
+    scaling: str = "magnitude",
     orthogonalize: bool = False,
 ) -> SteeringVector:
     """Build a :class:`SteeringVector` from contrastive prompt pairs.
@@ -213,11 +213,15 @@ def generate_steering_vector(
             (cross-covariance contrastive axis — cleaner separation of the
             trait from confounds, but wants many prompt pairs).
         model_name: Free-form provenance string stored in the vector.
-        layers: Restrict generation to these layer indices (default: all).
-        scaling: "unit" — each direction normalised to unit length; or
-            "magnitude" — scaled by the mean projection magnitude, so a
-            single additive strength behaves consistently across layers
-            (compensates for residual-stream growth with depth).
+        layers: Restrict generation to these layer indices. Default: all
+            layers except the last — steering the final layer perturbs the
+            pre-logit state directly and its direction is a magnitude
+            outlier. An explicit list is honoured exactly (last included).
+        scaling: "magnitude" (default) — each direction scaled by its mean
+            projection magnitude, so one additive strength behaves
+            consistently across layers (the residual stream grows ~35x in
+            norm with depth; magnitude scaling tracks it, corr ~0.99). Or
+            "unit" — every direction normalised to unit length.
         orthogonalize: When True, project each layer's direction orthogonal
             to that layer's control-class (negative) mean before scaling
             (ds4's default generator step) — strips the component aligned
@@ -256,7 +260,12 @@ def generate_steering_vector(
     block_list = container.layers
     n_layers = len(block_list)
 
-    target_layers = sorted(layers) if layers is not None else list(range(n_layers))
+    if layers is not None:
+        target_layers = sorted(layers)
+    else:
+        # Skip the final layer: steering it perturbs the pre-logit state
+        # directly, and its direction is a magnitude outlier.
+        target_layers = list(range(n_layers - 1)) or [0]
     for il in target_layers:
         if il < 0 or il >= n_layers:
             raise ValueError(f"layer {il} out of range (model has {n_layers})")
