@@ -1,13 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Monkey-patch: apply a steering vector to a loaded mlx-lm / mlx-vlm model.
 
-Each transformer block in the model is wrapped so that, after it produces
-its residual-stream output ``h``, the layer's steering direction is added::
-
-    h <- h + direction[il]
-
-The directions passed in here are already scaled by strength and filtered
-to the configured layer range (see :meth:`SteeringVector.layer_map`).
+Each transformer block is wrapped so that, after it produces its
+residual-stream output ``h``, one or more steering specs are applied —
+an additive bias and/or directional projections (see
+:class:`~omlx.steering.SteeringSpec` and :class:`_SteeredLayer`).
 
 Applied once at load time by ``apply_post_load_transforms`` and reversible
 via :func:`remove_steering_patch`, so a cached model object can be re-used
@@ -21,6 +18,8 @@ from typing import Any
 
 import mlx.core as mx
 import mlx.nn as nn
+
+from ..steering import SteeringSpec
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +63,17 @@ def model_hidden_size(model: Any) -> int | None:
 
 
 class _SteeredLayer(nn.Module):
-    """Wraps a transformer block, adding a steering direction to its output.
+    """Wraps a transformer block, steering its residual-stream output.
+
+    Applies, in order, an optional additive bias and any number of
+    directional projections::
+
+        h <- h + add_bias
+        h <- h - strength · (d̂ · h) · d̂      (for each projection)
+
+    ``add_bias`` is the pre-summed contribution of every additive spec for
+    this layer; projections are kept separate because they are not linear in
+    the activation. See :func:`apply_steering_patch`.
 
     A real ``nn.Module`` (not a bare proxy): the wrapped block is registered
     as a child module, so its parameters stay visible to MLX's tree
@@ -74,30 +83,45 @@ class _SteeredLayer(nn.Module):
     ``patches/specprefill`` (removed in a ``finally``), this patch is
     persistent, so correct parameter tracking matters.
 
-    The steering direction is stored as a plain instance attribute via
-    ``object.__setattr__`` so MLX does not register it as a trainable
-    parameter — it is a fixed bias, not a weight, and must not be quantized
-    or serialised with the model.
+    Steering data is stored via ``object.__setattr__`` so MLX does not
+    register it as a trainable parameter — it is fixed configuration, not a
+    weight, and must not be quantized or serialised with the model.
     """
 
-    def __init__(self, block: Any, direction: mx.array):
+    def __init__(
+        self,
+        block: Any,
+        add_bias: mx.array | None,
+        projections: list[tuple[mx.array, float]],
+    ):
         super().__init__()
         # Register the block as a dict-child directly: when it is a real
         # nn.Module, MLX's traversal recurses into it for parameters();
         # when it is a plain object it is just a leaf entry.
         self["block"] = block
-        object.__setattr__(self, "_steer_direction", direction)
+        object.__setattr__(self, "_steer_add", add_bias)
+        object.__setattr__(self, "_steer_proj", projections)
+
+    def _steer(self, h: mx.array) -> mx.array:
+        # Cast steering data to the hidden dtype so a bf16/fp16 residual
+        # stream is not silently promoted to f32.
+        if self._steer_add is not None:
+            h = h + self._steer_add.astype(h.dtype)
+        for unit, strength in self._steer_proj:
+            u = unit.astype(h.dtype)
+            # Per-token component of h along the (unit) direction.
+            coeff = (h * u).sum(axis=-1, keepdims=True)
+            h = h - strength * coeff * u
+        return h
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
         out = self["block"](*args, **kwargs)
         # A block returns either the hidden state directly or a tuple whose
         # first element is the hidden state (some architectures also return
-        # cache/aux entries). Cast the direction to the hidden dtype so a
-        # bf16/fp16 residual stream is not silently promoted to f32.
+        # cache/aux entries).
         if isinstance(out, tuple):
-            h = out[0]
-            return (h + self._steer_direction.astype(h.dtype),) + tuple(out[1:])
-        return out + self._steer_direction.astype(out.dtype)
+            return (self._steer(out[0]),) + tuple(out[1:])
+        return self._steer(out)
 
     def __getattr__(self, name: str) -> Any:
         # Reached for names absent from the wrapper; delegate to the block
@@ -111,16 +135,17 @@ class _SteeredLayer(nn.Module):
 
 def apply_steering_patch(
     model: Any,
-    layer_map: dict[int, mx.array],
+    specs: list[SteeringSpec],
     *,
     n_embd: int | None = None,
 ) -> int:
-    """Wrap transformer blocks so configured layers add their direction.
+    """Wrap transformer blocks to steer their output per the given specs.
 
     Args:
         model: A loaded mlx-lm / mlx-vlm model object.
-        layer_map: Maps absolute layer index -> already-scaled direction
-            array (see :meth:`SteeringVector.layer_map`).
+        specs: Steering specs to apply together. Additive ("add") specs sum
+            into a single per-layer bias; projection ("project") specs apply
+            in sequence after it.
         n_embd: Optional expected hidden size; when given and derivable
             from the model, a mismatch raises rather than failing later
             inside the forward pass.
@@ -129,10 +154,10 @@ def apply_steering_patch(
         The number of layers actually patched.
 
     Removes any prior steering patch first, so this is safe to call again
-    with a new ``layer_map`` (e.g. after a settings change).
+    with new specs (e.g. after a settings change).
     """
     remove_steering_patch(model)
-    if not layer_map:
+    if not specs:
         return 0
 
     container = find_layers_container(model)
@@ -143,15 +168,33 @@ def apply_steering_patch(
 
     expected = model_hidden_size(model) or n_embd
     if expected is not None:
-        for il, direction in layer_map.items():
-            if direction.shape[-1] != expected:
+        for spec in specs:
+            if spec.vector.n_embd != expected:
                 raise ValueError(
-                    f"steering direction for layer {il} has size "
-                    f"{direction.shape[-1]}, but model n_embd is {expected}"
+                    f"steering vector n_embd {spec.vector.n_embd} does not "
+                    f"match model n_embd {expected}"
+                )
+
+    # Resolve specs into per-layer operations: additive contributions sum;
+    # projections accumulate as an ordered list.
+    add_bias: dict[int, mx.array] = {}
+    projections: dict[int, list[tuple[mx.array, float]]] = {}
+    for spec in specs:
+        for il, direction in spec.active_directions().items():
+            if spec.mode == "add":
+                contrib = (direction * spec.strength).astype(mx.float32)
+                add_bias[il] = (
+                    contrib if il not in add_bias else add_bias[il] + contrib
+                )
+            else:  # "project" — the formula needs a unit direction
+                norm = mx.linalg.norm(direction)
+                unit = direction / norm if float(norm) > 1e-8 else direction
+                projections.setdefault(il, []).append(
+                    (unit.astype(mx.float32), spec.strength)
                 )
 
     patched = 0
-    for il, direction in layer_map.items():
+    for il in sorted(set(add_bias) | set(projections)):
         if il < 0 or il >= n_layers:
             logger.warning(
                 "steering: layer %d out of range (model has %d layers), skipping",
@@ -159,12 +202,20 @@ def apply_steering_patch(
                 n_layers,
             )
             continue
-        layers[il] = _SteeredLayer(layers[il], direction)
+        layers[il] = _SteeredLayer(
+            layers[il], add_bias.get(il), projections.get(il, [])
+        )
         patched += 1
 
     if patched:
         model._omlx_steering_active = True
-        logger.info("Steering patch applied to %d/%d layers", patched, n_layers)
+        logger.info(
+            "Steering patch applied to %d/%d layers (%d spec%s)",
+            patched,
+            n_layers,
+            len(specs),
+            "" if len(specs) == 1 else "s",
+        )
     return patched
 
 

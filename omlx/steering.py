@@ -48,12 +48,17 @@ class SteeringVector:
             length ``n_embd``.
         n_embd: Model hidden size the directions were built for.
         method: How the vector was produced ("pca", "mean", "manual").
+        scaling: Per-layer scaling applied at generation time — "unit"
+            (each direction normalised to unit length) or "magnitude"
+            (scaled by the mean projection magnitude, so a single strength
+            knob behaves consistently across layers).
         model: Identifier of the source model (free-form, for provenance).
     """
 
     directions: dict[int, mx.array] = field(default_factory=dict)
     n_embd: int = 0
     method: str = "manual"
+    scaling: str = "unit"
     model: str = ""
 
     def __post_init__(self) -> None:
@@ -88,6 +93,7 @@ class SteeringVector:
             "omlx_steering_version": str(STEERING_FORMAT_VERSION),
             "n_embd": str(self.n_embd),
             "method": self.method,
+            "scaling": self.scaling,
             "model": self.model,
         }
         mx.save_safetensors(str(path), arrays, metadata=metadata)
@@ -137,6 +143,7 @@ class SteeringVector:
             directions=directions,
             n_embd=n_embd,
             method=metadata.get("method", "manual") or "manual",
+            scaling=metadata.get("scaling", "unit") or "unit",
             model=metadata.get("model", "") or "",
         )
 
@@ -160,3 +167,53 @@ class SteeringVector:
                 continue
             result[il] = (vec * strength).astype(mx.float32)
         return result
+
+
+# Supported application modes (see SteeringSpec.mode).
+STEERING_MODES = ("add", "project")
+
+
+@dataclass
+class SteeringSpec:
+    """One steering vector applied with a mode, strength and layer range.
+
+    A model may be steered by several specs at once (see
+    :func:`omlx.patches.steering.apply_steering_patch`): additive specs sum
+    into a single per-layer bias; projection specs apply in sequence.
+
+    Attributes:
+        vector: The steering directions to apply.
+        strength: Scale factor. For "add" mode it scales the direction. For
+            "project" mode, 1.0 fully removes the direction's component from
+            the activation, 0 is a no-op, <0 amplifies it, >1 flips it.
+        mode: "add" — additive residual-stream bias (``h += strength·d``);
+            "project" — directional projection
+            (``h -= strength·(d̂·h)·d̂``), which is self-calibrating across
+            layers because it scales with the activation itself.
+        layer_start: First layer to steer (inclusive; None = unbounded).
+        layer_end: Last layer to steer (inclusive; None = unbounded).
+    """
+
+    vector: SteeringVector
+    strength: float = 1.0
+    mode: str = "add"
+    layer_start: int | None = None
+    layer_end: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.mode not in STEERING_MODES:
+            raise ValueError(
+                f"unknown steering mode {self.mode!r}; "
+                f"expected one of {STEERING_MODES}"
+            )
+
+    def active_directions(self) -> dict[int, mx.array]:
+        """Directions within the configured layer range (unscaled)."""
+        out: dict[int, mx.array] = {}
+        for il, vec in self.vector.directions.items():
+            if self.layer_start is not None and il < self.layer_start:
+                continue
+            if self.layer_end is not None and il > self.layer_end:
+                continue
+            out[il] = vec
+        return out
