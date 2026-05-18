@@ -67,13 +67,17 @@ class _HiddenCapture(nn.Module):
 
 
 def _collect_hidden(
-    model: Any,
+    text_model: Any,
     tokenizer: Any,
     prompts: list[str],
     sink: dict[int, mx.array],
     n_layers: int,
 ) -> dict[int, mx.array]:
-    """Run the model on each prompt; return ``{layer: [n_prompts, n_embd]}``."""
+    """Run a text forward on each prompt; return ``{layer: [n_prompts, n_embd]}``.
+
+    ``text_model`` is the object whose forward pass is a pure-text decode —
+    the model itself for an LLM, or ``model.language_model`` for a VLM.
+    """
     from mlx_lm.models.cache import make_prompt_cache
 
     acc: dict[int, list[mx.array]] = {il: [] for il in range(n_layers)}
@@ -83,7 +87,7 @@ def _collect_hidden(
             raise ValueError(f"prompt {idx} tokenized to an empty sequence")
         tokens = mx.array(ids)[None]  # [1, seq]
         sink.clear()
-        model(tokens, cache=make_prompt_cache(model))
+        text_model(tokens, cache=make_prompt_cache(text_model))
         mx.eval(list(sink.values()))
         missing = [il for il in range(n_layers) if il not in sink]
         if missing:
@@ -122,11 +126,14 @@ def generate_steering_vector(
     method: str = "pca",
     model_name: str = "",
     layers: list[int] | None = None,
+    scaling: str = "unit",
 ) -> SteeringVector:
     """Build a :class:`SteeringVector` from contrastive prompt pairs.
 
     Args:
-        model: A loaded mlx-lm model object.
+        model: A loaded mlx-lm LLM, or an mlx-vlm VLM — for a VLM the text
+            decoder (``model.language_model``) is driven directly so the
+            forward pass is pure text.
         tokenizer: Its tokenizer (must expose ``.encode``).
         positive: Prompts exhibiting the target behaviour.
         negative: Prompts exhibiting the opposite; must be the same length
@@ -134,12 +141,20 @@ def generate_steering_vector(
         method: "pca" (leading principal component) or "mean".
         model_name: Free-form provenance string stored in the vector.
         layers: Restrict generation to these layer indices (default: all).
+        scaling: "unit" — each direction normalised to unit length; or
+            "magnitude" — scaled by the mean projection magnitude, so a
+            single additive strength behaves consistently across layers
+            (compensates for residual-stream growth with depth).
 
     Returns:
-        A normalised SteeringVector with one direction per requested layer.
+        A SteeringVector with one direction per requested layer.
     """
     if method not in ("pca", "mean"):
         raise ValueError(f"unknown method {method!r}; expected 'pca' or 'mean'")
+    if scaling not in ("unit", "magnitude"):
+        raise ValueError(
+            f"unknown scaling {scaling!r}; expected 'unit' or 'magnitude'"
+        )
     if len(positive) != len(negative):
         raise ValueError(
             f"positive/negative prompt counts differ: "
@@ -149,11 +164,10 @@ def generate_steering_vector(
         raise ValueError("need at least one contrastive prompt pair")
     if method == "pca" and len(positive) < 2:
         raise ValueError("PCA needs at least 2 prompt pairs; use method='mean'")
-    if getattr(model, "language_model", None) is not None:
-        raise ValueError(
-            "steering vector generation supports text LLMs only; got a "
-            "VLM-shaped model (has a .language_model submodule)"
-        )
+
+    # For a VLM, drive the text decoder directly so the forward pass is a
+    # pure-text decode (the top-level forward expects vision inputs).
+    text_model = getattr(model, "language_model", None) or model
 
     container = find_layers_container(model)
     if container is None:
@@ -174,9 +188,9 @@ def generate_steering_vector(
         block_list[i] = _HiddenCapture(block_list[i], sink, i)
     try:
         logger.info("Capturing hidden states for %d positive prompts", len(positive))
-        pos_hidden = _collect_hidden(model, tokenizer, positive, sink, n_layers)
+        pos_hidden = _collect_hidden(text_model, tokenizer, positive, sink, n_layers)
         logger.info("Capturing hidden states for %d negative prompts", len(negative))
-        neg_hidden = _collect_hidden(model, tokenizer, negative, sink, n_layers)
+        neg_hidden = _collect_hidden(text_model, tokenizer, negative, sink, n_layers)
     finally:
         for i in range(n_layers):
             block_list[i] = originals[i]
@@ -187,21 +201,32 @@ def generate_steering_vector(
         vec = diff.mean(axis=0) if method == "mean" else _pca_direction(diff)
         norm = mx.linalg.norm(vec)
         if float(norm) < 1e-8:
-            logger.warning("layer %d direction is near-zero; leaving unnormalised", il)
+            logger.warning("layer %d direction is near-zero; leaving unscaled", il)
+            directions[il] = vec.astype(mx.float32)
+            continue
+        unit = vec / norm
+        if scaling == "magnitude":
+            # Scale the unit direction by the mean signed projection of the
+            # per-pair differences onto it — compensates for the residual
+            # stream growing with depth, so one strength knob works for all
+            # layers (jukofyork's per-layer scaling).
+            magnitude = float(mx.abs((diff @ unit).mean()))
+            directions[il] = (unit * magnitude).astype(mx.float32)
         else:
-            vec = vec / norm
-        directions[il] = vec.astype(mx.float32)
+            directions[il] = unit.astype(mx.float32)
 
     n_embd = int(next(iter(directions.values())).shape[-1])
     logger.info(
-        "Generated steering vector: %d layers, n_embd=%d, method=%s",
+        "Generated steering vector: %d layers, n_embd=%d, method=%s, scaling=%s",
         len(directions),
         n_embd,
         method,
+        scaling,
     )
     return SteeringVector(
         directions=directions,
         n_embd=n_embd,
         method=method,
+        scaling=scaling,
         model=model_name,
     )

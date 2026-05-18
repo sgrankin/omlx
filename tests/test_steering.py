@@ -131,6 +131,14 @@ class RealModel(nn.Module):
         self.args = SimpleNamespace(hidden_size=n_embd)
 
 
+class FakeVLM:
+    """A VLM-shaped model: the text decoder lives under .language_model."""
+
+    def __init__(self, n_layers: int, n_embd: int, vocab: int = 256):
+        self.language_model = FakeModel(n_layers, n_embd, vocab)
+        self.config = SimpleNamespace(hidden_size=n_embd)
+
+
 # ---------------------------------------------------------------------------
 # SteeringVector — native file I/O
 # ---------------------------------------------------------------------------
@@ -574,6 +582,66 @@ def test_generate_rejects_unknown_method():
         generate_steering_vector(
             model, FakeTokenizer(), ["a", "b"], ["c", "d"], method="bogus"
         )
+
+
+def test_generate_rejects_unknown_scaling():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    with pytest.raises(ValueError, match="unknown scaling"):
+        generate_steering_vector(
+            model,
+            FakeTokenizer(),
+            ["a", "b"],
+            ["c", "d"],
+            method="mean",
+            scaling="bogus",
+        )
+
+
+def test_generate_magnitude_scaling_equals_raw_mean_diff():
+    """method=mean + scaling=magnitude reproduces the un-normalised mean diff.
+
+    With unit u = meandiff/||meandiff||, the magnitude |mean(diff·u)| equals
+    ||meandiff||, so unit·magnitude == the raw mean difference.
+    """
+    model = FakeModel(N_LAYERS, N_EMBD)
+    tok = FakeTokenizer()
+    positive = ["AAA", "BBB", "CCC"]
+    negative = ["aaa", "bbb", "ccc"]
+
+    sv = generate_steering_vector(
+        model, tok, positive, negative, method="mean", scaling="magnitude"
+    )
+    assert sv.scaling == "magnitude"
+
+    diffs = [
+        model._emb[ord(p[-1]) % 256] - model._emb[ord(n[-1]) % 256]
+        for p, n in zip(positive, negative)
+    ]
+    expected = mx.stack(diffs).mean(axis=0)  # raw mean difference
+    for il in range(N_LAYERS):
+        assert mx.allclose(sv.directions[il], expected, atol=1e-2, rtol=1e-4)
+    # And the directions are not unit-norm (that is the point of "magnitude").
+    norms = [float(mx.linalg.norm(d)) for d in sv.directions.values()]
+    assert not all(abs(n - 1.0) < 1e-3 for n in norms)
+
+
+def test_generate_on_vlm_uses_language_model():
+    """A VLM-shaped model is steered via its text decoder, not rejected."""
+    vlm = FakeVLM(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        vlm,
+        FakeTokenizer(),
+        ["aa", "bb", "cc"],
+        ["xx", "yy", "zz"],
+        method="mean",
+        model_name="fake-vlm",
+    )
+    assert sv.layers == list(range(N_LAYERS))
+    assert sv.n_embd == N_EMBD
+    # The text decoder's blocks must be restored after capture.
+    assert all(
+        isinstance(b, FakeBlock) for b in vlm.language_model.model.layers
+    )
 
 
 def test_generated_vector_roundtrips_through_disk(tmp_path):
