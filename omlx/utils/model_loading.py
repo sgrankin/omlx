@@ -1092,7 +1092,36 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
         if applied:
             logger.info(f"IndexCache applied: freq={index_cache_freq}")
 
+    _maybe_apply_steering(model, model_settings)
+
     return model
+
+
+def _maybe_apply_steering(model: Any, model_settings: Any) -> None:
+    """Apply a configured steering vector to the residual stream.
+
+    Failures are logged and swallowed: a misconfigured steering vector
+    must not prevent the model from loading and serving requests.
+    """
+    steering_path = getattr(model_settings, "steering_vector", None)
+    if not steering_path:
+        return
+    try:
+        from ..patches.steering import apply_steering_patch
+        from ..steering import SteeringVector
+
+        vector = SteeringVector.load(steering_path)
+        layer_map = vector.layer_map(
+            strength=getattr(model_settings, "steering_strength", 1.0) or 1.0,
+            layer_start=getattr(model_settings, "steering_layer_start", None),
+            layer_end=getattr(model_settings, "steering_layer_end", None),
+        )
+        patched = apply_steering_patch(model, layer_map, n_embd=vector.n_embd)
+        logger.info(
+            "Steering vector applied: %d layers from %s", patched, steering_path
+        )
+    except Exception as e:
+        logger.error("Failed to apply steering vector %s: %s", steering_path, e)
 
 
 def maybe_load_custom_quantization(
