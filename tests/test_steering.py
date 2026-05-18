@@ -244,6 +244,14 @@ def test_model_hidden_size():
     assert model_hidden_size(FakeModel(N_LAYERS, N_EMBD)) == N_EMBD
 
 
+def test_find_layers_container_resolves_vlm():
+    """For a VLM the deepest list (language_model.model.layers) must win."""
+    vlm = FakeVLM(N_LAYERS, N_EMBD)
+    container = find_layers_container(vlm)
+    assert container is vlm.language_model.model
+    assert len(container.layers) == N_LAYERS
+
+
 def test_apply_patch_adds_direction():
     model = FakeModel(N_LAYERS, N_EMBD)
     direction = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
@@ -642,6 +650,33 @@ def test_generate_on_vlm_uses_language_model():
     assert all(
         isinstance(b, FakeBlock) for b in vlm.language_model.model.layers
     )
+
+
+def test_drop_mtp_weights_on_load_filters_mtp_tensors():
+    """The MTP-drop shim removes mtp.* tensors from a load_weights call."""
+    import mlx.nn as nn
+
+    from omlx.cli import _drop_mtp_weights_on_load
+
+    received: list = []
+    original = nn.Module.load_weights
+    nn.Module.load_weights = lambda self, w, *a, **k: received.append(list(w))
+    try:
+        with _drop_mtp_weights_on_load():
+            nn.Module.load_weights(
+                object(),
+                [
+                    ("language_model.layers.0.self_attn.q_proj.weight", 1),
+                    ("language_model.mtp.layers.0.self_attn.q_proj.weight", 2),
+                    ("mtp.norm.weight", 3),
+                ],
+            )
+    finally:
+        nn.Module.load_weights = original
+
+    assert received == [[("language_model.layers.0.self_attn.q_proj.weight", 1)]]
+    # The shim restores the original load_weights on exit.
+    assert nn.Module.load_weights is original
 
 
 def test_generated_vector_roundtrips_through_disk(tmp_path):

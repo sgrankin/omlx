@@ -15,6 +15,7 @@ Usage:
 """
 
 import argparse
+import contextlib
 import faulthandler
 import sys
 
@@ -509,6 +510,100 @@ def _parse_layer_spec(spec: str | None) -> list[int] | None:
     return [int(tok) for tok in spec.split(",") if tok.strip()]
 
 
+@contextlib.contextmanager
+def _drop_mtp_weights_on_load():
+    """Scoped shim: drop ``mtp.*`` tensors during ``load_weights``.
+
+    MTP (multi-token prediction) heads are a decoding accelerator and play
+    no part in steering. Some checkpoints (e.g. Qwen3.6) ship MTP-head
+    weights that mlx-vlm's loader does not sanitize away — it sanitizes
+    against the ``LanguageModel`` class, never the ``Model.sanitize`` that
+    drops them — so a plain load rejects them as unexpected parameters.
+    Filtering them here loads the model as an ordinary non-MTP model,
+    which is exactly what steering needs.
+    """
+    import mlx.nn as _nn
+
+    original = _nn.Module.load_weights
+
+    def _filtered(self, weights, *args, **kwargs):
+        if isinstance(weights, list):
+            weights = [
+                (k, v)
+                for k, v in weights
+                if ".mtp." not in k and not k.startswith("mtp.")
+            ]
+        return original(self, weights, *args, **kwargs)
+
+    _nn.Module.load_weights = _filtered
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original
+
+
+def _load_steering_model(model_path: str):
+    """Load a model + tokenizer for steering work, VLM- and oQ-aware.
+
+    Mirrors omlx's own engine load path: pre-load patches (oQ per-layer
+    quant key expansion), custom-quant loaders (paroquant), and — for VLMs
+    — the audio-config and nested-visual remap shims, since mlx-lm cannot
+    load VLM checkpoints. MTP-head weights are dropped (see
+    :func:`_drop_mtp_weights_on_load`).
+    """
+    import json
+    from pathlib import Path
+
+    from .utils.model_loading import (
+        maybe_apply_pre_load_patches,
+        maybe_load_custom_quantization,
+    )
+
+    is_vlm = False
+    config_path = Path(model_path) / "config.json"
+    if config_path.exists():
+        try:
+            cfg = json.loads(config_path.read_text())
+            is_vlm = "vision_config" in cfg or "text_config" in cfg
+        except (OSError, json.JSONDecodeError):
+            pass
+
+    # Pre-load patches: expand oQ per-layer quant keys, and inject MTP
+    # modules so an MTP-head checkpoint's mtp.* weights load into a real
+    # submodule rather than being rejected as unexpected parameters.
+    maybe_apply_pre_load_patches(model_path)
+
+    custom = maybe_load_custom_quantization(model_path, is_vlm=is_vlm)
+    if custom is not None:
+        model, processor = custom
+        return model, getattr(processor, "tokenizer", processor)
+
+    if is_vlm:
+        from mlx_vlm.utils import load as vlm_load
+
+        from .engine.vlm import (
+            _patch_torch_free_image_processor,
+            _patch_video_processor_bug,
+            _remap_nested_visual_on_load,
+            _strip_audio_config_if_orphaned,
+        )
+
+        _patch_video_processor_bug()
+        _patch_torch_free_image_processor()
+        with (
+            _strip_audio_config_if_orphaned(Path(model_path)),
+            _remap_nested_visual_on_load(Path(model_path)),
+            _drop_mtp_weights_on_load(),
+        ):
+            model, processor = vlm_load(model_path)
+        return model, getattr(processor, "tokenizer", processor)
+
+    from mlx_lm import load as lm_load
+
+    with _drop_mtp_weights_on_load():
+        return lm_load(model_path)
+
+
 def steering_generate_command(args) -> int:
     """Generate a steering vector from contrastive prompt pairs."""
     import json
@@ -537,9 +632,7 @@ def steering_generate_command(args) -> int:
         return 1
 
     print(f"Loading model: {args.model}")
-    from mlx_lm import load
-
-    model, tokenizer = load(args.model)
+    model, tokenizer = _load_steering_model(args.model)
 
     vector = generate_steering_vector(
         model,
@@ -559,13 +652,70 @@ def steering_generate_command(args) -> int:
     return 0
 
 
+def steering_eval_command(args) -> int:
+    """Generate from a model at a sweep of steering strengths."""
+    from .steering import SteeringVector
+    from .steering_eval import evaluate_steering
+
+    try:
+        scales = [float(s) for s in args.scales.split(",") if s.strip()]
+    except ValueError as e:
+        print(f"Invalid --scales {args.scales!r}: {e}")
+        return 1
+    if not scales:
+        print("--scales is empty")
+        return 1
+
+    try:
+        layers = _parse_layer_spec(args.layers)
+    except ValueError as e:
+        print(f"Invalid --layers spec {args.layers!r}: {e}")
+        return 1
+    layer_start = min(layers) if layers else None
+    layer_end = max(layers) if layers else None
+
+    try:
+        vector = SteeringVector.load(args.vector)
+    except (FileNotFoundError, ValueError) as e:
+        print(f"Failed to load steering vector: {e}")
+        return 1
+
+    print(f"Loading model: {args.model}")
+    model, tokenizer = _load_steering_model(args.model)
+
+    results = evaluate_steering(
+        model,
+        tokenizer,
+        vector,
+        args.prompt,
+        scales=scales,
+        mode=args.mode,
+        layer_start=layer_start,
+        layer_end=layer_end,
+        max_tokens=args.max_tokens,
+    )
+
+    print()
+    for scale, text in results:
+        label = (
+            "baseline (no steering)"
+            if scale == 0.0
+            else f"strength {scale:+g}  mode={args.mode}"
+        )
+        bar = "=" * 70
+        print(f"{bar}\n  {label}\n{bar}\n{text}\n")
+    return 0
+
+
 def steering_command(args) -> int:
     """Dispatch 'omlx steering <subcommand>'."""
     sub = getattr(args, "steering_command", None)
     if sub == "generate":
         return steering_generate_command(args)
+    if sub == "eval":
+        return steering_eval_command(args)
     print(f"Unknown steering subcommand: {sub}")
-    print("Available: generate")
+    print("Available: generate, eval")
     return 1
 
 
@@ -869,6 +1019,51 @@ Example directory structure:
         type=str,
         default=None,
         help='Layers to generate, e.g. "10-31" or "10,11,12" (default: all)',
+    )
+
+    steering_eval = steering_sub.add_parser(
+        "eval",
+        help="Generate at a sweep of steering strengths to compare behaviour",
+        description="Apply a steering vector at several strengths and print "
+        "the generated text for each, including a no-steering baseline. "
+        "Generation is greedy so differences are attributable to steering.",
+    )
+    steering_eval.add_argument(
+        "--model", type=str, required=True, help="Model path or HF repo id"
+    )
+    steering_eval.add_argument(
+        "--vector",
+        type=str,
+        required=True,
+        help="Steering vector .safetensors file to evaluate",
+    )
+    steering_eval.add_argument(
+        "--prompt", type=str, required=True, help="User prompt to generate from"
+    )
+    steering_eval.add_argument(
+        "--scales",
+        type=str,
+        default="-1,0,0.5,1,1.5",
+        help="Comma-separated strengths; 0 = baseline (default: -1,0,0.5,1,1.5)",
+    )
+    steering_eval.add_argument(
+        "--mode",
+        type=str,
+        default="add",
+        choices=["add", "project"],
+        help="Steering mode (default: add)",
+    )
+    steering_eval.add_argument(
+        "--layers",
+        type=str,
+        default=None,
+        help='Layer range to steer, e.g. "10-31" (default: all)',
+    )
+    steering_eval.add_argument(
+        "--max-tokens",
+        type=int,
+        default=200,
+        help="Tokens to generate per scale (default: 200)",
     )
 
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
