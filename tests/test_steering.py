@@ -547,6 +547,52 @@ def test_generate_pca_direction_is_oriented_and_unit():
         assert float((diffs @ d).mean()) > 0.0
 
 
+def test_generate_crosscov_direction_oriented_and_unit():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    tok = FakeTokenizer()
+    positive = ["high", "more", "most", "peak", "tall", "wide"]
+    negative = ["low", "less", "dips", "base", "tiny", "thin"]
+
+    sv = generate_steering_vector(
+        model, tok, positive, negative, method="crosscov"
+    )
+    assert sv.method == "crosscov"
+    assert sv.layers == list(range(N_LAYERS))
+    for il in range(N_LAYERS):
+        d = sv.directions[il]
+        assert abs(float(mx.linalg.norm(d)) - 1.0) < 1e-5
+        diffs = mx.stack(
+            [
+                model._emb[ord(p[-1]) % 256] - model._emb[ord(n[-1]) % 256]
+                for p, n in zip(positive, negative)
+            ]
+        )
+        # Oriented so the contrastive differences project positively.
+        assert float((diffs @ d).mean()) > 0.0
+
+
+def test_generate_crosscov_needs_two_pairs():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    with pytest.raises(ValueError, match="at least 2"):
+        generate_steering_vector(
+            model, FakeTokenizer(), ["a"], ["b"], method="crosscov"
+        )
+
+
+def test_generate_crosscov_magnitude_scaling():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model,
+        FakeTokenizer(),
+        ["aa", "bb", "cc", "dd"],
+        ["ww", "xx", "yy", "zz"],
+        method="crosscov",
+        scaling="magnitude",
+    )
+    assert sv.method == "crosscov"
+    assert sv.scaling == "magnitude"
+
+
 def test_generate_restores_model_after_run():
     model = FakeModel(N_LAYERS, N_EMBD)
     originals = list(model.model.layers)

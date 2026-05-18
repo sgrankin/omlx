@@ -994,8 +994,11 @@ Example directory structure:
         "--method",
         type=str,
         default="pca",
-        choices=["pca", "mean"],
-        help="Reduction method (default: pca)",
+        choices=["pca", "mean", "crosscov"],
+        help=(
+            "Reduction method: 'mean', 'pca', or 'crosscov' (cross-covariance "
+            "contrastive axis — cleaner, wants many prompt pairs). Default: pca"
+        ),
     )
     steering_gen.add_argument(
         "--scaling",
