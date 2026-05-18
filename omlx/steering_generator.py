@@ -167,6 +167,26 @@ def _crosscov_direction(
     return mx.array(direction)
 
 
+def _orthogonalize(direction: mx.array, control_mean: mx.array) -> mx.array:
+    """Remove the component of ``direction`` parallel to the control mean.
+
+    ds4's default generator step: a contrastive direction can pick up a
+    component aligned with where the control-class activations sit in
+    general — steering along that merely scales activations rather than
+    moving the trait. Projecting it out leaves a cleaner contrastive axis.
+    Returns a unit vector (or ``direction`` unchanged if degenerate).
+    """
+    base_norm = mx.linalg.norm(control_mean)
+    if float(base_norm) < 1e-8:
+        return direction
+    base = control_mean / base_norm
+    direction = direction - mx.sum(direction * base) * base
+    norm = mx.linalg.norm(direction)
+    if float(norm) < 1e-8:
+        return direction
+    return direction / norm
+
+
 def generate_steering_vector(
     model: Any,
     tokenizer: Any,
@@ -176,6 +196,7 @@ def generate_steering_vector(
     model_name: str = "",
     layers: list[int] | None = None,
     scaling: str = "unit",
+    orthogonalize: bool = False,
 ) -> SteeringVector:
     """Build a :class:`SteeringVector` from contrastive prompt pairs.
 
@@ -197,6 +218,10 @@ def generate_steering_vector(
             "magnitude" — scaled by the mean projection magnitude, so a
             single additive strength behaves consistently across layers
             (compensates for residual-stream growth with depth).
+        orthogonalize: When True, project each layer's direction orthogonal
+            to that layer's control-class (negative) mean before scaling
+            (ds4's default generator step) — strips the component aligned
+            with general activation drift, leaving a cleaner trait axis.
 
     Returns:
         A SteeringVector with one direction per requested layer.
@@ -268,6 +293,8 @@ def generate_steering_vector(
             directions[il] = vec.astype(mx.float32)
             continue
         unit = vec / norm
+        if orthogonalize:
+            unit = _orthogonalize(unit, neg_h.mean(axis=0))
         if scaling == "magnitude":
             # Scale the unit direction by the mean signed projection of the
             # per-pair differences onto it — compensates for the residual
@@ -280,11 +307,13 @@ def generate_steering_vector(
 
     n_embd = int(next(iter(directions.values())).shape[-1])
     logger.info(
-        "Generated steering vector: %d layers, n_embd=%d, method=%s, scaling=%s",
+        "Generated steering vector: %d layers, n_embd=%d, method=%s, "
+        "scaling=%s, orthogonalize=%s",
         len(directions),
         n_embd,
         method,
         scaling,
+        orthogonalize,
     )
     return SteeringVector(
         directions=directions,

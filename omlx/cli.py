@@ -1115,6 +1115,7 @@ def steering_generate_command(args) -> int:
         model_name=args.model,
         layers=layers,
         scaling=args.scaling,
+        orthogonalize=args.orthogonalize,
     )
     vector.save(args.output)
     print(
@@ -1705,6 +1706,14 @@ Example directory structure:
         type=str,
         default=None,
         help='Layers to generate, e.g. "10-31" or "10,11,12" (default: all)',
+    )
+    steering_gen.add_argument(
+        "--orthogonalize",
+        action="store_true",
+        help=(
+            "Project each direction orthogonal to the control-class mean "
+            "(ds4-style) — strips general activation drift from the trait axis"
+        ),
     )
 
     steering_eval = steering_sub.add_parser(
