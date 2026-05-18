@@ -89,6 +89,12 @@ class ModelSettings:
             "gemma4_assistant" model.
         vlm_mtp_draft_model: Path/repo of the assistant drafter (e.g. "gemma-4-26B-A4B-it-assistant").
         vlm_mtp_draft_block_size: Tokens drafted per round (None = mlx-vlm default).
+        steering_vector: Path to a native .safetensors steering (control) vector
+            file; applied as a per-layer additive bias on the residual stream.
+        steering_strength: Scale applied to every steering direction (default 1.0;
+            negative values steer away from the captured behaviour).
+        steering_layer_start: First layer to steer (inclusive; None = unbounded).
+        steering_layer_end: Last layer to steer (inclusive; None = unbounded).
         is_pinned: Keep model loaded in memory.
         is_default: Use this model when no model is specified.
         display_name: Human-readable name for UI display.
@@ -164,6 +170,13 @@ class ModelSettings:
     vlm_mtp_enabled: bool = False
     vlm_mtp_draft_model: Optional[str] = None  # Path / model id of the assistant drafter
     vlm_mtp_draft_block_size: Optional[int] = None  # Tokens per draft round (None = mlx-vlm default)
+
+    # Steering vectors (model-level control vector applied to the residual stream).
+    # Applied uniformly to every request the model serves.
+    steering_vector: Optional[str] = None  # Path to a native .safetensors steering vector
+    steering_strength: float = 1.0  # Scale applied to all directions
+    steering_layer_start: Optional[int] = None  # First steered layer (inclusive; None = unbounded)
+    steering_layer_end: Optional[int] = None  # Last steered layer (inclusive; None = unbounded)
 
     # Model management flags
     is_pinned: bool = False

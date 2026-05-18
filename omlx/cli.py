@@ -491,6 +491,83 @@ def diagnose_command(args) -> int:
     return 1
 
 
+def _parse_layer_spec(spec: str | None) -> list[int] | None:
+    """Parse a ``--layers`` spec into a list of indices.
+
+    Accepts an inclusive range ``"10-31"`` or a comma list ``"10,11,12"``.
+    Returns None for an empty spec (meaning "all layers").
+    """
+    if not spec:
+        return None
+    spec = spec.strip()
+    if "," not in spec and spec.count("-") == 1 and not spec.startswith("-"):
+        start_str, end_str = spec.split("-")
+        start, end = int(start_str), int(end_str)
+        if start > end:
+            raise ValueError(f"range start {start} exceeds end {end}")
+        return list(range(start, end + 1))
+    return [int(tok) for tok in spec.split(",") if tok.strip()]
+
+
+def steering_generate_command(args) -> int:
+    """Generate a steering vector from contrastive prompt pairs."""
+    import json
+
+    from .steering_generator import generate_steering_vector
+
+    prompts_path = args.prompts
+    try:
+        with open(prompts_path, encoding="utf-8") as f:
+            data = json.load(f)
+        positive = list(data["positive"])
+        negative = list(data["negative"])
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        print(f"Failed to read prompt pairs from {prompts_path}: {e}")
+        print('Expected JSON: {"positive": [...], "negative": [...]}')
+        return 1
+
+    if args.max_pairs is not None:
+        positive = positive[: args.max_pairs]
+        negative = negative[: args.max_pairs]
+
+    try:
+        layers = _parse_layer_spec(args.layers)
+    except ValueError as e:
+        print(f"Invalid --layers spec {args.layers!r}: {e}")
+        return 1
+
+    print(f"Loading model: {args.model}")
+    from mlx_lm import load
+
+    model, tokenizer = load(args.model)
+
+    vector = generate_steering_vector(
+        model,
+        tokenizer,
+        positive,
+        negative,
+        method=args.method,
+        model_name=args.model,
+        layers=layers,
+    )
+    vector.save(args.output)
+    print(
+        f"Wrote steering vector ({len(vector.directions)} layers, "
+        f"n_embd={vector.n_embd}, method={vector.method}) to {args.output}"
+    )
+    return 0
+
+
+def steering_command(args) -> int:
+    """Dispatch 'omlx steering <subcommand>'."""
+    sub = getattr(args, "steering_command", None)
+    if sub == "generate":
+        return steering_generate_command(args)
+    print(f"Unknown steering subcommand: {sub}")
+    print("Available: generate")
+    return 1
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="omlx: Production-ready LLM server for Apple Silicon",
@@ -729,6 +806,59 @@ Example directory structure:
         help="What to diagnose. 'menubar' checks Tahoe ControlCenter visibility.",
     )
 
+    # Steering command
+    steering_parser = subparsers.add_parser(
+        "steering",
+        help="Steering (control) vector tools",
+        description="Generate and manage steering vectors — per-layer additive "
+        "biases on the residual stream that nudge model behaviour.",
+    )
+    steering_sub = steering_parser.add_subparsers(
+        dest="steering_command", help="Steering subcommands"
+    )
+    steering_gen = steering_sub.add_parser(
+        "generate",
+        help="Generate a steering vector from contrastive prompt pairs",
+        description="Run a model on (positive, negative) prompt pairs, capture "
+        "per-layer hidden states, and reduce their differences to a per-layer "
+        "steering direction.",
+    )
+    steering_gen.add_argument(
+        "--model", type=str, required=True, help="Model path or HF repo id"
+    )
+    steering_gen.add_argument(
+        "--prompts",
+        type=str,
+        required=True,
+        help='JSON file: {"positive": [...], "negative": [...]} (equal-length lists)',
+    )
+    steering_gen.add_argument(
+        "--output",
+        "-o",
+        type=str,
+        required=True,
+        help="Destination .safetensors file for the steering vector",
+    )
+    steering_gen.add_argument(
+        "--method",
+        type=str,
+        default="pca",
+        choices=["pca", "mean"],
+        help="Reduction method (default: pca)",
+    )
+    steering_gen.add_argument(
+        "--max-pairs",
+        type=int,
+        default=None,
+        help="Use at most this many prompt pairs (default: all)",
+    )
+    steering_gen.add_argument(
+        "--layers",
+        type=str,
+        default=None,
+        help='Layers to generate, e.g. "10-31" or "10,11,12" (default: all)',
+    )
+
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
     # tokens (e.g. `-r`, `--resume <id>`) to the underlying tool binary.
     # Non-launch commands keep the previous strictness by rejecting unknowns.
@@ -743,6 +873,8 @@ Example directory structure:
             serve_command(args)
         elif args.command == "diagnose":
             sys.exit(diagnose_command(args))
+        elif args.command == "steering":
+            sys.exit(steering_command(args))
         else:
             parser.print_help()
             sys.exit(1)
