@@ -692,6 +692,55 @@
                                     </div>
                                 </div>
 
+                                <!-- Steering vectors -->
+                                <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
+                                    <div class="min-w-0">
+                                        <span class="text-sm font-medium text-neutral-700">Steering Vectors</span>
+                                        <p class="text-xs text-neutral-500 mt-0.5">Control vectors applied as a per-layer bias on the residual stream, nudging model behaviour. Multiple vectors stack; negative strength inverts. Generate with <code class="text-[11px] bg-neutral-200 px-1 rounded">omlx steering generate</code>.</p>
+                                    </div>
+                                    <template x-for="(sv, idx) in modelSettings.steering_vectors" :key="idx">
+                                        <div class="p-3 bg-white rounded-lg border border-neutral-200 space-y-2">
+                                            <div class="flex items-center gap-2">
+                                                <input type="text" x-model="sv.path" placeholder="/path/to/vector.safetensors"
+                                                       class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <button type="button" @click="modelSettings.steering_vectors.splice(idx, 1)"
+                                                        class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
+                                                        title="Remove">&#10005;</button>
+                                            </div>
+                                            <div class="grid grid-cols-2 gap-2">
+                                                <div>
+                                                    <label class="block text-[10px] font-bold uppercase tracking-wider text-neutral-500 mb-1">Strength</label>
+                                                    <input type="number" step="0.1" x-model.number="sv.strength" placeholder="1.0"
+                                                           class="w-full px-2 py-1 border border-neutral-200 rounded-lg text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-[10px] font-bold uppercase tracking-wider text-neutral-500 mb-1">Mode</label>
+                                                    <select x-model="sv.mode"
+                                                            class="w-full px-2 py-1 border border-neutral-200 rounded-lg text-xs bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                        <option value="add">add &mdash; bias</option>
+                                                        <option value="project">project &mdash; ablate</option>
+                                                    </select>
+                                                </div>
+                                                <div>
+                                                    <label class="block text-[10px] font-bold uppercase tracking-wider text-neutral-500 mb-1">Layer start</label>
+                                                    <input type="number" step="1" min="0" x-model.number="sv.layer_start" placeholder="all"
+                                                           class="w-full px-2 py-1 border border-neutral-200 rounded-lg text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                                <div>
+                                                    <label class="block text-[10px] font-bold uppercase tracking-wider text-neutral-500 mb-1">Layer end</label>
+                                                    <input type="number" step="1" min="0" x-model.number="sv.layer_end" placeholder="all"
+                                                           class="w-full px-2 py-1 border border-neutral-200 rounded-lg text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </template>
+                                    <button type="button"
+                                            @click="modelSettings.steering_vectors.push({ path: '', strength: 1.0, mode: 'add', layer_start: null, layer_end: null })"
+                                            class="px-3 py-1.5 text-xs rounded-lg border border-dashed border-neutral-300 text-neutral-500 hover:text-neutral-900 hover:border-neutral-500 transition-all">
+                                        + Add steering vector
+                                    </button>
+                                </div>
+
                                 <!-- DFlash -->
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="flex items-start justify-between gap-3">

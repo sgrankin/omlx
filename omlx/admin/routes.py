@@ -154,6 +154,8 @@ class ModelSettingsRequest(BaseModel):
     is_default: bool | None = None
     # Security: per-model opt-in for trust_remote_code (issue #926)
     trust_remote_code: bool | None = None
+    # Steering (control) vectors — list of per-vector specs
+    steering_vectors: list[dict[str, Any]] | None = None
 
 
 class CreateProfileRequest(BaseModel):
@@ -1873,6 +1875,9 @@ async def update_model_settings(
             if request.index_cache_freq and request.index_cache_freq >= 2
             else None
         )
+    if "steering_vectors" in sent:
+        # Empty list clears steering (reset to None).
+        current_settings.steering_vectors = request.steering_vectors or None
     # TurboQuant KV cache settings
     if "turboquant_kv_enabled" in sent:
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
@@ -2159,6 +2164,8 @@ async def update_model_settings(
         and (
             ("model_type_override" in sent and entry.engine_type != prev_engine_type)
             or "index_cache_freq" in sent
+            # Steering vectors are applied by apply_post_load_transforms.
+            or "steering_vectors" in sent
             or "dflash_enabled" in sent
             or "dflash_draft_model" in sent
             or "dflash_draft_quant_enabled" in sent

@@ -1621,6 +1621,13 @@
                     vlm_mtp_draft_block_size: settings.vlm_mtp_draft_block_size ?? null,
                     ctKwargEntries,
                     trust_remote_code: settings.trust_remote_code || false,
+                    steering_vectors: (settings.steering_vectors || []).map(sv => ({
+                        path: sv.path || '',
+                        strength: sv.strength ?? 1.0,
+                        mode: sv.mode || 'add',
+                        layer_start: sv.layer_start ?? null,
+                        layer_end: sv.layer_end ?? null,
+                    })),
                 };
                 this.showModelSettingsModal = true;
             },
@@ -1750,6 +1757,18 @@
                                     ? parseInt(this.modelSettings.vlm_mtp_draft_block_size)
                                     : null,
                                 trust_remote_code: this.modelSettings.trust_remote_code,
+                                steering_vectors: (() => {
+                                    const list = (this.modelSettings.steering_vectors || [])
+                                        .filter(sv => sv.path && sv.path.trim())
+                                        .map(sv => ({
+                                            path: sv.path.trim(),
+                                            strength: Number.isFinite(sv.strength) ? sv.strength : 1.0,
+                                            mode: sv.mode === 'project' ? 'project' : 'add',
+                                            layer_start: Number.isFinite(sv.layer_start) ? sv.layer_start : null,
+                                            layer_end: Number.isFinite(sv.layer_end) ? sv.layer_end : null,
+                                        }));
+                                    return list.length ? list : null;
+                                })(),
                             };
                         })()),
                     });
