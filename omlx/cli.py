@@ -1021,6 +1021,7 @@ def steering_generate_command(args) -> int:
         method=args.method,
         model_name=args.model,
         layers=layers,
+        scaling=args.scaling,
     )
     vector.save(args.output)
     print(
@@ -1528,6 +1529,17 @@ Example directory structure:
         default="pca",
         choices=["pca", "mean"],
         help="Reduction method (default: pca)",
+    )
+    steering_gen.add_argument(
+        "--scaling",
+        type=str,
+        default="unit",
+        choices=["unit", "magnitude"],
+        help=(
+            "Per-layer scaling: 'unit' (unit-norm directions) or 'magnitude' "
+            "(scale by mean projection, so one strength works across layers). "
+            "Default: unit"
+        ),
     )
     steering_gen.add_argument(
         "--max-pairs",
