@@ -20,7 +20,11 @@ from omlx.patches.steering import (
     model_hidden_size,
     remove_steering_patch,
 )
-from omlx.steering import STEERING_FORMAT_VERSION, SteeringVector
+from omlx.steering import (
+    STEERING_FORMAT_VERSION,
+    SteeringSpec,
+    SteeringVector,
+)
 from omlx.steering_generator import generate_steering_vector
 
 N_EMBD = 8
@@ -75,9 +79,36 @@ class FakeModel:
         return h
 
 
+class IdentityBlock:
+    """A block that returns its input unchanged."""
+
+    def __call__(self, h, *args, **kwargs):
+        return h
+
+
 class FakeTokenizer:
     def encode(self, text: str) -> list[int]:
         return [ord(c) % 256 for c in text] or [0]
+
+
+def _spec(
+    directions,
+    *,
+    n_embd: int = N_EMBD,
+    strength: float = 1.0,
+    mode: str = "add",
+    layer_start=None,
+    layer_end=None,
+    scaling: str = "unit",
+) -> SteeringSpec:
+    """Build a SteeringSpec from a ``{layer: array}`` dict."""
+    return SteeringSpec(
+        vector=SteeringVector(dict(directions), n_embd=n_embd, scaling=scaling),
+        strength=strength,
+        mode=mode,
+        layer_start=layer_start,
+        layer_end=layer_end,
+    )
 
 
 class RealBlock(nn.Module):
@@ -159,6 +190,18 @@ def test_format_version_is_stored(tmp_path):
     assert metadata["omlx_steering_version"] == str(STEERING_FORMAT_VERSION)
 
 
+def test_save_load_preserves_scaling(tmp_path):
+    path = tmp_path / "vec.safetensors"
+    SteeringVector(
+        {1: mx.ones(N_EMBD)}, n_embd=N_EMBD, scaling="magnitude"
+    ).save(path)
+    assert SteeringVector.load(path).scaling == "magnitude"
+
+
+def test_scaling_defaults_to_unit():
+    assert SteeringVector({1: mx.ones(N_EMBD)}).scaling == "unit"
+
+
 def test_layer_map_scales_and_filters():
     sv = SteeringVector(
         directions={il: mx.ones(N_EMBD) for il in range(N_LAYERS)},
@@ -196,7 +239,7 @@ def test_model_hidden_size():
 def test_apply_patch_adds_direction():
     model = FakeModel(N_LAYERS, N_EMBD)
     direction = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
-    patched = apply_steering_patch(model, {2: direction})
+    patched = apply_steering_patch(model, [_spec({2: direction})])
     assert patched == 1
     assert model._omlx_steering_active is True
 
@@ -208,11 +251,19 @@ def test_apply_patch_adds_direction():
     assert mx.allclose(out, h + 3.0 + direction)
 
 
+def test_apply_patch_scales_by_strength():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    direction = mx.ones(N_EMBD)
+    apply_steering_patch(model, [_spec({0: direction}, strength=2.5)])
+    out = model.model.layers[0](mx.zeros((1, 1, N_EMBD)))
+    # layer 0 FakeBlock seed == 1, plus 2.5 * direction.
+    assert mx.allclose(out, mx.full((1, 1, N_EMBD), 1.0 + 2.5))
+
+
 def test_patch_handles_tuple_output():
     model = FakeModel(N_LAYERS, N_EMBD)
     model.model.layers[1] = TupleBlock()
-    direction = mx.ones(N_EMBD)
-    apply_steering_patch(model, {1: direction})
+    apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)})])
 
     h = mx.zeros((1, 1, N_EMBD))
     out = model.model.layers[1](h)
@@ -224,7 +275,7 @@ def test_patch_handles_tuple_output():
 def test_patch_preserves_hidden_dtype():
     model = FakeModel(N_LAYERS, N_EMBD)
     model.model.layers[0] = TupleBlock()  # identity-ish, returns input dtype
-    apply_steering_patch(model, {0: mx.ones(N_EMBD, dtype=mx.float32)})
+    apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD, dtype=mx.float32)})])
     out, _aux = model.model.layers[0](mx.zeros((1, 1, N_EMBD), dtype=mx.bfloat16))
     assert out.dtype == mx.bfloat16
 
@@ -232,7 +283,9 @@ def test_patch_preserves_hidden_dtype():
 def test_remove_patch_restores_blocks():
     model = FakeModel(N_LAYERS, N_EMBD)
     originals = list(model.model.layers)
-    apply_steering_patch(model, {1: mx.ones(N_EMBD), 3: mx.ones(N_EMBD)})
+    apply_steering_patch(
+        model, [_spec({1: mx.ones(N_EMBD), 3: mx.ones(N_EMBD)})]
+    )
     assert remove_steering_patch(model) is True
     assert model.model.layers == originals
     assert model._omlx_steering_active is False
@@ -243,8 +296,8 @@ def test_remove_patch_restores_blocks():
 def test_apply_patch_is_idempotent():
     """Re-applying replaces the prior patch rather than nesting wrappers."""
     model = FakeModel(N_LAYERS, N_EMBD)
-    apply_steering_patch(model, {1: mx.ones(N_EMBD)})
-    apply_steering_patch(model, {1: mx.ones(N_EMBD) * 5.0})
+    apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)})])
+    apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)}, strength=5.0)])
     layer = model.model.layers[1]
     assert isinstance(layer, _SteeredLayer)
     assert not isinstance(layer["block"], _SteeredLayer)
@@ -255,7 +308,9 @@ def test_patch_keeps_wrapped_block_params_visible():
     model = RealModel(3, N_EMBD)
     before = len(tree_flatten(model.parameters()))
 
-    patched = apply_steering_patch(model, {1: mx.ones(N_EMBD), 2: mx.ones(N_EMBD)})
+    patched = apply_steering_patch(
+        model, [_spec({1: mx.ones(N_EMBD), 2: mx.ones(N_EMBD)})]
+    )
     assert patched == 2
 
     after = tree_flatten(model.parameters())
@@ -270,7 +325,7 @@ def test_patch_keeps_wrapped_block_params_visible():
 def test_patch_survives_set_dtype():
     """set_dtype walks the whole module tree — it must see through the wrapper."""
     model = RealModel(2, N_EMBD)
-    apply_steering_patch(model, {1: mx.ones(N_EMBD)})
+    apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)})])
     model.set_dtype(mx.float16)
     out = model.layers[1](mx.zeros((1, 1, N_EMBD), dtype=mx.float16))
     assert out.dtype == mx.float16
@@ -278,20 +333,150 @@ def test_patch_survives_set_dtype():
 
 def test_apply_patch_out_of_range_layer_skipped():
     model = FakeModel(N_LAYERS, N_EMBD)
-    patched = apply_steering_patch(model, {1: mx.ones(N_EMBD), 99: mx.ones(N_EMBD)})
+    patched = apply_steering_patch(
+        model, [_spec({1: mx.ones(N_EMBD), 99: mx.ones(N_EMBD)})]
+    )
     assert patched == 1
 
 
 def test_apply_patch_rejects_wrong_n_embd():
     model = FakeModel(N_LAYERS, N_EMBD)
     with pytest.raises(ValueError, match="n_embd"):
-        apply_steering_patch(model, {1: mx.ones(N_EMBD + 3)})
+        apply_steering_patch(
+            model, [_spec({1: mx.ones(N_EMBD + 3)}, n_embd=N_EMBD + 3)]
+        )
 
 
-def test_empty_layer_map_is_noop():
+def test_empty_specs_is_noop():
     model = FakeModel(N_LAYERS, N_EMBD)
-    assert apply_steering_patch(model, {}) == 0
+    assert apply_steering_patch(model, []) == 0
     assert getattr(model, "_omlx_steering_active", False) is False
+
+
+def test_apply_patch_layer_range():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    spec = _spec(
+        {il: mx.ones(N_EMBD) for il in range(N_LAYERS)},
+        layer_start=1,
+        layer_end=2,
+    )
+    patched = apply_steering_patch(model, [spec])
+    assert patched == 2
+    assert isinstance(model.model.layers[1], _SteeredLayer)
+    assert isinstance(model.model.layers[2], _SteeredLayer)
+    assert not isinstance(model.model.layers[0], _SteeredLayer)
+    assert not isinstance(model.model.layers[3], _SteeredLayer)
+
+
+# ---------------------------------------------------------------------------
+# Steering patch — projection mode
+# ---------------------------------------------------------------------------
+
+
+def test_projection_removes_component():
+    """mode='project', strength=1.0 ablates the direction from the output."""
+    d = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
+    layer = _SteeredLayer(IdentityBlock(), None, [(d / mx.linalg.norm(d), 1.0)])
+    h = mx.random.normal((1, 3, N_EMBD))
+    out = layer(h)
+    u = d / mx.linalg.norm(d)
+    residual = (out * u).sum(axis=-1)
+    assert float(mx.abs(residual).max()) < 1e-4
+
+
+def test_projection_partial_strength_halves_component():
+    d = mx.ones(N_EMBD)
+    u = d / mx.linalg.norm(d)
+    layer = _SteeredLayer(IdentityBlock(), None, [(u, 0.5)])
+    h = mx.random.normal((1, 4, N_EMBD))
+    before = (h * u).sum(axis=-1)
+    after = (layer(h) * u).sum(axis=-1)
+    assert mx.allclose(after, before * 0.5, atol=1e-4)
+
+
+def test_projection_negative_strength_amplifies():
+    d = mx.ones(N_EMBD)
+    u = d / mx.linalg.norm(d)
+    layer = _SteeredLayer(IdentityBlock(), None, [(u, -1.0)])
+    h = mx.random.normal((1, 4, N_EMBD))
+    before = (h * u).sum(axis=-1)
+    after = (layer(h) * u).sum(axis=-1)
+    # h - (-1)·(u·h)·u  ->  component doubles.
+    assert mx.allclose(after, before * 2.0, atol=1e-4)
+
+
+def test_apply_patch_project_mode_normalizes_direction():
+    """A non-unit projection direction is unit-normalised by the patch."""
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = IdentityBlock()
+    raw = mx.arange(N_EMBD, dtype=mx.float32) + 3.0  # deliberately not unit
+    apply_steering_patch(model, [_spec({0: raw}, mode="project", strength=1.0)])
+    h = mx.random.normal((1, 2, N_EMBD))
+    out = model.model.layers[0](h)
+    u = raw / mx.linalg.norm(raw)
+    assert float(mx.abs((out * u).sum(axis=-1)).max()) < 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Steering patch — multiple vectors
+# ---------------------------------------------------------------------------
+
+
+def test_multi_vector_additive_specs_sum():
+    """Two additive specs on the same layer sum into one bias."""
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = IdentityBlock()
+    s1 = _spec({0: mx.ones(N_EMBD)}, strength=1.0)
+    s2 = _spec({0: mx.ones(N_EMBD)}, strength=3.0)
+    apply_steering_patch(model, [s1, s2])
+    out = model.model.layers[0](mx.zeros((1, 1, N_EMBD)))
+    assert mx.allclose(out, mx.full((1, 1, N_EMBD), 4.0))
+
+
+def test_multi_vector_add_then_project():
+    """An additive spec and a projection spec coexist on one layer."""
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = IdentityBlock()
+    u = mx.ones(N_EMBD) / mx.linalg.norm(mx.ones(N_EMBD))
+    add = _spec({0: mx.ones(N_EMBD)}, strength=2.0)
+    proj = _spec({0: u}, mode="project", strength=1.0)
+    apply_steering_patch(model, [add, proj])
+    out = model.model.layers[0](mx.zeros((1, 1, N_EMBD)))
+    # bias added first, then its component along u projected back out.
+    assert float(mx.abs((out * u).sum(axis=-1)).max()) < 1e-4
+
+
+def test_multi_vector_disjoint_layers():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    s1 = _spec({0: mx.ones(N_EMBD)})
+    s2 = _spec({2: mx.ones(N_EMBD)})
+    patched = apply_steering_patch(model, [s1, s2])
+    assert patched == 2
+    assert isinstance(model.model.layers[0], _SteeredLayer)
+    assert isinstance(model.model.layers[2], _SteeredLayer)
+
+
+# ---------------------------------------------------------------------------
+# SteeringSpec
+# ---------------------------------------------------------------------------
+
+
+def test_spec_rejects_unknown_mode():
+    with pytest.raises(ValueError, match="unknown steering mode"):
+        SteeringSpec(vector=SteeringVector({0: mx.ones(N_EMBD)}), mode="bogus")
+
+
+def test_spec_active_directions_filters_range():
+    vec = SteeringVector({il: mx.ones(N_EMBD) for il in range(N_LAYERS)})
+    spec = SteeringSpec(vector=vec, layer_start=1, layer_end=2)
+    assert sorted(spec.active_directions()) == [1, 2]
+
+
+def test_spec_active_directions_unbounded():
+    vec = SteeringVector({il: mx.ones(N_EMBD) for il in range(N_LAYERS)})
+    assert sorted(SteeringSpec(vector=vec).active_directions()) == list(
+        range(N_LAYERS)
+    )
 
 
 # ---------------------------------------------------------------------------

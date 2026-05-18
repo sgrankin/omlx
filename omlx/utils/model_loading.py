@@ -286,30 +286,41 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
 
 
 def _maybe_apply_steering(model: Any, model_settings: Any) -> None:
-    """Apply a configured steering vector to the residual stream.
+    """Apply configured steering vectors to the residual stream.
 
     Failures are logged and swallowed: a misconfigured steering vector
     must not prevent the model from loading and serving requests.
     """
-    steering_path = getattr(model_settings, "steering_vector", None)
-    if not steering_path:
+    specs_raw = getattr(model_settings, "steering_vectors", None)
+    if not specs_raw:
         return
     try:
         from ..patches.steering import apply_steering_patch
-        from ..steering import SteeringVector
+        from ..steering import SteeringSpec, SteeringVector
 
-        vector = SteeringVector.load(steering_path)
-        layer_map = vector.layer_map(
-            strength=getattr(model_settings, "steering_strength", 1.0) or 1.0,
-            layer_start=getattr(model_settings, "steering_layer_start", None),
-            layer_end=getattr(model_settings, "steering_layer_end", None),
-        )
-        patched = apply_steering_patch(model, layer_map, n_embd=vector.n_embd)
+        specs = []
+        for entry in specs_raw:
+            path = entry.get("path")
+            if not path:
+                logger.warning("steering: skipping entry with no path: %r", entry)
+                continue
+            specs.append(
+                SteeringSpec(
+                    vector=SteeringVector.load(path),
+                    strength=float(entry.get("strength", 1.0)),
+                    mode=entry.get("mode", "add") or "add",
+                    layer_start=entry.get("layer_start"),
+                    layer_end=entry.get("layer_end"),
+                )
+            )
+        if not specs:
+            return
+        patched = apply_steering_patch(model, specs)
         logger.info(
-            "Steering vector applied: %d layers from %s", patched, steering_path
+            "Steering applied: %d layer(s) from %d vector(s)", patched, len(specs)
         )
     except Exception as e:
-        logger.error("Failed to apply steering vector %s: %s", steering_path, e)
+        logger.error("Failed to apply steering vectors: %s", e)
 
 
 def maybe_load_custom_quantization(

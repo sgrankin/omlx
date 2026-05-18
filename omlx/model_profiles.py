@@ -66,10 +66,7 @@ MODEL_SPECIFIC_PROFILE_FIELDS = (
     "specprefill_keep_pct",
     "specprefill_threshold",
     "index_cache_freq",
-    "steering_vector",
-    "steering_strength",
-    "steering_layer_start",
-    "steering_layer_end",
+    "steering_vectors",
 )
 
 # Excluded — never stored in a profile or template.
