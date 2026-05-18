@@ -593,6 +593,40 @@ def test_generate_crosscov_magnitude_scaling():
     assert sv.scaling == "magnitude"
 
 
+def test_orthogonalize_removes_parallel_component():
+    from omlx.steering_generator import _orthogonalize
+
+    base = mx.array([3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    direction = mx.array([1.0, 1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0])
+    result = _orthogonalize(direction, base)
+    # Orthogonal to the control mean, and unit length.
+    assert abs(float(mx.sum(result * base))) < 1e-5
+    assert abs(float(mx.linalg.norm(result)) - 1.0) < 1e-5
+
+
+def test_orthogonalize_degenerate_base_is_noop():
+    from omlx.steering_generator import _orthogonalize
+
+    direction = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
+    result = _orthogonalize(direction, mx.zeros(N_EMBD))
+    assert mx.allclose(result, direction)
+
+
+def test_generate_with_orthogonalize():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model,
+        FakeTokenizer(),
+        ["aa", "bb", "cc"],
+        ["xx", "yy", "zz"],
+        method="mean",
+        orthogonalize=True,
+    )
+    assert sv.layers == list(range(N_LAYERS))
+    for d in sv.directions.values():
+        assert abs(float(mx.linalg.norm(d)) - 1.0) < 1e-4
+
+
 def test_generate_restores_model_after_run():
     model = FakeModel(N_LAYERS, N_EMBD)
     originals = list(model.model.layers)
