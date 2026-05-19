@@ -31,9 +31,9 @@ per-layer last-token hidden state, then reduce:
 
 | method | how | notes |
 |---|---|---|
-| `mean` | average of per-pair differences `pos − neg` | cheap, robust with few pairs; a solid baseline |
-| `pca` | leading principal component of the differences | dominated by within-class variance — picks up confounds |
+| `mean` | average of per-pair differences `pos − neg` | **default** — cheap, robust with few pairs |
 | `crosscov` | eigenvector of the symmetrized cross-covariance `AᵀB` of baseline-centred classes, most-negative eigenvalue, Fisher-discriminant tie-break | cleanest separation of the trait from shared structure; wants many pairs (~`n_embd`) |
+| `pca` | leading principal component of the differences | **discouraged** — dominated by within-class variance, axis is confound-contaminated |
 
 Scaling — `--scaling magnitude` (the **default**) scales each layer's
 direction by its mean projection magnitude rather than to unit norm, so a
@@ -41,9 +41,9 @@ single `strength` behaves consistently across layers (see the calibration
 finding below). `--scaling unit` is available for the unit-norm form.
 
 `--orthogonalize` projects each layer's direction orthogonal to that
-layer's control-class mean (ds4's default generator step) — strips the
-component aligned with general activation drift. Composable with any
-method.
+layer's control-class mean — strips the component aligned with general
+activation drift. **On by default, matching ds4's generator**;
+`--no-orthogonalize` disables it. Composable with any method.
 
 By default the generator **skips the final layer** — steering it perturbs
 the pre-logit state directly and its direction is a magnitude outlier. An
@@ -113,12 +113,14 @@ expose the difference — the spread is across the *full* depth.)
 
 ### Recommendation
 
-`crosscov` generation with the default `magnitude` scaling (and the
-default last-layer skip), applied in `add` mode, with a strength swept via
-`omlx steering eval` (the window is model- and layer-band-specific).
-`--orthogonalize` is a cheap, well-motivated extra for confounded prompt
-sets. Use `project` when the goal is to *remove* a behaviour and coherence
-at high strength matters more than bidirectional control.
+The defaults — `mean` reduction, `magnitude` scaling, `orthogonalize` on,
+last layer skipped — are the right starting point: robust regardless of
+how many prompt pairs you have. Switch to `--method crosscov` when you
+have many pairs (~`n_embd`) or a subtle/confounded trait. Avoid `pca`.
+Apply in `add` mode, sweeping strength via `omlx steering eval` (the
+window is model- and layer-band-specific). Use `project` when the goal is
+to *remove* a behaviour and coherence at high strength matters more than
+bidirectional control.
 
 ## Known limitations
 

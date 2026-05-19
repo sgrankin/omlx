@@ -510,7 +510,7 @@ def test_generate_mean_matches_hidden_state_diff():
 
     sv = generate_steering_vector(
         model, tok, positive, negative,
-        method="mean", scaling="unit", model_name="fake",
+        method="mean", scaling="unit", orthogonalize=False, model_name="fake",
     )
     # Default skips the final layer.
     assert sv.layers == list(range(N_LAYERS - 1))
@@ -536,7 +536,8 @@ def test_generate_pca_direction_is_oriented_and_unit():
     negative = ["low", "less", "dips", "base"]
 
     sv = generate_steering_vector(
-        model, tok, positive, negative, method="pca", scaling="unit"
+        model, tok, positive, negative,
+        method="pca", scaling="unit", orthogonalize=False,
     )
     for il in sv.layers:
         d = sv.directions[il]
@@ -558,7 +559,8 @@ def test_generate_crosscov_direction_oriented_and_unit():
     negative = ["low", "less", "dips", "base", "tiny", "thin"]
 
     sv = generate_steering_vector(
-        model, tok, positive, negative, method="crosscov", scaling="unit"
+        model, tok, positive, negative,
+        method="crosscov", scaling="unit", orthogonalize=False,
     )
     assert sv.method == "crosscov"
     assert sv.layers == list(range(N_LAYERS - 1))
@@ -658,6 +660,34 @@ def test_generate_default_scaling_is_magnitude():
     assert sv.scaling == "magnitude"
 
 
+def test_generate_default_method_is_mean():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    sv = generate_steering_vector(
+        model, FakeTokenizer(), ["aa", "bb"], ["xx", "yy"]
+    )
+    assert sv.method == "mean"
+
+
+def test_generate_orthogonalize_default_on():
+    model = FakeModel(N_LAYERS, N_EMBD)
+    pos, neg = ["aa", "bb", "cc"], ["xx", "yy", "zz"]
+    default = generate_steering_vector(model, FakeTokenizer(), pos, neg)
+    on = generate_steering_vector(
+        model, FakeTokenizer(), pos, neg, orthogonalize=True
+    )
+    off = generate_steering_vector(
+        model, FakeTokenizer(), pos, neg, orthogonalize=False
+    )
+    assert all(
+        mx.allclose(default.directions[il], on.directions[il])
+        for il in default.layers
+    )
+    assert any(
+        not mx.allclose(default.directions[il], off.directions[il])
+        for il in default.layers
+    )
+
+
 def test_generate_restores_model_after_run():
     model = FakeModel(N_LAYERS, N_EMBD)
     originals = list(model.model.layers)
@@ -728,7 +758,8 @@ def test_generate_magnitude_scaling_equals_raw_mean_diff():
     negative = ["aaa", "bbb", "ccc"]
 
     sv = generate_steering_vector(
-        model, tok, positive, negative, method="mean", scaling="magnitude"
+        model, tok, positive, negative,
+        method="mean", scaling="magnitude", orthogonalize=False,
     )
     assert sv.scaling == "magnitude"
 
