@@ -239,9 +239,13 @@ class SteeringSpec:
 
     Attributes:
         vector: The steering directions to apply.
-        strength: Scale factor. For "add" mode it scales the direction. For
-            "project" mode, 1.0 fully removes the direction's component from
-            the activation, 0 is a no-op, <0 amplifies it, >1 flips it.
+        strength: Scale factor. For "add" mode it is a band-width-independent
+            total budget — :func:`~omlx.patches.steering.apply_steering_patch`
+            divides it by the number of steered layers, so a given strength
+            perturbs comparably whether applied over a narrow or wide band.
+            For "project" mode it is per-layer (not normalised): 1.0 fully
+            removes the direction's component from the activation, 0 is a
+            no-op, <0 amplifies it, >1 flips it.
         mode: "add" — additive residual-stream bias (``h += strength·d``);
             "project" — directional projection
             (``h -= strength·(d̂·h)·d̂``), which is self-calibrating across

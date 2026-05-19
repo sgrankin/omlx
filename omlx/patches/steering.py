@@ -180,13 +180,22 @@ def apply_steering_patch(
     add_bias: dict[int, mx.array] = {}
     projections: dict[int, list[tuple[mx.array, float]]] = {}
     for spec in specs:
-        for il, direction in spec.active_directions().items():
-            if spec.mode == "add":
-                contrib = (direction * spec.strength).astype(mx.float32)
+        active = spec.active_directions()
+        if spec.mode == "add":
+            # Normalise additive strength by the steered-layer count. An
+            # additive bias compounds down the residual stream, so the same
+            # `strength` over a wide band perturbs far more than over a
+            # narrow one; dividing makes `strength` a band-width-independent
+            # total budget. Projection is self-calibrating and per-layer
+            # meaningful, so it is left unnormalised.
+            per_layer = spec.strength / max(len(active), 1)
+            for il, direction in active.items():
+                contrib = (direction * per_layer).astype(mx.float32)
                 add_bias[il] = (
                     contrib if il not in add_bias else add_bias[il] + contrib
                 )
-            else:  # "project" — the formula needs a unit direction
+        else:  # "project" — the formula needs a unit direction
+            for il, direction in active.items():
                 norm = mx.linalg.norm(direction)
                 unit = direction / norm if float(norm) > 1e-8 else direction
                 projections.setdefault(il, []).append(
