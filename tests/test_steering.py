@@ -210,6 +210,14 @@ def test_scaling_defaults_to_unit():
     assert SteeringVector({1: mx.ones(N_EMBD)}).scaling == "unit"
 
 
+def test_get_steering_dir():
+    from omlx.steering import get_steering_dir
+
+    d = get_steering_dir()
+    assert d.name == "steering"
+    assert d.parent.name == ".omlx"
+
+
 def test_layer_map_scales_and_filters():
     sv = SteeringVector(
         directions={il: mx.ones(N_EMBD) for il in range(N_LAYERS)},

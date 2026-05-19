@@ -696,13 +696,21 @@
                                 <div class="p-4 bg-neutral-50 rounded-xl space-y-3">
                                     <div class="min-w-0">
                                         <span class="text-sm font-medium text-neutral-700">Steering Vectors</span>
-                                        <p class="text-xs text-neutral-500 mt-0.5">Control vectors applied as a per-layer bias on the residual stream, nudging model behaviour. Multiple vectors stack; negative strength inverts. Generate with <code class="text-[11px] bg-neutral-200 px-1 rounded">omlx steering generate</code>.</p>
+                                        <p class="text-xs text-neutral-500 mt-0.5">Control vectors applied as a per-layer bias on the residual stream, nudging model behaviour. Multiple vectors stack; negative strength inverts. The dropdown lists vectors in <code class="text-[11px] bg-neutral-200 px-1 rounded">~/.omlx/steering</code> — generate them with <code class="text-[11px] bg-neutral-200 px-1 rounded">omlx steering generate</code>.</p>
                                     </div>
                                     <template x-for="(sv, idx) in modelSettings.steering_vectors" :key="idx">
                                         <div class="p-3 bg-white rounded-lg border border-neutral-200 space-y-2">
                                             <div class="flex items-center gap-2">
-                                                <input type="text" x-model="sv.path" placeholder="/path/to/vector.safetensors"
-                                                       class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                <select x-model="sv.path"
+                                                        class="flex-1 px-3 py-1.5 border border-neutral-200 rounded-lg text-xs bg-white focus:ring-2 focus:ring-neutral-900 focus:border-transparent transition-all">
+                                                    <option value="">Select a steering vector…</option>
+                                                    <template x-for="v in steeringVectors" :key="v.path">
+                                                        <option :value="v.path" x-text="v.name"></option>
+                                                    </template>
+                                                    <template x-if="sv.path && !steeringVectors.some(v => v.path === sv.path)">
+                                                        <option :value="sv.path" x-text="sv.path + '  (not in ~/.omlx/steering)'"></option>
+                                                    </template>
+                                                </select>
                                                 <button type="button" @click="modelSettings.steering_vectors.splice(idx, 1)"
                                                         class="p-1.5 text-neutral-400 hover:text-red-500 hover:bg-red-50 rounded-lg transition-colors"
                                                         title="Remove">&#10005;</button>

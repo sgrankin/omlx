@@ -607,6 +607,7 @@ def _load_steering_model(model_path: str):
 def steering_generate_command(args) -> int:
     """Generate a steering vector from contrastive prompt pairs."""
     import json
+    from pathlib import Path
 
     from .steering_generator import generate_steering_vector
 
@@ -631,6 +632,18 @@ def steering_generate_command(args) -> int:
         print(f"Invalid --layers spec {args.layers!r}: {e}")
         return 1
 
+    # Default output: ~/.omlx/steering/<model>__<prompts>.safetensors —
+    # the model prefix makes it clear which model a vector belongs to.
+    if args.output:
+        output = Path(args.output)
+    else:
+        from .steering import get_steering_dir
+
+        model_name = Path(args.model).name
+        prompts_stem = Path(args.prompts).stem
+        output = get_steering_dir() / f"{model_name}__{prompts_stem}.safetensors"
+    output.parent.mkdir(parents=True, exist_ok=True)
+
     print(f"Loading model: {args.model}")
     model, tokenizer = _load_steering_model(args.model)
 
@@ -645,10 +658,10 @@ def steering_generate_command(args) -> int:
         scaling=args.scaling,
         orthogonalize=args.orthogonalize,
     )
-    vector.save(args.output)
+    vector.save(output)
     print(
         f"Wrote steering vector ({len(vector.directions)} layers, "
-        f"n_embd={vector.n_embd}, method={vector.method}) to {args.output}"
+        f"n_embd={vector.n_embd}, method={vector.method}) to {output}"
     )
     return 0
 
@@ -988,8 +1001,11 @@ Example directory structure:
         "--output",
         "-o",
         type=str,
-        required=True,
-        help="Destination .safetensors file for the steering vector",
+        default=None,
+        help=(
+            "Destination .safetensors file (default: "
+            "~/.omlx/steering/<model>__<prompts>.safetensors)"
+        ),
     )
     steering_gen.add_argument(
         "--method",

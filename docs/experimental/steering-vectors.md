@@ -11,6 +11,8 @@ model's behaviour, without retraining. Configured per model via
 - Generator — `omlx/steering_generator.py`
 - Eval / strength sweeps — `omlx/steering_eval.py`
 - CLI — `omlx steering generate` / `omlx steering eval`
+- Vector files live in `~/.omlx/steering/` — `generate` writes there by
+  default (`<model>__<prompts>.safetensors`) and the admin UI lists it
 
 ## Mechanism
 

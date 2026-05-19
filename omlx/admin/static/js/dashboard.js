@@ -68,6 +68,7 @@
 
             // Models
             models: [],
+            steeringVectors: [],
             loadingModels: false,
             reloading: false,
             sortBy: 'id',
@@ -1127,6 +1128,19 @@
                     console.error('Failed to load templates:', e);
                 }
             },
+            async loadSteeringVectors() {
+                try {
+                    const r = await fetch('/admin/api/steering-vectors');
+                    if (r.ok) {
+                        const data = await r.json();
+                        this.steeringVectors = data.vectors || [];
+                    } else if (r.status === 401) {
+                        window.location.href = '/admin';
+                    }
+                } catch (e) {
+                    console.error('Failed to load steering vectors:', e);
+                }
+            },
             async loadProfileFields() {
                 try {
                     const r = await fetch('/admin/api/profile-fields');
@@ -1535,6 +1549,7 @@
                 await Promise.all([
                     this.loadProfilesForModel(model.id),
                     this.loadTemplates(),
+                    this.loadSteeringVectors(),
                 ]);
                 this.computeDrift();
                 if (this.reasoningParsers.length === 0) {
