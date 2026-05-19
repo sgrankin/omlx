@@ -1184,6 +1184,7 @@ def steering_eval_command(args) -> int:
         layer_start=layer_start,
         layer_end=layer_end,
         max_tokens=args.max_tokens,
+        chat_template_kwargs={"enable_thinking": False} if args.no_think else None,
     )
 
     print()
@@ -1194,7 +1195,11 @@ def steering_eval_command(args) -> int:
             else f"strength {scale:+g}  mode={args.mode}"
         )
         bar = "=" * 70
-        print(f"{bar}\n  {label}\n{bar}\n{text}\n")
+        body = text if text.strip() else (
+            "(empty — steering forced an immediate end-of-sequence; "
+            "this strength is past the usable window)"
+        )
+        print(f"{bar}\n  {label}\n{bar}\n{body}\n")
     return 0
 
 
@@ -1784,8 +1789,10 @@ Example directory structure:
     steering_eval.add_argument(
         "--scales",
         type=str,
-        default="-1,0,0.5,1,1.5",
-        help="Comma-separated strengths; 0 = baseline (default: -1,0,0.5,1,1.5)",
+        default="-0.2,-0.1,0,0.1,0.2",
+        help="Comma-separated strengths; 0 = baseline. The default suits "
+        "magnitude-scaled vectors — the usable window is narrow (best near "
+        "±0.1, edge ±0.2 on a mid-stack band); larger strengths break output.",
     )
     steering_eval.add_argument(
         "--mode",
@@ -1803,8 +1810,15 @@ Example directory structure:
     steering_eval.add_argument(
         "--max-tokens",
         type=int,
-        default=200,
-        help="Tokens to generate per scale (default: 200)",
+        default=512,
+        help="Tokens to generate per scale (default: 512)",
+    )
+    steering_eval.add_argument(
+        "--no-think",
+        action="store_true",
+        help="Disable the model's reasoning block (templates with "
+        "enable_thinking=False) so the steered answer is generated "
+        "directly — recommended for reasoning models.",
     )
 
     steering_sub.add_parser(

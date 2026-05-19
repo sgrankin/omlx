@@ -78,11 +78,16 @@ def evaluate_steering(
     layer_start: int | None = None,
     layer_end: int | None = None,
     max_tokens: int = 200,
+    chat_template_kwargs: dict | None = None,
 ) -> list[tuple[float, str]]:
     """Generate ``prompt`` at each strength in ``scales``.
 
     A strength of 0 is generated with steering removed entirely (the
     baseline). Returns ``[(scale, generated_text), ...]`` in input order.
+
+    ``chat_template_kwargs`` is forwarded to ``apply_chat_template`` — e.g.
+    ``{"enable_thinking": False}`` to evaluate a reasoning model's direct
+    answer rather than its (often long) reasoning block.
     """
     text_model = getattr(model, "language_model", None) or model
 
@@ -95,6 +100,7 @@ def evaluate_steering(
                 [{"role": "user", "content": prompt}],
                 tokenize=False,
                 add_generation_prompt=True,
+                **(chat_template_kwargs or {}),
             )
             prompt_ids = list(tokenizer.encode(templated))
         except Exception as e:  # noqa: BLE001 - fall back to a raw prompt
