@@ -375,6 +375,15 @@ def test_apply_patch_scales_by_strength():
     assert mx.allclose(out, mx.full((1, 1, N_EMBD), 1.0 + 2.5))
 
 
+def test_model_hidden_size_resolves_via_language_model():
+    """For a VLM, n_embd is found by falling through to language_model."""
+    from omlx.patches.steering import model_hidden_size
+
+    vlm = FakeVLM(N_LAYERS, N_EMBD)
+    # Top-level config has neither .args nor .config; fallback should work.
+    assert model_hidden_size(vlm) == N_EMBD
+
+
 def test_apply_patch_normalizes_add_by_layer_count():
     """Additive strength is divided across the steered layers."""
     model = FakeModel(N_LAYERS, N_EMBD)

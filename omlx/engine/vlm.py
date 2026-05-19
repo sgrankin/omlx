@@ -1670,6 +1670,15 @@ class VLMBatchedEngine(BaseEngine):
             except Exception:
                 logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
+        # Same post-load transforms the batched text engine runs — IndexCache,
+        # steering vectors, etc. Without this, settings.steering_vectors is
+        # persisted but never applied on a VLM (the steering patch already
+        # handles VLM layer-tree shape, this was just an engine-side omission).
+        from ..utils.model_loading import apply_post_load_transforms
+        self._vlm_model = apply_post_load_transforms(
+            self._vlm_model, self._model_settings
+        )
+
         _fix_processor_none_pixels(self._processor)
         self._diffusion_family = self._detect_diffusion_family()
         if self.is_diffusion_model:

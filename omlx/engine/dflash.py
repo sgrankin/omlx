@@ -623,6 +623,14 @@ class DFlashEngine(ActivityTrackingMixin, BaseEngine):
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
 
+        # Same post-load transforms the batched text engine runs (steering
+        # vectors, IndexCache). Without this, settings.steering_vectors is
+        # persisted but never applied on a dflash-backed model.
+        from ..utils.model_loading import apply_post_load_transforms
+        self._target_model = apply_post_load_transforms(
+            self._target_model, self._model_settings
+        )
+
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
         # The original self._tokenizer_obj stays for event-loop operations
         # (encode, apply_chat_template, count_chat_tokens).

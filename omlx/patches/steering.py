@@ -48,7 +48,12 @@ def find_layers_container(model: Any) -> Any | None:
 
 
 def model_hidden_size(model: Any) -> int | None:
-    """Best-effort lookup of the model's hidden size (``n_embd``)."""
+    """Best-effort lookup of the model's hidden size (``n_embd``).
+
+    On a VLM the top-level ``config`` only carries vision/text sub-configs;
+    fall through to ``model.language_model`` so the steering vector's
+    n_embd can still be validated against the text decoder.
+    """
     for attr in ("args", "config"):
         obj = getattr(model, attr, None)
         if obj is None:
@@ -59,6 +64,9 @@ def model_hidden_size(model: Any) -> int | None:
             hs = getattr(obj, "hidden_size", None) or getattr(obj, "n_embd", None)
         if hs:
             return int(hs)
+    lm = getattr(model, "language_model", None)
+    if lm is not None and lm is not model:
+        return model_hidden_size(lm)
     return None
 
 
