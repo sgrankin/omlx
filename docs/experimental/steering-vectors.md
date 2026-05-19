@@ -26,6 +26,15 @@ configured spec applies, in order:
 Multiple specs stack: additive specs sum into one per-layer bias,
 projection specs apply sequentially.
 
+## Datasets
+
+`--prompts` takes either a path to a `{"positive": [...], "negative":
+[...]}` JSON file or the name of a known dataset. `omlx steering
+datasets` lists them. Bundled sets ship under `omlx/data/steering/`
+(emotions, style, persona/trait axes — see that directory's README);
+user-local sets in `~/.omlx/steering/datasets/` are also resolved by name
+and shadow bundled ones.
+
 ## Generation methods
 
 A vector is built from contrastive prompt pairs — capture each prompt's

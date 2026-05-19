@@ -609,9 +609,14 @@ def steering_generate_command(args) -> int:
     import json
     from pathlib import Path
 
+    from .steering import resolve_dataset
     from .steering_generator import generate_steering_vector
 
-    prompts_path = args.prompts
+    try:
+        prompts_path = resolve_dataset(args.prompts)
+    except FileNotFoundError as e:
+        print(e)
+        return 1
     try:
         with open(prompts_path, encoding="utf-8") as f:
             data = json.load(f)
@@ -721,6 +726,22 @@ def steering_eval_command(args) -> int:
     return 0
 
 
+def steering_datasets_command(args) -> int:
+    """List available steering datasets (bundled + user-local)."""
+    from .steering import get_bundled_datasets_dir, list_datasets
+
+    datasets = list_datasets()
+    if not datasets:
+        print("No steering datasets found.")
+        return 0
+    bundled = get_bundled_datasets_dir()
+    print(f"{len(datasets)} steering dataset(s) — pass a name to --prompts:\n")
+    for name, path in sorted(datasets.items()):
+        origin = "bundled" if path.is_relative_to(bundled) else "user"
+        print(f"  {name:<18} [{origin:>7}]  {path}")
+    return 0
+
+
 def steering_command(args) -> int:
     """Dispatch 'omlx steering <subcommand>'."""
     sub = getattr(args, "steering_command", None)
@@ -728,8 +749,10 @@ def steering_command(args) -> int:
         return steering_generate_command(args)
     if sub == "eval":
         return steering_eval_command(args)
+    if sub == "datasets":
+        return steering_datasets_command(args)
     print(f"Unknown steering subcommand: {sub}")
-    print("Available: generate, eval")
+    print("Available: generate, eval, datasets")
     return 1
 
 
@@ -995,7 +1018,11 @@ Example directory structure:
         "--prompts",
         type=str,
         required=True,
-        help='JSON file: {"positive": [...], "negative": [...]} (equal-length lists)',
+        help=(
+            "Contrastive prompts: a bundled/user dataset name (see "
+            "'omlx steering datasets') or a path to a JSON file "
+            '{"positive": [...], "negative": [...]}'
+        ),
     )
     steering_gen.add_argument(
         "--output",
@@ -1095,6 +1122,13 @@ Example directory structure:
         type=int,
         default=200,
         help="Tokens to generate per scale (default: 200)",
+    )
+
+    steering_sub.add_parser(
+        "datasets",
+        help="List available steering datasets (for --prompts)",
+        description="List bundled and user-local contrastive prompt datasets "
+        "that can be passed by name to 'omlx steering generate --prompts'.",
     )
 
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown
