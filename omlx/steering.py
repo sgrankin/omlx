@@ -51,6 +51,50 @@ def get_steering_dir() -> Path:
     return DEFAULT_BASE_PATH / "steering"
 
 
+def get_bundled_datasets_dir() -> Path:
+    """Directory of contrastive prompt datasets shipped with oMLX."""
+    return Path(__file__).parent / "data" / "steering"
+
+
+def get_user_datasets_dir() -> Path:
+    """User-local contrastive prompt datasets (``~/.omlx/steering/datasets``)."""
+    return get_steering_dir() / "datasets"
+
+
+def list_datasets() -> dict[str, Path]:
+    """Map dataset name -> path, merging bundled and user-local datasets.
+
+    A user-local dataset shadows a bundled one of the same name.
+    """
+    out: dict[str, Path] = {}
+    for directory in (get_bundled_datasets_dir(), get_user_datasets_dir()):
+        if directory.is_dir():
+            for path in sorted(directory.glob("*.json")):
+                out[path.stem] = path
+    return out
+
+
+def resolve_dataset(spec: str) -> Path:
+    """Resolve a ``--prompts`` value to a dataset file.
+
+    An existing path is returned as-is; otherwise ``spec`` is treated as a
+    dataset name and looked up among the user-local and bundled datasets.
+    Raises FileNotFoundError (listing what is available) on a miss.
+    """
+    path = Path(spec)
+    if path.exists():
+        return path
+    name = spec[:-5] if spec.endswith(".json") else spec
+    datasets = list_datasets()
+    if name in datasets:
+        return datasets[name]
+    available = ", ".join(sorted(datasets)) or "(none)"
+    raise FileNotFoundError(
+        f"steering dataset {spec!r} not found — not an existing path, and "
+        f"not a known dataset name. Available datasets: {available}"
+    )
+
+
 @dataclass
 class SteeringVector:
     """A set of per-layer steering directions for one model.

@@ -218,6 +218,53 @@ def test_get_steering_dir():
     assert d.parent.name == ".omlx"
 
 
+def test_list_datasets_includes_bundled():
+    from omlx.steering import list_datasets
+
+    ds = list_datasets()
+    for name in ("joy", "calm", "assistant", "evil"):
+        assert name in ds, f"bundled dataset {name!r} missing"
+
+
+def test_resolve_dataset_by_name():
+    from omlx.steering import resolve_dataset
+
+    path = resolve_dataset("joy")
+    assert path.name == "joy.json"
+    assert path.exists()
+
+
+def test_resolve_dataset_accepts_explicit_path(tmp_path):
+    from omlx.steering import resolve_dataset
+
+    f = tmp_path / "custom.json"
+    f.write_text("{}")
+    assert resolve_dataset(str(f)) == f
+
+
+def test_resolve_dataset_unknown_raises():
+    from omlx.steering import resolve_dataset
+
+    with pytest.raises(FileNotFoundError, match="not found"):
+        resolve_dataset("no-such-steering-dataset")
+
+
+def test_bundled_datasets_are_well_formed():
+    import json
+
+    from omlx.steering import get_bundled_datasets_dir
+
+    files = list(get_bundled_datasets_dir().glob("*.json"))
+    assert len(files) >= 9
+    for f in files:
+        data = json.loads(f.read_text())
+        assert set(data) >= {"positive", "negative"}, f
+        pos, neg = data["positive"], data["negative"]
+        assert len(pos) == len(neg) > 0, f
+        assert all(isinstance(p, str) and p.strip() for p in pos), f
+        assert all(isinstance(n, str) and n.strip() for n in neg), f
+
+
 def test_layer_map_scales_and_filters():
     sv = SteeringVector(
         directions={il: mx.ones(N_EMBD) for il in range(N_LAYERS)},
