@@ -685,6 +685,15 @@ class VLMBatchedEngine(BaseEngine):
             get_mlx_executor(), _load_vlm_sync
         )
 
+        # Same post-load transforms the batched text engine runs — IndexCache,
+        # steering vectors, etc. Without this, settings.steering_vectors is
+        # persisted but never applied on a VLM (the steering patch already
+        # handles VLM layer-tree shape, this was just an engine-side omission).
+        from ..utils.model_loading import apply_post_load_transforms
+        self._vlm_model = apply_post_load_transforms(
+            self._vlm_model, self._model_settings
+        )
+
         _fix_processor_none_pixels(self._processor)
 
         # Initialize vision feature cache

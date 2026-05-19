@@ -294,30 +294,54 @@ def _maybe_apply_steering(model: Any, model_settings: Any) -> None:
     specs_raw = getattr(model_settings, "steering_vectors", None)
     if not specs_raw:
         return
+    from pathlib import Path as _Path
+
     try:
         from ..patches.steering import apply_steering_patch
         from ..steering import SteeringSpec, SteeringVector
 
-        specs = []
+        parsed: list[tuple[str, SteeringSpec]] = []
         for entry in specs_raw:
             path = entry.get("path")
             if not path:
                 logger.warning("steering: skipping entry with no path: %r", entry)
                 continue
-            specs.append(
-                SteeringSpec(
-                    vector=SteeringVector.load(path),
-                    strength=float(entry.get("strength", 1.0)),
-                    mode=entry.get("mode", "add") or "add",
-                    layer_start=entry.get("layer_start"),
-                    layer_end=entry.get("layer_end"),
-                )
-            )
-        if not specs:
+            try:
+                vector = SteeringVector.load(path)
+            except Exception as e:  # noqa: BLE001 — surface bad vectors, keep loading
+                logger.warning("steering: failed to load %s: %s", path, e)
+                continue
+            parsed.append((path, SteeringSpec(
+                vector=vector,
+                strength=float(entry.get("strength", 1.0)),
+                mode=entry.get("mode", "add") or "add",
+                layer_start=entry.get("layer_start"),
+                layer_end=entry.get("layer_end"),
+            )))
+        if not parsed:
             return
+        specs = [s for _, s in parsed]
         patched = apply_steering_patch(model, specs)
+        # One line per spec — shows the user exactly what was applied.
+        details = []
+        for i, (path, spec) in enumerate(parsed, 1):
+            name = _Path(path).name
+            ls, le = spec.layer_start, spec.layer_end
+            if ls is None and le is None:
+                band = "all"
+            elif ls is None:
+                band = f"..{le}"
+            elif le is None:
+                band = f"{ls}.."
+            else:
+                band = f"{ls}-{le}"
+            details.append(
+                f"  [{i}] {name}  mode={spec.mode}  strength={spec.strength}  "
+                f"layers={band}"
+            )
         logger.info(
-            "Steering applied: %d layer(s) from %d vector(s)", patched, len(specs)
+            "Steering applied (%d layer(s) total from %d vector(s)):\n%s",
+            patched, len(specs), "\n".join(details),
         )
     except Exception as e:
         logger.error("Failed to apply steering vectors: %s", e)
