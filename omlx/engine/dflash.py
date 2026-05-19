@@ -280,12 +280,16 @@ class DFlashEngine(BaseEngine):
         self._target_ops = target_bundle.target_ops
         target_meta = target_bundle.meta
 
-        # Same post-load transforms the batched text engine runs (steering
-        # vectors, IndexCache). Without this, settings.steering_vectors is
-        # persisted but never applied on a dflash-backed model.
+        # Post-load transforms (steering, IndexCache). Run on the MLX
+        # executor: arrays created here (e.g. a loaded steering vector) bind
+        # to the calling thread's stream, and inference runs on the executor
+        # thread — they must originate there or stream lookups fail later.
         from ..utils.model_loading import apply_post_load_transforms
-        self._target_model = apply_post_load_transforms(
-            self._target_model, self._model_settings
+        self._target_model = await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_post_load_transforms,
+            self._target_model,
+            self._model_settings,
         )
 
         # Deep-copy tokenizer for executor-thread usage (dflash generation).
