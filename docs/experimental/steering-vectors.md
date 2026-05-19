@@ -10,7 +10,7 @@ model's behaviour, without retraining. Configured per model via
 - Application patch — `omlx/patches/steering.py` (`_SteeredLayer`)
 - Generator — `omlx/steering_generator.py`
 - Eval / strength sweeps — `omlx/steering_eval.py`
-- CLI — `omlx steering generate` / `omlx steering eval`
+- CLI — `omlx steering generate` / `eval` / `layers` / `datasets`
 - Vector files live in `~/.omlx/steering/` — `generate` writes there by
   default (`<model>__<prompts>.safetensors`) and the admin UI lists it
 
@@ -19,12 +19,26 @@ model's behaviour, without retraining. Configured per model via
 After transformer block `il` produces residual-stream output `h`, each
 configured spec applies, in order:
 
-- **`add`** — `h ← h + strength · d`  (additive bias)
+- **`add`** — `h ← h + strength · d`  (additive bias). `strength` is a
+  band-width-independent total budget: `apply_steering_patch` divides it
+  by the number of steered layers, so a value found on one layer band
+  carries to another without re-tuning.
 - **`project`** — `h ← h − strength · (d̂·h) · d̂`  (directional projection;
-  `strength=1` ablates the component, `<0` amplifies, `>1` flips)
+  `strength=1` ablates the component, `<0` amplifies, `>1` flips). Not
+  normalised — projection is per-layer self-calibrating.
 
 Multiple specs stack: additive specs sum into one per-layer bias,
 projection specs apply sequentially.
+
+## Choosing the layer band
+
+`omlx steering layers --model … --prompts …` captures per-layer
+activations once and scores each layer's separability (a Cohen's-d effect
+size) and difference-consistency, then suggests a contiguous mid-stack
+band to pass to `generate --layers`. This reads the band from a single
+capture instead of a blind generate/evaluate sweep of ranges; the
+per-layer profile also flags whether the prompt set isolates a consistent
+trait at all.
 
 ## Datasets
 

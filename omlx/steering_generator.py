@@ -99,6 +99,45 @@ def _collect_hidden(
     return {il: mx.stack(acc[il], axis=0) for il in range(n_layers)}
 
 
+def _capture_layer_states(
+    model: Any,
+    tokenizer: Any,
+    positive: list[str],
+    negative: list[str],
+) -> tuple[dict[int, mx.array], dict[int, mx.array], int]:
+    """Capture per-layer final-token hidden states for both prompt sets.
+
+    Wraps every transformer block, runs a text forward on each prompt, and
+    always restores the original blocks — even if a forward pass raises.
+    Returns ``(pos_hidden, neg_hidden, n_layers)`` where each hidden map is
+    ``{layer: [n_prompts, n_embd]}``. Shared by :func:`generate_steering_vector`
+    and :func:`analyze_layers`.
+    """
+    # For a VLM, drive the text decoder directly so the forward pass is a
+    # pure-text decode (the top-level forward expects vision inputs).
+    text_model = getattr(model, "language_model", None) or model
+
+    container = find_layers_container(model)
+    if container is None:
+        raise ValueError("could not locate the transformer layer list on model")
+    block_list = container.layers
+    n_layers = len(block_list)
+
+    sink: dict[int, mx.array] = {}
+    originals = list(block_list)
+    for i in range(n_layers):
+        block_list[i] = _HiddenCapture(block_list[i], sink, i)
+    try:
+        logger.info("Capturing hidden states for %d positive prompts", len(positive))
+        pos_hidden = _collect_hidden(text_model, tokenizer, positive, sink, n_layers)
+        logger.info("Capturing hidden states for %d negative prompts", len(negative))
+        neg_hidden = _collect_hidden(text_model, tokenizer, negative, sink, n_layers)
+    finally:
+        for i in range(n_layers):
+            block_list[i] = originals[i]
+    return pos_hidden, neg_hidden, n_layers
+
+
 def _pca_direction(diff: mx.array) -> mx.array:
     """Leading principal component of a ``[n_pairs, n_embd]`` difference set.
 
@@ -252,15 +291,9 @@ def generate_steering_vector(
             f"method={method!r} needs at least 2 prompt pairs; use method='mean'"
         )
 
-    # For a VLM, drive the text decoder directly so the forward pass is a
-    # pure-text decode (the top-level forward expects vision inputs).
-    text_model = getattr(model, "language_model", None) or model
-
-    container = find_layers_container(model)
-    if container is None:
-        raise ValueError("could not locate the transformer layer list on model")
-    block_list = container.layers
-    n_layers = len(block_list)
+    pos_hidden, neg_hidden, n_layers = _capture_layer_states(
+        model, tokenizer, positive, negative
+    )
 
     if layers is not None:
         target_layers = sorted(layers)
@@ -271,21 +304,6 @@ def generate_steering_vector(
     for il in target_layers:
         if il < 0 or il >= n_layers:
             raise ValueError(f"layer {il} out of range (model has {n_layers})")
-
-    # Wrap every block to capture hidden states, capture, then always
-    # restore the originals — even if the forward pass raises.
-    sink: dict[int, mx.array] = {}
-    originals = list(block_list)
-    for i in range(n_layers):
-        block_list[i] = _HiddenCapture(block_list[i], sink, i)
-    try:
-        logger.info("Capturing hidden states for %d positive prompts", len(positive))
-        pos_hidden = _collect_hidden(text_model, tokenizer, positive, sink, n_layers)
-        logger.info("Capturing hidden states for %d negative prompts", len(negative))
-        neg_hidden = _collect_hidden(text_model, tokenizer, negative, sink, n_layers)
-    finally:
-        for i in range(n_layers):
-            block_list[i] = originals[i]
 
     directions: dict[int, mx.array] = {}
     for il in target_layers:
@@ -333,3 +351,94 @@ def generate_steering_vector(
         scaling=scaling,
         model=model_name,
     )
+
+
+def _suggest_band(
+    separations: list[float], threshold: float = 0.6
+) -> tuple[int, int] | None:
+    """Pick a contiguous layer band from per-layer separation scores.
+
+    ``separations[i]`` is layer ``i``'s score. The last layer is excluded
+    from the suggestion — steering it perturbs the pre-logit state. Returns
+    the contiguous run containing the peak-separation layer over which
+    separation stays at or above ``threshold`` of the peak, or ``None`` if
+    every score is ~0.
+    """
+    scored = separations[:-1] if len(separations) > 1 else list(separations)
+    if not scored or max(scored) <= 1e-8:
+        return None
+    peak = max(scored)
+    peak_layer = scored.index(peak)
+    cutoff = threshold * peak
+    start = end = peak_layer
+    while start - 1 >= 0 and scored[start - 1] >= cutoff:
+        start -= 1
+    while end + 1 < len(scored) and scored[end + 1] >= cutoff:
+        end += 1
+    return (start, end)
+
+
+def analyze_layers(
+    model: Any,
+    tokenizer: Any,
+    positive: list[str],
+    negative: list[str],
+    *,
+    threshold: float = 0.6,
+) -> dict:
+    """Score each layer's separability for a contrastive prompt set.
+
+    Captures per-layer activations once (no generation) and, for each
+    layer, measures how well the positive and negative prompts separate:
+
+    - **separation** — a Cohen's-d effect size: the standardized gap
+      between the two classes' projections onto the layer's mean-difference
+      direction. Large where the layer cleanly encodes the trait.
+    - **consistency** — ``|mean(diff)| / mean|diff|`` over the per-pair
+      differences; 1.0 if every pair points the same way, →0 if scattered.
+
+    Returns ``{"layers": [{"layer", "separation", "consistency"}, ...],
+    "suggested": (start, end) | None}``. The suggested band is the
+    contiguous run around the peak-separation layer (last layer excluded)
+    where separation stays above ``threshold`` of the peak — read straight
+    from one capture, rather than a blind generate/evaluate sweep of ranges.
+    """
+    import numpy as np
+
+    if len(positive) != len(negative):
+        raise ValueError(
+            f"positive/negative prompt counts differ: "
+            f"{len(positive)} vs {len(negative)}"
+        )
+    if len(positive) == 0:
+        raise ValueError("need at least one contrastive prompt pair")
+
+    pos_hidden, neg_hidden, n_layers = _capture_layer_states(
+        model, tokenizer, positive, negative
+    )
+
+    layer_stats: list[dict] = []
+    separations: list[float] = []
+    for il in range(n_layers):
+        p = np.asarray(pos_hidden[il], dtype=np.float32)
+        n = np.asarray(neg_hidden[il], dtype=np.float32)
+        diff = p - n
+        mean_diff = diff.mean(axis=0)
+        md_norm = float(np.linalg.norm(mean_diff))
+        if md_norm < 1e-8:
+            sep = cons = 0.0
+        else:
+            unit = mean_diff / md_norm
+            proj_p, proj_n = p @ unit, n @ unit
+            pooled = float(np.sqrt(0.5 * (proj_p.var() + proj_n.var()))) + 1e-8
+            sep = float(abs(proj_p.mean() - proj_n.mean()) / pooled)
+            cons = md_norm / (float(np.linalg.norm(diff, axis=1).mean()) + 1e-8)
+        separations.append(sep)
+        layer_stats.append(
+            {"layer": il, "separation": sep, "consistency": cons}
+        )
+
+    return {
+        "layers": layer_stats,
+        "suggested": _suggest_band(separations, threshold),
+    }

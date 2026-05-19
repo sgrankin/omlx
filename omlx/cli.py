@@ -604,32 +604,44 @@ def _load_steering_model(model_path: str):
         return lm_load(model_path)
 
 
-def steering_generate_command(args) -> int:
-    """Generate a steering vector from contrastive prompt pairs."""
+def _load_contrastive_prompts(prompts_spec: str, max_pairs: int | None):
+    """Resolve a --prompts value to ``(positive, negative)`` prompt lists.
+
+    Accepts a dataset name or a JSON file path (see ``resolve_dataset``).
+    Raises FileNotFoundError or ValueError with a user-facing message.
+    """
     import json
-    from pathlib import Path
 
     from .steering import resolve_dataset
-    from .steering_generator import generate_steering_vector
 
+    path = resolve_dataset(prompts_spec)  # FileNotFoundError on a miss
     try:
-        prompts_path = resolve_dataset(args.prompts)
-    except FileNotFoundError as e:
-        print(e)
-        return 1
-    try:
-        with open(prompts_path, encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             data = json.load(f)
         positive = list(data["positive"])
         negative = list(data["negative"])
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
-        print(f"Failed to read prompt pairs from {prompts_path}: {e}")
-        print('Expected JSON: {"positive": [...], "negative": [...]}')
-        return 1
+        raise ValueError(
+            f"Failed to read prompt pairs from {path}: {e}\n"
+            'Expected JSON: {"positive": [...], "negative": [...]}'
+        ) from e
+    if max_pairs is not None:
+        positive = positive[:max_pairs]
+        negative = negative[:max_pairs]
+    return positive, negative
 
-    if args.max_pairs is not None:
-        positive = positive[: args.max_pairs]
-        negative = negative[: args.max_pairs]
+
+def steering_generate_command(args) -> int:
+    """Generate a steering vector from contrastive prompt pairs."""
+    from pathlib import Path
+
+    from .steering_generator import generate_steering_vector
+
+    try:
+        positive, negative = _load_contrastive_prompts(args.prompts, args.max_pairs)
+    except (FileNotFoundError, ValueError) as e:
+        print(e)
+        return 1
 
     try:
         layers = _parse_layer_spec(args.layers)
@@ -747,6 +759,42 @@ def steering_datasets_command(args) -> int:
     return 0
 
 
+def steering_layers_command(args) -> int:
+    """Score per-layer separability and suggest a steering band."""
+    from .steering_generator import analyze_layers
+
+    try:
+        positive, negative = _load_contrastive_prompts(args.prompts, args.max_pairs)
+    except (FileNotFoundError, ValueError) as e:
+        print(e)
+        return 1
+
+    print(f"Loading model: {args.model}")
+    model, tokenizer = _load_steering_model(args.model)
+    result = analyze_layers(
+        model, tokenizer, positive, negative, threshold=args.threshold
+    )
+
+    layers = result["layers"]
+    peak = max((r["separation"] for r in layers), default=0.0) or 1.0
+    print(f"\n{'layer':>5}  {'separation':>10}  {'consistency':>11}")
+    for r in layers:
+        bar = "#" * int(round(40 * r["separation"] / peak))
+        print(
+            f"{r['layer']:>5}  {r['separation']:>10.3f}  "
+            f"{r['consistency']:>11.3f}  {bar}"
+        )
+    band = result["suggested"]
+    if band:
+        print(f"\nSuggested band: --layers {band[0]}-{band[1]}")
+    else:
+        print(
+            "\nNo clear band — separation is near zero at every layer; "
+            "the prompt pairs may not isolate a consistent trait."
+        )
+    return 0
+
+
 def steering_command(args) -> int:
     """Dispatch 'omlx steering <subcommand>'."""
     sub = getattr(args, "steering_command", None)
@@ -756,8 +804,10 @@ def steering_command(args) -> int:
         return steering_eval_command(args)
     if sub == "datasets":
         return steering_datasets_command(args)
+    if sub == "layers":
+        return steering_layers_command(args)
     print(f"Unknown steering subcommand: {sub}")
-    print("Available: generate, eval, datasets")
+    print("Available: generate, eval, datasets, layers")
     return 1
 
 
@@ -1106,10 +1156,11 @@ Example directory structure:
     steering_eval.add_argument(
         "--scales",
         type=str,
-        default="-0.2,-0.1,0,0.1,0.2",
-        help="Comma-separated strengths; 0 = baseline. The default suits "
-        "magnitude-scaled vectors — the usable window is narrow (best near "
-        "±0.1, edge ±0.2 on a mid-stack band); larger strengths break output.",
+        default="-3,-1.5,0,1.5,3",
+        help="Comma-separated strengths; 0 = baseline. For add mode, "
+        "strength is a band-width-independent total budget (divided across "
+        "the steered layers); sweep to find the model's window, then narrow "
+        "in. Larger strengths break output.",
     )
     steering_eval.add_argument(
         "--mode",
@@ -1143,6 +1194,36 @@ Example directory structure:
         help="List available steering datasets (for --prompts)",
         description="List bundled and user-local contrastive prompt datasets "
         "that can be passed by name to 'omlx steering generate --prompts'.",
+    )
+
+    steering_layers = steering_sub.add_parser(
+        "layers",
+        help="Score per-layer separability and suggest a steering band",
+        description="Capture per-layer activations for a contrastive prompt "
+        "set and report, per layer, how cleanly the two classes separate — "
+        "then suggest a layer band for 'generate --layers'. One capture, no "
+        "generation: replaces a blind sweep of layer ranges.",
+    )
+    steering_layers.add_argument(
+        "--model", type=str, required=True, help="Model path or HF repo id"
+    )
+    steering_layers.add_argument(
+        "--prompts",
+        type=str,
+        required=True,
+        help="Dataset name or JSON file (see 'omlx steering datasets')",
+    )
+    steering_layers.add_argument(
+        "--max-pairs",
+        type=int,
+        default=None,
+        help="Use at most this many prompt pairs (default: all)",
+    )
+    steering_layers.add_argument(
+        "--threshold",
+        type=float,
+        default=0.6,
+        help="Band cutoff as a fraction of peak separation (default: 0.6)",
     )
 
     # Use parse_known_args so `omlx launch <tool> -- ...` can forward unknown

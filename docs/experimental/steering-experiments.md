@@ -13,7 +13,10 @@ the mechanism.
 - **Steered layers:** 10–26 (a mid-stack band; steering all 40 layers
   compounds the perturbation and breaks much sooner).
 - **Strength sweep:** −0.2, −0.1, 0, +0.1, +0.2. 0 is the unsteered
-  baseline. Greedy decoding.
+  baseline. Greedy decoding. _These are the **pre-normalization
+  per-layer** values used at the time of the run; `add`-mode strength is
+  now a band-width-independent total budget (finding #5) — a per-layer
+  0.2 over this 17-layer band corresponds to total strength ≈ 3.4._
 - **Thinking disabled.** This is a reasoning model. An early run capped
   generation at 130 tokens and saw only the *opening of the think
   block* — never the answer; a 1280-token budget still overflowed on
@@ -120,17 +123,24 @@ it — which the multi-vector support already allows.
    eval should support — and the docs should recommend — co-applying a
    refusal-suppression vector. The multi-vector machinery already
    supports this; it is a documentation/UX gap, not a code gap.
-5. **Strength compounds across the band.** 17 layers at magnitude 0.2 is
-   near the edge; the same per-layer strength over fewer layers would
-   not be. A future `evaluate_steering` could normalise `strength` by the
-   steered-layer count so the number means the same thing regardless of
-   band width. *(Proposed.)*
+5. **Strength compounds across the band** — fixed. 17 layers at
+   per-layer 0.2 is near the edge; the same per-layer strength over fewer
+   layers would not be. `add`-mode `strength` is now divided by the
+   steered-layer count in `apply_steering_patch`, so it is a band-width-
+   independent total budget — a strength found on one band carries to
+   another. `project` mode is per-layer meaningful and left as-is.
+   *(Done.)*
 6. **Consider dropping `pca`** from `--method`, or marking it
    experiment-only — it moved nothing on the cleanest available axis.
-7. **A generation-time quality metric would help.** Reporting the cosine
-   spread of the per-pair differences (or a holdout projection
-   separation) at `omlx steering generate` time would flag a weak axis
-   before eval — though in this run every bundled axis turned out strong.
+   *(Proposed.)*
+7. **Finding the layer band for a new model** — `omlx steering layers`
+   captures per-layer activations once and scores each layer's
+   separability (a Cohen's-d effect size) and difference-consistency,
+   then suggests a contiguous mid-stack band. This reads the band
+   straight from one capture rather than a blind generate/evaluate sweep
+   of layer ranges — the per-layer separability profile also doubles as
+   the weak-axis check that finding (formerly a separate proposal)
+   called for. *(Done.)*
 8. Vectors are saved to `~/.omlx/steering/` as
    `Qwen3.6-35B-A3B-oQ6-fp16__<dataset>.safetensors` and now populate the
    admin dropdown directly.

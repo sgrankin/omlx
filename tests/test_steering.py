@@ -265,6 +265,50 @@ def test_bundled_datasets_are_well_formed():
         assert all(isinstance(n, str) and n.strip() for n in neg), f
 
 
+def test_suggest_band_around_peak():
+    from omlx.steering_generator import _suggest_band
+
+    # peak at index 3; contiguous run >= 0.6*peak is indices 2..4.
+    seps = [0.1, 0.3, 0.7, 1.0, 0.65, 0.2, 0.0]
+    assert _suggest_band(seps, threshold=0.6) == (2, 4)
+
+
+def test_suggest_band_excludes_last_layer():
+    from omlx.steering_generator import _suggest_band
+
+    # the genuine peak is the last layer; it must be ignored.
+    assert _suggest_band([0.2, 0.9, 0.3, 5.0], threshold=0.6) == (1, 1)
+
+
+def test_suggest_band_none_when_flat():
+    from omlx.steering_generator import _suggest_band
+
+    assert _suggest_band([0.0, 0.0, 0.0], threshold=0.6) is None
+
+
+def test_analyze_layers_returns_per_layer_stats():
+    from omlx.steering_generator import analyze_layers
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    result = analyze_layers(
+        model, FakeTokenizer(), ["aa", "bb", "cc"], ["xx", "yy", "zz"]
+    )
+    assert len(result["layers"]) == N_LAYERS
+    for r in result["layers"]:
+        assert {"layer", "separation", "consistency"} <= set(r)
+        assert r["separation"] >= 0.0
+    band = result["suggested"]
+    assert band is None or (0 <= band[0] <= band[1] < N_LAYERS - 1)
+
+
+def test_analyze_layers_rejects_mismatched_counts():
+    from omlx.steering_generator import analyze_layers
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    with pytest.raises(ValueError, match="differ"):
+        analyze_layers(model, FakeTokenizer(), ["a", "b"], ["c"])
+
+
 def test_layer_map_scales_and_filters():
     sv = SteeringVector(
         directions={il: mx.ones(N_EMBD) for il in range(N_LAYERS)},
@@ -329,6 +373,31 @@ def test_apply_patch_scales_by_strength():
     out = model.model.layers[0](mx.zeros((1, 1, N_EMBD)))
     # layer 0 FakeBlock seed == 1, plus 2.5 * direction.
     assert mx.allclose(out, mx.full((1, 1, N_EMBD), 1.0 + 2.5))
+
+
+def test_apply_patch_normalizes_add_by_layer_count():
+    """Additive strength is divided across the steered layers."""
+    model = FakeModel(N_LAYERS, N_EMBD)
+    direction = mx.ones(N_EMBD)
+    # Three add layers at strength 3.0 -> each layer's bias is 3.0/3 = 1.0.
+    apply_steering_patch(
+        model, [_spec({0: direction, 1: direction, 2: direction}, strength=3.0)]
+    )
+    out = model.model.layers[1](mx.zeros((1, 1, N_EMBD)))
+    # FakeBlock layer 1 has bias seed == 2; plus the per-layer add of 1.0.
+    assert mx.allclose(out, mx.full((1, 1, N_EMBD), 2.0 + 1.0))
+
+
+def test_apply_patch_add_strength_band_independent():
+    """A wider band splits the same strength into a smaller per-layer bias."""
+    d = mx.ones(N_EMBD)
+    narrow = FakeModel(N_LAYERS, N_EMBD)
+    apply_steering_patch(narrow, [_spec({0: d}, strength=4.0)])
+    wide = FakeModel(N_LAYERS, N_EMBD)
+    apply_steering_patch(wide, [_spec({0: d, 1: d, 2: d, 3: d}, strength=4.0)])
+    # 1-layer spec -> per-layer 4.0; 4-layer spec -> per-layer 1.0.
+    assert mx.allclose(narrow.model.layers[0]._steer_add, d * 4.0)
+    assert mx.allclose(wide.model.layers[0]._steer_add, d * 1.0)
 
 
 def test_patch_handles_tuple_output():
