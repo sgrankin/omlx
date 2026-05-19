@@ -1834,6 +1834,24 @@ async def list_grammar_parsers(is_admin: bool = Depends(require_admin)):
         return []
 
 
+@router.get("/api/steering-vectors")
+async def list_steering_vectors(is_admin: bool = Depends(require_admin)):
+    """List steering vector files available in the steering directory.
+
+    Used to populate the steering-vector dropdown in the model-settings
+    modal. Returns ``{"vectors": [{"name", "path"}, ...]}`` sorted by name;
+    an empty list if the directory does not exist yet.
+    """
+    from ..steering import get_steering_dir
+
+    steering_dir = get_steering_dir()
+    vectors = []
+    if steering_dir.is_dir():
+        for path in sorted(steering_dir.glob("*.safetensors")):
+            vectors.append({"name": path.name, "path": str(path)})
+    return {"vectors": vectors}
+
+
 # =============================================================================
 # Models API Routes
 # =============================================================================

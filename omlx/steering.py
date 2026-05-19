@@ -39,6 +39,18 @@ STEERING_FORMAT_VERSION = 1
 _TENSOR_PREFIX = "direction."
 
 
+def get_steering_dir() -> Path:
+    """Return the directory where steering vector files are kept.
+
+    A sibling of the models and cache directories under the oMLX home —
+    ``~/.omlx/steering``. Generated vectors land here by default and the
+    admin UI lists it; callers that write to it create it lazily.
+    """
+    from .settings import DEFAULT_BASE_PATH
+
+    return DEFAULT_BASE_PATH / "steering"
+
+
 @dataclass
 class SteeringVector:
     """A set of per-layer steering directions for one model.
