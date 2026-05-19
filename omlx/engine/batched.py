@@ -277,13 +277,22 @@ class BatchedEngine(BaseEngine):
             get_mlx_executor(), _load_model_sync
         )
 
-        # Apply post-load transforms (e.g., IndexCache for DSA models)
+        # Post-load transforms (IndexCache, steering vectors). Run on the
+        # MLX executor: arrays created here (a loaded steering vector's
+        # directions) bind to the calling thread's stream, and inference is
+        # on the executor thread — they must originate there or later stream
+        # lookups fail with "There is no Stream(gpu, N) in current thread".
         from ..utils.model_loading import (
             apply_post_load_transforms,
             materialize_lazy_state,
         )
 
-        self._model = apply_post_load_transforms(self._model, self._model_settings)
+        self._model = await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_post_load_transforms,
+            self._model,
+            self._model_settings,
+        )
 
         # Materialize lazy buffers on the loader thread so per-engine
         # inference threads can read them (#1304).

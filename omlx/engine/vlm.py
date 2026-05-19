@@ -1671,12 +1671,16 @@ class VLMBatchedEngine(BaseEngine):
                 logger.debug("Qwen MoE gate+up fusion not applied", exc_info=True)
 
         # Same post-load transforms the batched text engine runs — IndexCache,
-        # steering vectors, etc. Without this, settings.steering_vectors is
-        # persisted but never applied on a VLM (the steering patch already
-        # handles VLM layer-tree shape, this was just an engine-side omission).
+        # steering vectors, etc. Run on the MLX executor: any arrays created
+        # here (e.g. mx.load of a steering vector .safetensors) get bound to
+        # the calling thread's stream, and later inference is on the executor
+        # thread, so they must originate there too.
         from ..utils.model_loading import apply_post_load_transforms
-        self._vlm_model = apply_post_load_transforms(
-            self._vlm_model, self._model_settings
+        self._vlm_model = await loop.run_in_executor(
+            get_mlx_executor(),
+            apply_post_load_transforms,
+            self._vlm_model,
+            self._model_settings,
         )
 
         _fix_processor_none_pixels(self._processor)

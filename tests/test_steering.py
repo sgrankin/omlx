@@ -309,6 +309,119 @@ def test_analyze_layers_rejects_mismatched_counts():
         analyze_layers(model, FakeTokenizer(), ["a", "b"], ["c"])
 
 
+# ---------------------------------------------------------------------------
+# Load-time apply: apply_post_load_transforms → _maybe_apply_steering
+# ---------------------------------------------------------------------------
+
+
+def test_post_load_applies_steering_from_settings(tmp_path):
+    """settings.steering_vectors → apply_post_load_transforms wires the patch."""
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    vec_path = tmp_path / "v.safetensors"
+    SteeringVector(directions={1: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    settings = SimpleNamespace(
+        steering_vectors=[
+            {"path": str(vec_path), "strength": 0.5, "mode": "add"}
+        ],
+        index_cache_freq=None,
+    )
+    apply_post_load_transforms(model, settings)
+    assert getattr(model, "_omlx_steering_active", False) is True
+    assert isinstance(model.model.layers[1], _SteeredLayer)
+
+
+def test_post_load_no_op_when_steering_empty():
+    """No steering_vectors → no patch."""
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    apply_post_load_transforms(
+        model, SimpleNamespace(steering_vectors=None, index_cache_freq=None)
+    )
+    assert getattr(model, "_omlx_steering_active", False) is False
+
+
+def test_post_load_no_op_when_settings_is_none():
+    """settings=None — early return, no exception, model untouched."""
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    apply_post_load_transforms(model, None)
+    assert getattr(model, "_omlx_steering_active", False) is False
+
+
+def test_post_load_logs_per_spec_details(tmp_path, caplog):
+    """The load-time log lists each spec's name, mode, strength, band."""
+    import logging
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    vec_path = tmp_path / "joy.safetensors"
+    SteeringVector(directions={1: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    settings = SimpleNamespace(
+        steering_vectors=[
+            {
+                "path": str(vec_path),
+                "strength": 0.5,
+                "mode": "add",
+                "layer_start": None,
+                "layer_end": None,
+            }
+        ],
+        index_cache_freq=None,
+    )
+    with caplog.at_level(logging.INFO, logger="omlx.utils.model_loading"):
+        apply_post_load_transforms(model, settings)
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "joy.safetensors" in msg
+    assert "mode=add" in msg
+    assert "strength=0.5" in msg
+    assert "layers=all" in msg
+
+
+def test_post_load_isolates_one_bad_vector(tmp_path, caplog):
+    """One bad vector entry warns and is skipped; the rest still apply."""
+    import logging
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    good = tmp_path / "good.safetensors"
+    SteeringVector(directions={2: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(good))
+    settings = SimpleNamespace(
+        steering_vectors=[
+            {"path": str(tmp_path / "missing.safetensors"), "strength": 1.0, "mode": "add"},
+            {"path": str(good), "strength": 1.0, "mode": "add"},
+        ],
+        index_cache_freq=None,
+    )
+    with caplog.at_level(logging.WARNING, logger="omlx.utils.model_loading"):
+        apply_post_load_transforms(model, settings)
+    # The good one was still applied.
+    assert getattr(model, "_omlx_steering_active", False) is True
+    assert isinstance(model.model.layers[2], _SteeredLayer)
+    # The bad one warned and named the missing file.
+    msg = "\n".join(r.message for r in caplog.records)
+    assert "missing.safetensors" in msg
+
+
+def test_apply_patch_clear_error_on_vlm_dim_mismatch():
+    """A VLM with wrong-dim steering vector errors clearly via language_model."""
+    vlm = FakeVLM(N_LAYERS, N_EMBD)
+    wrong = _spec({1: mx.ones(N_EMBD + 4)}, n_embd=N_EMBD + 4)
+    with pytest.raises(ValueError, match="n_embd"):
+        apply_steering_patch(vlm, [wrong])
+
+
 def test_layer_map_scales_and_filters():
     sv = SteeringVector(
         directions={il: mx.ones(N_EMBD) for il in range(N_LAYERS)},
