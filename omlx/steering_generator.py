@@ -192,11 +192,11 @@ def generate_steering_vector(
     tokenizer: Any,
     positive: list[str],
     negative: list[str],
-    method: str = "pca",
+    method: str = "mean",
     model_name: str = "",
     layers: list[int] | None = None,
     scaling: str = "magnitude",
-    orthogonalize: bool = False,
+    orthogonalize: bool = True,
 ) -> SteeringVector:
     """Build a :class:`SteeringVector` from contrastive prompt pairs.
 
@@ -208,10 +208,12 @@ def generate_steering_vector(
         positive: Prompts exhibiting the target behaviour.
         negative: Prompts exhibiting the opposite; must be the same length
             as ``positive`` (pair ``i`` is ``positive[i]`` vs ``negative[i]``).
-        method: "mean" (average of per-pair differences), "pca" (leading
-            principal component of the differences), or "crosscov"
-            (cross-covariance contrastive axis — cleaner separation of the
-            trait from confounds, but wants many prompt pairs).
+        method: "mean" (default — average of per-pair differences; robust
+            with few pairs), "crosscov" (cross-covariance contrastive axis
+            — cleaner separation of the trait from confounds, but wants
+            many prompt pairs ~n_embd), or "pca" (leading principal
+            component of the differences; discouraged — its axis is
+            confound-dominated).
         model_name: Free-form provenance string stored in the vector.
         layers: Restrict generation to these layer indices. Default: all
             layers except the last — steering the final layer perturbs the
@@ -222,10 +224,10 @@ def generate_steering_vector(
             consistently across layers (the residual stream grows ~35x in
             norm with depth; magnitude scaling tracks it, corr ~0.99). Or
             "unit" — every direction normalised to unit length.
-        orthogonalize: When True, project each layer's direction orthogonal
-            to that layer's control-class (negative) mean before scaling
-            (ds4's default generator step) — strips the component aligned
-            with general activation drift, leaving a cleaner trait axis.
+        orthogonalize: Project each layer's direction orthogonal to that
+            layer's control-class (negative) mean before scaling — strips
+            the component aligned with general activation drift, leaving a
+            cleaner trait axis. Default True, matching ds4's generator.
 
     Returns:
         A SteeringVector with one direction per requested layer.

@@ -994,11 +994,12 @@ Example directory structure:
     steering_gen.add_argument(
         "--method",
         type=str,
-        default="pca",
-        choices=["pca", "mean", "crosscov"],
+        default="mean",
+        choices=["mean", "crosscov", "pca"],
         help=(
-            "Reduction method: 'mean', 'pca', or 'crosscov' (cross-covariance "
-            "contrastive axis — cleaner, wants many prompt pairs). Default: pca"
+            "Reduction method: 'mean' (default, robust), 'crosscov' "
+            "(cross-covariance contrastive axis — cleaner, wants many prompt "
+            "pairs), or 'pca' (discouraged — confound-dominated axis)"
         ),
     )
     steering_gen.add_argument(
@@ -1026,10 +1027,12 @@ Example directory structure:
     )
     steering_gen.add_argument(
         "--orthogonalize",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Project each direction orthogonal to the control-class mean "
-            "(ds4-style) — strips general activation drift from the trait axis"
+            "(ds4-style) — strips general activation drift from the trait "
+            "axis. On by default; use --no-orthogonalize to disable"
         ),
     )
 
