@@ -778,11 +778,15 @@ def steering_layers_command(args) -> int:
 
 # 256-colour pairs chosen so alternate rows are subtly different in hue
 # (cyan ↔ sky-blue, pink ↔ light pink) rather than in lightness — striping
-# without one row looking "dimmed". Sub-cell tip chars: cons grows
-# rightward and uses the full ▏..█ left-heavy gradient; sep grows leftward
-# and the right-heavy block inventory is sparse (only ▕ and ▐), so its tip
-# uses a coarse 3-level gradient.
+# without one row looking "dimmed". The dim pair preserves hue but drops
+# saturation/brightness; it marks the part of the sep bar that orthogonalize
+# against the control mean would strip (i.e. activation-magnitude direction,
+# not trait axis). Sub-cell tip chars: cons grows rightward and uses the
+# full ▏..█ left-heavy gradient; sep grows leftward and the right-heavy
+# block inventory is sparse (only ▕ and ▐), so its tip uses a coarse 3-level
+# gradient.
 _SEP_COLOUR_A, _SEP_COLOUR_B = 51, 45         # cyan / deep sky-blue
+_SEP_DIM_A, _SEP_DIM_B = 30, 24               # dim cyan / dim sky-blue
 _CONS_COLOUR_A, _CONS_COLOUR_B = 207, 213     # pink / light pink
 _BLOCKS_RIGHT = " ▏▎▍▌▋▊▉█"
 _BAR_W = 20
@@ -792,8 +796,12 @@ def _print_butterfly(result: dict, threshold: float) -> None:
     """Render the layers report as a mirrored butterfly chart.
 
     Bars meet in the middle of the row — sep grows leftward, cons grows
-    rightward; layer + sep value on the far left, cons value on the far
-    right. ANSI 256-colour when stdout is a TTY; plain text otherwise.
+    rightward; layer + sep + sep⊥ values on the far left, cons value on
+    the far right. The sep bar is two-tone: the inner segment (closer to
+    centre) is the orthogonalize-surviving portion, the outer segment is
+    contamination — the component of the contrast parallel to the control
+    mean. ANSI 256-colour when stdout is a TTY; ░ stands in for the dim
+    portion when output is piped.
     """
     import sys
 
@@ -815,10 +823,20 @@ def _print_butterfly(result: dict, threshold: float) -> None:
             b += _BLOCKS_RIGHT[int(round(partial * 8))]
         return b.ljust(_BAR_W)
 
-    def sep_bar(v: float) -> str:
-        v_cells = _BAR_W * v / peak
-        full = int(v_cells)
-        partial = v_cells - full
+    def sep_bar(sep_v: float, ortho_v: float) -> tuple[str, int]:
+        """Right-anchored sep bar of width ``_BAR_W``.
+
+        Returns ``(bar, n_dim)`` — the bar string and how many leftmost
+        non-space cells should be drawn in the dim colour (the
+        contamination tip). ``ortho_v`` is clamped to ``sep_v`` so the
+        split never inverts under sampling noise.
+        """
+        sep_v = max(sep_v, 0.0)
+        ortho_v = max(0.0, min(ortho_v, sep_v))
+        sep_cells = _BAR_W * sep_v / peak
+        ortho_cells = _BAR_W * ortho_v / peak
+        full = int(sep_cells)
+        partial = sep_cells - full
         tip = ""
         if partial > 0.75:
             full += 1
@@ -826,9 +844,34 @@ def _print_butterfly(result: dict, threshold: float) -> None:
             tip = "▐"
         elif partial > 0:
             tip = "▕"
-        return (tip + "█" * full).rjust(_BAR_W)
+        total_filled = (1 if tip else 0) + full
+        ortho_full = min(int(round(ortho_cells)), total_filled)
+        n_dim = total_filled - ortho_full
+        return (tip + "█" * full).rjust(_BAR_W), n_dim
 
-    def render(bar_s: str, colour: int, tick_col: int) -> str:
+    def render_sep(
+        bar_s: str, bright: int, dim: int, n_dim: int
+    ) -> str:
+        out = []
+        dim_left = n_dim
+        for i, ch in enumerate(bar_s):
+            if ch != " ":
+                if use_colour:
+                    colour = dim if dim_left > 0 else bright
+                    out.append(f"\x1b[38;5;{colour}m{ch}\x1b[0m")
+                else:
+                    # Substitute a shade glyph for the dim portion so the
+                    # split survives on non-colour terminals.
+                    out.append("░" if dim_left > 0 else ch)
+                if dim_left > 0:
+                    dim_left -= 1
+            elif i == sep_tick:
+                out.append("┃")
+            else:
+                out.append(" ")
+        return "".join(out)
+
+    def render_cons(bar_s: str, colour: int) -> str:
         out = []
         for i, ch in enumerate(bar_s):
             if ch != " ":
@@ -836,14 +879,16 @@ def _print_butterfly(result: dict, threshold: float) -> None:
                     out.append(f"\x1b[38;5;{colour}m{ch}\x1b[0m")
                 else:
                     out.append(ch)
-            elif i == tick_col:
+            elif i == cons_tick:
                 out.append("┃")
             else:
                 out.append(" ")
         return "".join(out)
 
     # Header arrows aligned to the absolute column of each tick.
-    left_pad = 3 + 2 + 6 + 2   # "lyr" (3) + "  " + "sep" (6) + "  "
+    # "lyr"(3)+"  "+"sep"(6)+"  "+"sep⊥"(6)+"  " — sep⊥'s header glyph is
+    # 4 chars wide but right-padded into a 6-col field to match the values.
+    left_pad = 3 + 2 + 6 + 2 + 6 + 2
     sep_arrow_col = left_pad + sep_tick
     cons_arrow_col = left_pad + _BAR_W + cons_tick
     width = cons_arrow_col + 16
@@ -857,17 +902,24 @@ def _print_butterfly(result: dict, threshold: float) -> None:
                 header[col + j] = ch
     print()
     print("".join(header).rstrip())
-    print(f"{'lyr':>3}  {'sep':>6}  {' ' * (_BAR_W + _BAR_W)}  {'cons':>5}")
+    print(
+        f"{'lyr':>3}  {'sep':>6}  {'sep⊥':>6}  "
+        f"{' ' * (_BAR_W + _BAR_W)}  {'cons':>5}"
+    )
 
     for i, r in enumerate(layers):
         alt = (i % 2 == 1)
         sep_c = _SEP_COLOUR_B if alt else _SEP_COLOUR_A
+        sep_dim_c = _SEP_DIM_B if alt else _SEP_DIM_A
         cons_c = _CONS_COLOUR_B if alt else _CONS_COLOUR_A
-        sb = render(sep_bar(r["separation"]), sep_c, sep_tick)
-        cb = render(cons_bar(r["consistency"]), cons_c, cons_tick)
+        # Tolerate older callers that produced only "separation".
+        ortho = r.get("ortho_separation", r["separation"])
+        bar, n_dim = sep_bar(r["separation"], ortho)
+        sb = render_sep(bar, sep_c, sep_dim_c, n_dim)
+        cb = render_cons(cons_bar(r["consistency"]), cons_c)
         print(
-            f"{r['layer']:>3}  {r['separation']:>6.3f}  {sb}{cb}  "
-            f"{r['consistency']:>5.3f}"
+            f"{r['layer']:>3}  {r['separation']:>6.3f}  "
+            f"{ortho:>6.3f}  {sb}{cb}  {r['consistency']:>5.3f}"
         )
 
     print(f"\n{result['summary']}")
