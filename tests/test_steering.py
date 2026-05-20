@@ -295,8 +295,11 @@ def test_analyze_layers_returns_per_layer_stats():
     )
     assert len(result["layers"]) == N_LAYERS
     for r in result["layers"]:
-        assert {"layer", "separation", "consistency"} <= set(r)
+        assert {
+            "layer", "separation", "ortho_separation", "consistency"
+        } <= set(r)
         assert r["separation"] >= 0.0
+        assert r["ortho_separation"] >= 0.0
     band = result["suggested"]
     assert band is None or (0 <= band[0] <= band[1] < N_LAYERS - 1)
 
@@ -349,6 +352,107 @@ def test_quality_summary_passes_clean_axis():
     assert "strong" in summary
     assert "coherent" in summary
     assert warnings == []
+
+
+def test_quality_summary_flags_orthogonalize_confound():
+    """A peak layer where ortho_sep ≪ sep should trigger a confound warning."""
+    from omlx.steering_generator import _quality_summary
+
+    confounded = [
+        {"layer": 0, "separation": 0.1, "ortho_separation": 0.08,
+         "consistency": 0.4},
+        # Peak — Cohen's d 1.2 raw but only 0.3 after orthogonalize.
+        {"layer": 1, "separation": 1.2, "ortho_separation": 0.30,
+         "consistency": 0.9},
+        {"layer": 2, "separation": 0.5, "ortho_separation": 0.45,
+         "consistency": 0.5},
+    ]
+    summary, warnings = _quality_summary(confounded)
+    assert any("activation-magnitude" in w for w in warnings)
+    # The strong/coherent labels still hold — the warning is additive.
+    assert "strong" in summary
+
+
+def test_quality_summary_no_ortho_warning_when_clean():
+    """ortho_sep close to sep at the peak: no confound warning."""
+    from omlx.steering_generator import _quality_summary
+
+    clean = [
+        {"layer": 0, "separation": 1.2, "ortho_separation": 1.15,
+         "consistency": 0.9},
+        {"layer": 1, "separation": 0.5, "ortho_separation": 0.48,
+         "consistency": 0.5},
+    ]
+    _, warnings = _quality_summary(clean)
+    assert not any("activation-magnitude" in w for w in warnings)
+
+
+def test_per_layer_metrics_detects_magnitude_confound():
+    """When the contrast direction parallels the control mean,
+    ortho_separation drops well below the raw separation."""
+    import mlx.core as mx
+    import numpy as np
+
+    from omlx.steering_generator import _per_layer_metrics
+
+    # Both classes spread isotropically around a baseline along axis 0;
+    # the positive class is shifted further along that same axis. The
+    # mean-diff direction is then parallel to the control mean, so
+    # orthogonalize strips most of the discriminating axis.
+    rng = np.random.default_rng(0)
+    d, n = 16, 32
+    base = np.zeros(d, dtype=np.float32)
+    base[0] = 5.0
+    neg_np = base + rng.normal(scale=0.5, size=(n, d)).astype(np.float32)
+    pos_np = base.copy()
+    pos_np[0] = 9.0
+    pos_np = pos_np + rng.normal(scale=0.5, size=(n, d)).astype(np.float32)
+
+    sep, ortho_sep, _ = _per_layer_metrics(mx.array(pos_np), mx.array(neg_np))
+    assert sep > 1.0           # large raw separation
+    assert ortho_sep < 0.3 * sep  # mostly stripped
+
+
+def test_per_layer_metrics_keeps_orthogonal_contrast():
+    """When the mean-diff direction is orthogonal to the control mean,
+    ortho_separation ≈ separation (orthogonalize is a no-op)."""
+    import mlx.core as mx
+    import numpy as np
+
+    from omlx.steering_generator import _per_layer_metrics
+
+    # Both classes share a non-zero offset along axis 0 (the "control
+    # mean" direction); the trait shift sits purely along axis 1. So
+    # mean_diff lives on axis 1, which is orthogonal to the control mean.
+    rng = np.random.default_rng(1)
+    d, n = 16, 32
+    neg_centre = np.zeros(d, dtype=np.float32)
+    neg_centre[0] = 5.0
+    pos_centre = neg_centre.copy()
+    pos_centre[1] = 5.0
+    neg_np = neg_centre + rng.normal(scale=0.3, size=(n, d)).astype(np.float32)
+    pos_np = pos_centre + rng.normal(scale=0.3, size=(n, d)).astype(np.float32)
+
+    sep, ortho_sep, _ = _per_layer_metrics(mx.array(pos_np), mx.array(neg_np))
+    assert sep > 1.0
+    assert ortho_sep > 0.9 * sep  # axis preserved
+
+
+def test_quality_summary_skips_ortho_warning_when_peak_weak():
+    """If everything is weak, the ortho warning is redundant — suppressed."""
+    from omlx.steering_generator import _quality_summary
+
+    weak = [
+        {"layer": 0, "separation": 0.1, "ortho_separation": 0.02,
+         "consistency": 0.4},
+        {"layer": 1, "separation": 0.2, "ortho_separation": 0.01,
+         "consistency": 0.5},
+    ]
+    _, warnings = _quality_summary(weak)
+    # Weak-separation warning fires; ortho warning does not — the peak
+    # itself is below the usable floor.
+    assert any("weak" in w for w in warnings)
+    assert not any("activation-magnitude" in w for w in warnings)
 
 
 # ---------------------------------------------------------------------------

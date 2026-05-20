@@ -351,7 +351,8 @@ def generate_steering_vector(
         {
             "layer": il,
             "separation": (m := _per_layer_metrics(pos_hidden[il], neg_hidden[il]))[0],
-            "consistency": m[1],
+            "ortho_separation": m[1],
+            "consistency": m[2],
         }
         for il in target_layers
     ]
@@ -369,11 +370,19 @@ def generate_steering_vector(
     )
 
 
-def _per_layer_metrics(pos: mx.array, neg: mx.array) -> tuple[float, float]:
-    """Score a layer's contrast: ``(separation, consistency)``.
+def _per_layer_metrics(
+    pos: mx.array, neg: mx.array
+) -> tuple[float, float, float]:
+    """Score a layer's contrast: ``(separation, ortho_separation, consistency)``.
 
     - **separation** — Cohen's-d effect size of the two classes projected
       onto their mean-difference direction. Standardized; unbounded above.
+    - **ortho_separation** — same Cohen's-d, but on the mean-difference
+      direction *after* projecting out its component parallel to the
+      control-class (negative) mean. Matches what ``generate`` ships when
+      ``orthogonalize=True`` (the default). When ortho_separation ≪
+      separation, much of the raw separability is an activation-magnitude
+      direction rather than a trait axis — a confound signal.
     - **consistency** — ``|mean(diff)| / mean|diff|`` over the per-pair
       differences. 1.0 if every pair points the same way, →0 if scattered.
 
@@ -388,13 +397,29 @@ def _per_layer_metrics(pos: mx.array, neg: mx.array) -> tuple[float, float]:
     mean_diff = diff.mean(axis=0)
     md_norm = float(np.linalg.norm(mean_diff))
     if md_norm < 1e-8:
-        return 0.0, 0.0
+        return 0.0, 0.0, 0.0
     unit = mean_diff / md_norm
     proj_p, proj_n = p @ unit, n @ unit
     pooled = float(np.sqrt(0.5 * (proj_p.var() + proj_n.var()))) + 1e-8
     sep = float(abs(proj_p.mean() - proj_n.mean()) / pooled)
     cons = md_norm / (float(np.linalg.norm(diff, axis=1).mean()) + 1e-8)
-    return sep, cons
+
+    # Ortho-separation: rotate the projection axis to remove the part
+    # parallel to the control mean, then measure Cohen's d on the result.
+    control = n.mean(axis=0)
+    control_norm = float(np.linalg.norm(control))
+    if control_norm < 1e-8:
+        return sep, sep, cons
+    control_unit = control / control_norm
+    ortho = unit - float(unit @ control_unit) * control_unit
+    ortho_norm = float(np.linalg.norm(ortho))
+    if ortho_norm < 1e-8:
+        return sep, 0.0, cons
+    ortho_unit = ortho / ortho_norm
+    op_p, op_n = p @ ortho_unit, n @ ortho_unit
+    op_pooled = float(np.sqrt(0.5 * (op_p.var() + op_n.var()))) + 1e-8
+    ortho_sep = float(abs(op_p.mean() - op_n.mean()) / op_pooled)
+    return sep, ortho_sep, cons
 
 
 def _quality_summary(layer_stats: list[dict]) -> tuple[str, list[str]]:
@@ -404,6 +429,12 @@ def _quality_summary(layer_stats: list[dict]) -> tuple[str, list[str]]:
 
     - separation: ≥0.8 strong, ≥0.5 good, ≥0.3 marginal, <0.3 weak
     - consistency: ≥0.5 coherent, ≥0.3 mixed, <0.3 scattered
+    - ortho_separation / separation: a warning fires when the peak-sep
+      layer keeps less than half its Cohen's d after orthogonalize against
+      the control mean. That means the raw contrast leans heavily on an
+      activation-magnitude direction rather than a trait axis, so the
+      shipped vector (orthogonalize=True by default) will be much weaker
+      than the raw ``separation`` number suggests.
 
     Returns ``(summary_line, [warning, ...])``.
     """
@@ -439,6 +470,21 @@ def _quality_summary(layer_stats: list[dict]) -> tuple[str, list[str]]:
             "scattered per-pair differences — a few outlier pairs likely "
             "dominate the mean direction. Tighter prompt-pair matching "
             "usually helps."
+        )
+    # Confound check: only meaningful when the peak is itself usable; if
+    # everything is weak, the weak-separation warning already covers it.
+    peak_ortho = peak_sep.get("ortho_separation")
+    if (
+        peak_ortho is not None
+        and peak_sep["separation"] >= 0.3
+        and peak_ortho < 0.5 * peak_sep["separation"]
+    ):
+        warnings.append(
+            f"peak-layer contrast is mostly an activation-magnitude "
+            f"direction (sep={peak_sep['separation']:.2f}, "
+            f"sep⊥={peak_ortho:.2f}); orthogonalize will strip most of "
+            f"it. Look for a layer whose sep⊥ is close to its sep, or "
+            f"revisit the prompt pairs for magnitude confounds."
         )
     return summary, warnings
 
@@ -484,14 +530,21 @@ def analyze_layers(
     - **separation** — a Cohen's-d effect size: the standardized gap
       between the two classes' projections onto the layer's mean-difference
       direction. Large where the layer cleanly encodes the trait.
+    - **ortho_separation** — the same effect size, measured along the
+      mean-difference direction *after* projecting out its component
+      parallel to the control-class mean (i.e. what ``generate`` actually
+      ships with the default ``orthogonalize=True``). A big gap from
+      ``separation`` means the raw contrast leans on an
+      activation-magnitude direction rather than a clean trait axis.
     - **consistency** — ``|mean(diff)| / mean|diff|`` over the per-pair
       differences; 1.0 if every pair points the same way, →0 if scattered.
 
-    Returns ``{"layers": [{"layer", "separation", "consistency"}, ...],
-    "suggested": (start, end) | None}``. The suggested band is the
-    contiguous run around the peak-separation layer (last layer excluded)
-    where separation stays above ``threshold`` of the peak — read straight
-    from one capture, rather than a blind generate/evaluate sweep of ranges.
+    Returns ``{"layers": [{"layer", "separation", "ortho_separation",
+    "consistency"}, ...], "suggested": (start, end) | None}``. The
+    suggested band is the contiguous run around the peak-separation
+    layer (last layer excluded) where separation stays above
+    ``threshold`` of the peak — read straight from one capture, rather
+    than a blind generate/evaluate sweep of ranges.
     """
     if len(positive) != len(negative):
         raise ValueError(
@@ -508,10 +561,15 @@ def analyze_layers(
     layer_stats: list[dict] = []
     separations: list[float] = []
     for il in range(n_layers):
-        sep, cons = _per_layer_metrics(pos_hidden[il], neg_hidden[il])
+        sep, ortho_sep, cons = _per_layer_metrics(pos_hidden[il], neg_hidden[il])
         separations.append(sep)
         layer_stats.append(
-            {"layer": il, "separation": sep, "consistency": cons}
+            {
+                "layer": il,
+                "separation": sep,
+                "ortho_separation": ortho_sep,
+                "consistency": cons,
+            }
         )
 
     summary, warnings = _quality_summary(layer_stats)
