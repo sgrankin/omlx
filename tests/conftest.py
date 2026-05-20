@@ -83,9 +83,13 @@ class MockModelConfig:
 class MockModel:
     """Mock model for testing without loading real models."""
 
-    def __init__(self, config: Optional[MockModelConfig] = None):
+    def __init__(self, config: Optional[MockModelConfig] = None, num_layers: int = 4):
         self.config = config or MockModelConfig()
         self._parameters: Dict[str, Any] = {}
+        # Upstream's _do_external_prefill (PR #1315) calls make_prompt_cache,
+        # which does len(model.layers). Match the convention used by the
+        # MockModels in test_prefix_cache.py / test_hybrid_cache.py.
+        self.layers = [MagicMock() for _ in range(num_layers)]
 
     def __call__(self, input_ids: Any, **kwargs: Any) -> Any:
         """Forward pass (returns mock logits)."""
