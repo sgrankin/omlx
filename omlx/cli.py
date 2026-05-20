@@ -777,12 +777,24 @@ def steering_layers_command(args) -> int:
 
     layers = result["layers"]
     peak = max((r["separation"] for r in layers), default=0.0) or 1.0
-    print(f"\n{'layer':>5}  {'separation':>10}  {'consistency':>11}")
+    # Two bars per row so both metrics have a visual anchor:
+    # - separation is unbounded (Cohen's d), normalised to its column peak;
+    # - consistency is naturally [0, 1], shown against the full range.
+    # Layers with both bars long are the band to actually steer in;
+    # a long sep bar with a short cons bar means the mean direction is
+    # there but the per-pair signals scatter, and vice versa.
+    sep_w = cons_w = 20
+    print(
+        f"\n{'layer':>5}  {'sep':>6} {'(peak)':<{sep_w}}  "
+        f"{'cons':>5} {'(0..1)':<{cons_w}}"
+    )
     for r in layers:
-        bar = "#" * int(round(40 * r["separation"] / peak))
+        sep_bar = "#" * int(round(sep_w * r["separation"] / peak))
+        cons = max(0.0, min(1.0, r["consistency"]))
+        cons_bar = "#" * int(round(cons_w * cons))
         print(
-            f"{r['layer']:>5}  {r['separation']:>10.3f}  "
-            f"{r['consistency']:>11.3f}  {bar}"
+            f"{r['layer']:>5}  {r['separation']:>6.3f} {sep_bar:<{sep_w}}  "
+            f"{r['consistency']:>5.3f} {cons_bar:<{cons_w}}"
         )
     band = result["suggested"]
     if band:
