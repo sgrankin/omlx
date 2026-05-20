@@ -714,7 +714,8 @@ def steering_eval_command(args) -> int:
     print(f"Loading model: {args.model}")
     model, tokenizer = _load_steering_model(args.model)
 
-    results = evaluate_steering(
+    print()
+    for scale, text in evaluate_steering(
         model,
         tokenizer,
         vector,
@@ -725,10 +726,7 @@ def steering_eval_command(args) -> int:
         layer_end=layer_end,
         max_tokens=args.max_tokens,
         chat_template_kwargs={"enable_thinking": False} if args.no_think else None,
-    )
-
-    print()
-    for scale, text in results:
+    ):
         label = (
             "baseline (no steering)"
             if scale == 0.0
@@ -739,7 +737,7 @@ def steering_eval_command(args) -> int:
             "(empty — steering forced an immediate end-of-sequence; "
             "this strength is past the usable window)"
         )
-        print(f"{bar}\n  {label}\n{bar}\n{body}\n")
+        print(f"{bar}\n  {label}\n{bar}\n{body}\n", flush=True)
     return 0
 
 

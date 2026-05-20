@@ -13,6 +13,7 @@ attributable to the steering vector rather than sampling noise.
 from __future__ import annotations
 
 import logging
+from collections.abc import Iterator
 from typing import Any
 
 import mlx.core as mx
@@ -79,11 +80,12 @@ def evaluate_steering(
     layer_end: int | None = None,
     max_tokens: int = 200,
     chat_template_kwargs: dict | None = None,
-) -> list[tuple[float, str]]:
-    """Generate ``prompt`` at each strength in ``scales``.
+) -> Iterator[tuple[float, str]]:
+    """Yield ``(scale, generated_text)`` for each strength in ``scales``.
 
     A strength of 0 is generated with steering removed entirely (the
-    baseline). Returns ``[(scale, generated_text), ...]`` in input order.
+    baseline). A generator so callers can stream/print partial results
+    as each scale finishes; the steering patch is always cleared on exit.
 
     ``chat_template_kwargs`` is forwarded to ``apply_chat_template`` — e.g.
     ``{"enable_thinking": False}`` to evaluate a reasoning model's direct
@@ -108,25 +110,26 @@ def evaluate_steering(
     if prompt_ids is None:
         prompt_ids = list(tokenizer.encode(prompt))
 
-    results: list[tuple[float, str]] = []
-    for scale in scales:
-        if scale == 0.0:
-            remove_steering_patch(model)
-        else:
-            apply_steering_patch(
-                model,
-                [
-                    SteeringSpec(
-                        vector=vector,
-                        strength=scale,
-                        mode=mode,
-                        layer_start=layer_start,
-                        layer_end=layer_end,
-                    )
-                ],
+    try:
+        for scale in scales:
+            if scale == 0.0:
+                remove_steering_patch(model)
+            else:
+                apply_steering_patch(
+                    model,
+                    [
+                        SteeringSpec(
+                            vector=vector,
+                            strength=scale,
+                            mode=mode,
+                            layer_start=layer_start,
+                            layer_end=layer_end,
+                        )
+                    ],
+                )
+            logger.info("Generating at steering strength %.3g", scale)
+            yield scale, _greedy_generate(
+                text_model, tokenizer, prompt_ids, max_tokens
             )
-        logger.info("Generating at steering strength %.3g", scale)
-        results.append((scale, _greedy_generate(text_model, tokenizer, prompt_ids, max_tokens)))
-
-    remove_steering_patch(model)
-    return results
+    finally:
+        remove_steering_patch(model)
