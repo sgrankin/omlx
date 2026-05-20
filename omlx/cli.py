@@ -1244,28 +1244,104 @@ def steering_layers_command(args) -> int:
     result = analyze_layers(
         model, tokenizer, positive, negative, threshold=args.threshold
     )
+    _print_butterfly(result, args.threshold)
+    return 0
+
+
+# 256-colour pairs chosen so alternate rows are subtly different in hue
+# (cyan ↔ sky-blue, pink ↔ light pink) rather than in lightness — striping
+# without one row looking "dimmed". Sub-cell tip chars: cons grows
+# rightward and uses the full ▏..█ left-heavy gradient; sep grows leftward
+# and the right-heavy block inventory is sparse (only ▕ and ▐), so its tip
+# uses a coarse 3-level gradient.
+_SEP_COLOUR_A, _SEP_COLOUR_B = 51, 45         # cyan / deep sky-blue
+_CONS_COLOUR_A, _CONS_COLOUR_B = 207, 213     # pink / light pink
+_BLOCKS_RIGHT = " ▏▎▍▌▋▊▉█"
+_BAR_W = 20
+
+
+def _print_butterfly(result: dict, threshold: float) -> None:
+    """Render the layers report as a mirrored butterfly chart.
+
+    Bars meet in the middle of the row — sep grows leftward, cons grows
+    rightward; layer + sep value on the far left, cons value on the far
+    right. ANSI 256-colour when stdout is a TTY; plain text otherwise.
+    """
+    import sys
 
     layers = result["layers"]
-    peak = max((r["separation"] for r in layers), default=0.0) or 1.0
-    # Two bars per row so both metrics have a visual anchor:
-    # - separation is unbounded (Cohen's d), normalised to its column peak;
-    # - consistency is naturally [0, 1], shown against the full range.
-    # Layers with both bars long are the band to actually steer in;
-    # a long sep bar with a short cons bar means the mean direction is
-    # there but the per-pair signals scatter, and vice versa.
-    sep_w = cons_w = 20
-    print(
-        f"\n{'layer':>5}  {'sep':>6} {'(peak)':<{sep_w}}  "
-        f"{'cons':>5} {'(0..1)':<{cons_w}}"
-    )
-    for r in layers:
-        sep_bar = "#" * int(round(sep_w * r["separation"] / peak))
-        cons = max(0.0, min(1.0, r["consistency"]))
-        cons_bar = "#" * int(round(cons_w * cons))
+    if not layers:
+        print("(no layers analyzed)")
+        return
+    use_colour = sys.stdout.isatty()
+    peak = max(r["separation"] for r in layers) or 1.0
+    sep_tick = _BAR_W - int(round(_BAR_W * threshold))
+    cons_tick = int(round(_BAR_W * 0.5))
+
+    def cons_bar(v: float) -> str:
+        v_cells = _BAR_W * max(0.0, min(1.0, v))
+        full = int(v_cells)
+        partial = v_cells - full
+        b = "█" * full
+        if partial > 0 and full < _BAR_W:
+            b += _BLOCKS_RIGHT[int(round(partial * 8))]
+        return b.ljust(_BAR_W)
+
+    def sep_bar(v: float) -> str:
+        v_cells = _BAR_W * v / peak
+        full = int(v_cells)
+        partial = v_cells - full
+        tip = ""
+        if partial > 0.75:
+            full += 1
+        elif partial > 0.25:
+            tip = "▐"
+        elif partial > 0:
+            tip = "▕"
+        return (tip + "█" * full).rjust(_BAR_W)
+
+    def render(bar_s: str, colour: int, tick_col: int) -> str:
+        out = []
+        for i, ch in enumerate(bar_s):
+            if ch != " ":
+                if use_colour:
+                    out.append(f"\x1b[38;5;{colour}m{ch}\x1b[0m")
+                else:
+                    out.append(ch)
+            elif i == tick_col:
+                out.append("┃")
+            else:
+                out.append(" ")
+        return "".join(out)
+
+    # Header arrows aligned to the absolute column of each tick.
+    left_pad = 3 + 2 + 6 + 2   # "lyr" (3) + "  " + "sep" (6) + "  "
+    sep_arrow_col = left_pad + sep_tick
+    cons_arrow_col = left_pad + _BAR_W + cons_tick
+    width = cons_arrow_col + 16
+    header = [" "] * width
+    for col, label in [
+        (sep_arrow_col, f"↓ {threshold:.1f}×peak"),
+        (cons_arrow_col, "↓ 0.5"),
+    ]:
+        for j, ch in enumerate(label):
+            if col + j < width:
+                header[col + j] = ch
+    print()
+    print("".join(header).rstrip())
+    print(f"{'lyr':>3}  {'sep':>6}  {' ' * (_BAR_W + _BAR_W)}  {'cons':>5}")
+
+    for i, r in enumerate(layers):
+        alt = (i % 2 == 1)
+        sep_c = _SEP_COLOUR_B if alt else _SEP_COLOUR_A
+        cons_c = _CONS_COLOUR_B if alt else _CONS_COLOUR_A
+        sb = render(sep_bar(r["separation"]), sep_c, sep_tick)
+        cb = render(cons_bar(r["consistency"]), cons_c, cons_tick)
         print(
-            f"{r['layer']:>5}  {r['separation']:>6.3f} {sep_bar:<{sep_w}}  "
-            f"{r['consistency']:>5.3f} {cons_bar:<{cons_w}}"
+            f"{r['layer']:>3}  {r['separation']:>6.3f}  {sb}{cb}  "
+            f"{r['consistency']:>5.3f}"
         )
+
     print(f"\n{result['summary']}")
     for w in result.get("warnings", []):
         print(f"  ! {w}")
@@ -1277,7 +1353,6 @@ def steering_layers_command(args) -> int:
             "\nNo clear band — separation is near zero at every layer; "
             "the prompt pairs may not isolate a consistent trait."
         )
-    return 0
 
 
 def steering_command(args) -> int:
