@@ -17,6 +17,19 @@ omlx steering datasets        # list all available datasets
 positive `strength`; `negative` is its opposite. Negative strength
 inverts.
 
+**Orthogonalize and polarity.** `generate`'s default `--orthogonalize`
+subtracts the **negative-class mean** from the axis as a baseline drift,
+on the assumption that the negative class is your control (no trait) and
+the positive class is the trait. For the trait-vs-control axes here
+(`sycophancy`, `evil`, `assistant`) the bundled labelling already gives
+orthogonalize a sensible baseline. For the symmetric two-pole axes
+(`joy`↔sad, `calm`↔desperate, etc.) the negative class is the other
+extreme rather than a true control — orthogonalize still helps but is
+not strictly required; pass `--no-orthogonalize` if you want a perfectly
+symmetric axis. When authoring your own dataset, put **the trait-bearing
+prompts in `positive` and the control / baseline prompts in `negative`**
+so orthogonalize subtracts what you want.
+
 | dataset | positive → / negative → | kind |
 |---|---|---|
 | `joy` | happy, cheerful / sad, gloomy | emotion |
