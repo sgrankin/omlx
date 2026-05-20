@@ -309,6 +309,48 @@ def test_analyze_layers_rejects_mismatched_counts():
         analyze_layers(model, FakeTokenizer(), ["a", "b"], ["c"])
 
 
+def test_analyze_layers_returns_summary_and_warnings():
+    """analyze_layers now reports a verdict + optional warnings."""
+    from omlx.steering_generator import analyze_layers
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    result = analyze_layers(
+        model, FakeTokenizer(), ["aa", "bb", "cc"], ["xx", "yy", "zz"]
+    )
+    assert "summary" in result and isinstance(result["summary"], str)
+    assert "separation" in result["summary"]
+    assert "warnings" in result and isinstance(result["warnings"], list)
+
+
+def test_quality_summary_flags_weak_axis():
+    """A flat / low-separation profile triggers warnings."""
+    from omlx.steering_generator import _quality_summary
+
+    weak = [
+        {"layer": i, "separation": 0.05, "consistency": 0.05}
+        for i in range(4)
+    ]
+    summary, warnings = _quality_summary(weak)
+    assert "weak" in summary or "scattered" in summary
+    assert any("weak" in w for w in warnings)
+    assert any("scattered" in w for w in warnings)
+
+
+def test_quality_summary_passes_clean_axis():
+    """A strong + coherent profile produces no warnings."""
+    from omlx.steering_generator import _quality_summary
+
+    clean = [
+        {"layer": 0, "separation": 0.2, "consistency": 0.3},
+        {"layer": 1, "separation": 1.2, "consistency": 0.9},
+        {"layer": 2, "separation": 0.5, "consistency": 0.5},
+    ]
+    summary, warnings = _quality_summary(clean)
+    assert "strong" in summary
+    assert "coherent" in summary
+    assert warnings == []
+
+
 # ---------------------------------------------------------------------------
 # Load-time apply: apply_post_load_transforms → _maybe_apply_steering
 # ---------------------------------------------------------------------------

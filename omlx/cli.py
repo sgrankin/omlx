@@ -1268,6 +1268,9 @@ def steering_layers_command(args) -> int:
             f"{r['layer']:>5}  {r['separation']:>6.3f} {sep_bar:<{sep_w}}  "
             f"{r['consistency']:>5.3f} {cons_bar:<{cons_w}}"
         )
+    print(f"\n{result['summary']}")
+    for w in result.get("warnings", []):
+        print(f"  ! {w}")
     band = result["suggested"]
     if band:
         print(f"\nSuggested band: --layers {band[0]}-{band[1]}")

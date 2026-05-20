@@ -344,6 +344,22 @@ def generate_steering_vector(
         scaling,
         orthogonalize,
     )
+
+    # Score the captured axis over the kept layers so a poor dataset shows
+    # up at generate time rather than at first eval.
+    kept_stats = [
+        {
+            "layer": il,
+            "separation": (m := _per_layer_metrics(pos_hidden[il], neg_hidden[il]))[0],
+            "consistency": m[1],
+        }
+        for il in target_layers
+    ]
+    summary, quality_warnings = _quality_summary(kept_stats)
+    logger.info("Axis quality: %s", summary)
+    for w in quality_warnings:
+        logger.warning("Axis quality: %s", w)
+
     return SteeringVector(
         directions=directions,
         n_embd=n_embd,
@@ -351,6 +367,80 @@ def generate_steering_vector(
         scaling=scaling,
         model=model_name,
     )
+
+
+def _per_layer_metrics(pos: mx.array, neg: mx.array) -> tuple[float, float]:
+    """Score a layer's contrast: ``(separation, consistency)``.
+
+    - **separation** — Cohen's-d effect size of the two classes projected
+      onto their mean-difference direction. Standardized; unbounded above.
+    - **consistency** — ``|mean(diff)| / mean|diff|`` over the per-pair
+      differences. 1.0 if every pair points the same way, →0 if scattered.
+
+    Shared by :func:`analyze_layers` and :func:`generate_steering_vector`
+    so the "is this dataset clean?" signal is computed the same way.
+    """
+    import numpy as np
+
+    p = np.asarray(pos, dtype=np.float32)
+    n = np.asarray(neg, dtype=np.float32)
+    diff = p - n
+    mean_diff = diff.mean(axis=0)
+    md_norm = float(np.linalg.norm(mean_diff))
+    if md_norm < 1e-8:
+        return 0.0, 0.0
+    unit = mean_diff / md_norm
+    proj_p, proj_n = p @ unit, n @ unit
+    pooled = float(np.sqrt(0.5 * (proj_p.var() + proj_n.var()))) + 1e-8
+    sep = float(abs(proj_p.mean() - proj_n.mean()) / pooled)
+    cons = md_norm / (float(np.linalg.norm(diff, axis=1).mean()) + 1e-8)
+    return sep, cons
+
+
+def _quality_summary(layer_stats: list[dict]) -> tuple[str, list[str]]:
+    """One-line verdict + any warnings from per-layer separation/consistency.
+
+    Thresholds are empirical ("usable steering axis" floor):
+
+    - separation: ≥0.8 strong, ≥0.5 good, ≥0.3 marginal, <0.3 weak
+    - consistency: ≥0.5 coherent, ≥0.3 mixed, <0.3 scattered
+
+    Returns ``(summary_line, [warning, ...])``.
+    """
+    if not layer_stats:
+        return "no layers scored", []
+    peak_sep = max(layer_stats, key=lambda r: r["separation"])
+    peak_cons = max(layer_stats, key=lambda r: r["consistency"])
+    sep_word = (
+        "strong" if peak_sep["separation"] >= 0.8
+        else "good" if peak_sep["separation"] >= 0.5
+        else "marginal" if peak_sep["separation"] >= 0.3
+        else "weak"
+    )
+    cons_word = (
+        "coherent" if peak_cons["consistency"] >= 0.5
+        else "mixed" if peak_cons["consistency"] >= 0.3
+        else "scattered"
+    )
+    summary = (
+        f"peak separation {peak_sep['separation']:.3f} ({sep_word}) at "
+        f"layer {peak_sep['layer']}; peak consistency "
+        f"{peak_cons['consistency']:.3f} ({cons_word}) at layer {peak_cons['layer']}"
+    )
+    warnings: list[str] = []
+    if peak_sep["separation"] < 0.3:
+        warnings.append(
+            "weak separation at every layer — the prompt pairs may not "
+            "isolate a consistent trait. Check pair matching (same topic, "
+            "only the trait varying), add more pairs, or revisit polarity."
+        )
+    if peak_cons["consistency"] < 0.3:
+        warnings.append(
+            "scattered per-pair differences — a few outlier pairs likely "
+            "dominate the mean direction. Tighter prompt-pair matching "
+            "usually helps."
+        )
+    return summary, warnings
 
 
 def _suggest_band(
@@ -403,8 +493,6 @@ def analyze_layers(
     where separation stays above ``threshold`` of the peak — read straight
     from one capture, rather than a blind generate/evaluate sweep of ranges.
     """
-    import numpy as np
-
     if len(positive) != len(negative):
         raise ValueError(
             f"positive/negative prompt counts differ: "
@@ -420,25 +508,16 @@ def analyze_layers(
     layer_stats: list[dict] = []
     separations: list[float] = []
     for il in range(n_layers):
-        p = np.asarray(pos_hidden[il], dtype=np.float32)
-        n = np.asarray(neg_hidden[il], dtype=np.float32)
-        diff = p - n
-        mean_diff = diff.mean(axis=0)
-        md_norm = float(np.linalg.norm(mean_diff))
-        if md_norm < 1e-8:
-            sep = cons = 0.0
-        else:
-            unit = mean_diff / md_norm
-            proj_p, proj_n = p @ unit, n @ unit
-            pooled = float(np.sqrt(0.5 * (proj_p.var() + proj_n.var()))) + 1e-8
-            sep = float(abs(proj_p.mean() - proj_n.mean()) / pooled)
-            cons = md_norm / (float(np.linalg.norm(diff, axis=1).mean()) + 1e-8)
+        sep, cons = _per_layer_metrics(pos_hidden[il], neg_hidden[il])
         separations.append(sep)
         layer_stats.append(
             {"layer": il, "separation": sep, "consistency": cons}
         )
 
+    summary, warnings = _quality_summary(layer_stats)
     return {
         "layers": layer_stats,
         "suggested": _suggest_band(separations, threshold),
+        "summary": summary,
+        "warnings": warnings,
     }
