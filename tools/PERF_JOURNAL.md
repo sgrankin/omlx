@@ -136,3 +136,99 @@ Then try:
 - Look at scheduler.py overhead — maybe there's a Python-level lever in
   the loop *around* the model forward
 
+### t=4  Attention pre/post compile split (neutral)
+- Wrote `patch_gemma4_attn_compile.py`: pre-cache compile + post-cache
+  q_rope + post-cache o_proj as separate compiled regions, with SDPA
+  unchanged in between (preserves cache-aware paths e.g. TurboQuant).
+- Result on Gemma 4 26B-A4B-it: +1.6% (vs block-only +1.7%). NO GAIN.
+- The post-cache wrappers (q_rope is 2 ops, o_proj is 3 ops) are too thin
+  for compile to amortize its dispatch overhead.
+
+### t=5  __dict__-based attribute caching (neutral/slight regression)
+- Tried storing `input_layernorm` and `self_attn` refs in `self.__dict__`
+  to skip mlx Module's __getattr__ on each call.
+- Result: +1.5% (vs block-only +1.7%). Marginally worse.
+- Reverted. mlx Module's __getattr__ goes through `_children`, not
+  __dict__, so caching in __dict__ doesn't bypass the slow path.
+
+### t=6  RoPE compile (neutral, slight regression)
+- Wrote `patch_gemma4_rope_compile.py`: wrap ProportionalRoPE.__call__
+  in mx.compile, hoping to fuse its 8-10 slice/concat ops.
+- Result: +1.3% (vs block-only +1.7%). Slightly worse.
+- Reason: most of the "slices" are VIEWS, not kernel dispatches. The 8-10
+  ops estimate was wrong. mx.compile overhead > savings.
+
+### Where the patched profile shows remaining Python overhead
+Sorted by tottime (gemma 4 26B-A4B-it, 128 steps, patched):
+  decode_loop (.item() block):       3.187s
+  patched_call (my orchestration):   0.074s  ← biggest live frame
+  attention __call__:                0.041s
+  cache._update_in_place:            0.029s
+  rope_utils:                        0.029s
+  QuantizedLinear:                   0.018s
+  RMSNorm:                           0.010s
+  Module __getattr__:                0.007s
+  SDPA:                              0.006s
+Total live Python: ~250ms / 2965ms = 8.4% of wall.
+
+To get more wins, would need to inline cache.update_and_fetch into a
+compiled function (requires custom cache class), or rework attention
+to bring SDPA inside compile (cache-aware paths complicate this).
+Both are multi-day fork projects, not session wins.
+
+### Final disposition
+- Ship the block-compile patch. +1.5-1.7% on MoE models, 0% on dense.
+  Safe (token-identical). 4 commits on `perf/profile-decode`.
+- Park further per-block fusion. Diminishing returns territory.
+- Other levers (grammar overlap restoration, KV cache rewrite, full-model
+  compile) are documented in EXPERIMENTS.md as future work.
+
+### t=7  Forced-sync per-section timing — confirms GPU is the floor
+- Wrote section_time_gemma4.py: inserts mx.eval() at each section boundary
+  inside Attention.__call__ and DecoderLayer.__call__, measures per-section
+  wall + count.
+- The instrumented run is 7× slower (5.84 vs 42.2 tok/s) — every section
+  pays a ~250µs sync penalty. So sections that take >250µs/call are GPU-
+  compute-bounded; sections at exactly 250µs are dispatch+sync only.
+- Findings (only sections where actual GPU work clearly exceeds the sync
+  floor):
+    blk:experts      670µs/call  ≈ ~420µs real GPU work — HEAVIEST section
+    blk:mlp_main     390µs/call  ≈ ~140µs real GPU work
+    blk:router       346µs/call  ≈ ~100µs real GPU work
+    attn:q_proj      310µs/call  ≈ ~60µs real GPU work
+    attn:k_proj      295µs/call  ≈ ~45µs real GPU work
+    attn:sdpa        264µs/call  ≈ ~15µs real GPU work
+    everything else: ≤ ~250µs/call — basically pure sync overhead
+- Per layer at decode-batch=1:
+    Router + Experts + main_MLP ≈ 660µs of GPU work
+    Attention (q/k/v/o + SDPA + rope) ≈ 200µs of GPU work
+    Norms/residuals/etc: tiny per call
+- 30 layers × 860µs ≈ 26ms per token of GPU work. Matches the 23ms wall
+  per token in production (small slack from kernel queueing overlap).
+- **Conclusion**: At batch=1 decode, the model IS compute-bound and very
+  close to the realizable floor. The +1.7% from block-compile is shaving
+  Python dispatch overhead; we can't go meaningfully below the 23ms floor
+  without changing the model (smaller quants, fewer experts) or hardware.
+- Bigger wins would require: (a) running concurrent requests
+  (continuous-batching makes per-token cost amortize), (b) different
+  kernel choices for `affine_qmv_fast` (the q/k/v/o_proj kernel — out of
+  scope, MLX-level), or (c) speculative decoding (dflash / MTP, which
+  omlx already supports as opt-in).
+
+### Summary for the user (when they return)
+
+Block-compile patch shipped on `perf/profile-decode` branch as 4 commits:
+- `perf(tools): add decode-loop profiler`
+- `perf(tools): Metal trace capture + async-overlap baseline`
+- `perf: investigation journal`
+- `perf(patches): mx.compile-fuse the post-attn block body`
+- `perf(tools): experimental compile patches that DIDN'T win`
+
+Result: **+1.5-1.7% tok/s on MoE models** (Gemma 4 26B-A4B-it,
+Qwen3.6-35B-A3B), 0% on dense (Gemma 4 31B, Qwen3.6-27B). Token-identical.
+
+Per-section timing confirms the four target models are GPU-compute-bound
+at batch=1, near the realizable floor. Python overhead is small;
+further wins require model/algorithm changes (TurboQuant, speculative
+decoding), not Python-level optimizations.
+
