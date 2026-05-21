@@ -119,36 +119,22 @@ class SectionTimer:
         self.calls[self._name] = self.calls.get(self._name, 0) + 1
 
 
-def decode_loop(
+def decode_loop_serial(
     model: Any, tokenizer: Any, prompt_ids: list[int], n_steps: int,
     timer: SectionTimer | None = None,
 ) -> int:
+    """Naive serial decode: sync on .item() before submitting next forward.
+
+    Pessimistic — used only as a baseline against the overlap variant.
+    """
     from mlx_lm.models.cache import make_prompt_cache
 
     tm = _text_model(model)
+    cache = make_prompt_cache(tm)
 
-    if timer is not None:
-        timer.begin("setup_cache")
-        cache = make_prompt_cache(tm)
-        timer.end()
-    else:
-        cache = make_prompt_cache(tm)
-
-    # Prefill
-    if timer is not None:
-        timer.begin("prefill_forward")
-        out = tm(mx.array(prompt_ids)[None], cache=cache)
-        logits = _logits(out)[:, -1, :]
-        timer.end(logits)
-
-        timer.begin("prefill_argmax")
-        nxt_arr = mx.argmax(logits[0])
-        timer.end(nxt_arr)
-        nxt = int(nxt_arr.item())
-    else:
-        out = tm(mx.array(prompt_ids)[None], cache=cache)
-        logits = _logits(out)[:, -1, :]
-        nxt = int(mx.argmax(logits[0]).item())
+    out = tm(mx.array(prompt_ids)[None], cache=cache)
+    logits = _logits(out)[:, -1, :]
+    nxt = int(mx.argmax(logits[0]).item())
 
     for _ in range(n_steps):
         if timer is not None:
@@ -174,6 +160,48 @@ def decode_loop(
             logits = _logits(out)[:, -1, :]
             nxt = int(mx.argmax(logits[0]).item())
     return nxt
+
+
+def decode_loop_overlap(
+    model: Any, tokenizer: Any, prompt_ids: list[int], n_steps: int,
+) -> int:
+    """Async-overlap decode mirroring mlx_lm.generate.generate_step (lines
+    455-470 of mlx_lm/generate.py): submit the next forward pass before
+    syncing on the current token, so GPU stays busy across the .item() wait.
+
+    This is the pattern omlx's scheduler inherits via GenerationBatch._step.
+    Measured separately here to attribute the overlap's contribution.
+    """
+    from mlx_lm.models.cache import make_prompt_cache
+
+    tm = _text_model(model)
+    cache = make_prompt_cache(tm)
+
+    out = tm(mx.array(prompt_ids)[None], cache=cache)
+    logits = _logits(out)[:, -1, :]
+    y = mx.argmax(logits[0], keepdims=True)  # (1,)
+    mx.async_eval(y)
+
+    last = 0
+    for n in range(n_steps):
+        # Queue the next forward BEFORE syncing on y.
+        if n + 1 != n_steps:
+            out = tm(y[None, :], cache=cache)
+            logits = _logits(out)[:, -1, :]
+            next_y = mx.argmax(logits[0], keepdims=True)
+            mx.async_eval(next_y)
+        # Now block on the current token.
+        last = int(y.item())
+        if n + 1 != n_steps:
+            y = next_y
+    return last
+
+
+def decode_loop(
+    model: Any, tokenizer: Any, prompt_ids: list[int], n_steps: int,
+    timer: SectionTimer | None = None,
+) -> int:
+    return decode_loop_serial(model, tokenizer, prompt_ids, n_steps, timer=timer)
 
 
 def main() -> int:
@@ -213,14 +241,27 @@ def main() -> int:
     print(f"  prompt_ids: {len(prompt_ids)} tokens")
 
     # Warmup (untimed)
-    decode_loop(model, tokenizer, prompt_ids, args.warmup)
+    decode_loop_serial(model, tokenizer, prompt_ids, args.warmup)
+
+    # 0) Serial vs async-overlap A/B — does the overlap actually buy time?
+    def _bench(label: str, fn) -> float:
+        t = time.perf_counter()
+        fn(model, tokenizer, prompt_ids, args.steps)
+        return time.perf_counter() - t
+
+    print("\n=== Serial vs async-overlap decode ===")
+    for label, fn in (("serial ", decode_loop_serial), ("overlap", decode_loop_overlap)):
+        runs = [_bench(label, fn) for _ in range(3)]
+        best = min(runs)
+        print(f"  {label}  best={best:.3f}s  ({'/'.join(f'{r:.3f}' for r in runs)})  "
+              f"tok/s={args.steps / best:.2f}")
 
     # 1) Section timing pass — coarse split with mx.eval boundaries.
     timer = SectionTimer()
     t0 = time.perf_counter()
     decode_loop(model, tokenizer, prompt_ids, args.steps, timer=timer)
     section_wall = time.perf_counter() - t0
-    print(f"\n=== Section timing ({args.steps} decode steps, "
+    print(f"\n=== Section timing (serial, {args.steps} decode steps, "
           f"wall={section_wall:.2f}s, tok/s={args.steps / section_wall:.2f}) ===")
     print(f"  {'section':<22s}  {'calls':>6s}  {'total s':>10s}  "
           f"{'per-call ms':>13s}  {'share %':>8s}")
