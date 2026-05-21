@@ -71,6 +71,8 @@ def main():
                         help="Also apply attention pre/post compile patch (gemma4 only)")
     parser.add_argument("--with-rope", action="store_true",
                         help="Also apply RoPE compile patch (gemma4 only)")
+    parser.add_argument("--with-gateup", action="store_true",
+                        help="Also apply gate+up matmul fusion (any model with SwitchGLU)")
     args = parser.parse_args()
 
     path = (
@@ -113,6 +115,10 @@ def main():
         from tools.patch_gemma4_rope_compile import apply_gemma4_rope_compile_patch
         ok3 = apply_gemma4_rope_compile_patch()
         print(f"  rope patch applied: {ok3}")
+    if args.with_gateup:
+        from tools.patch_gemma4_gateup_fuse import apply_gemma4_gateup_fuse_patch
+        ok4 = apply_gemma4_gateup_fuse_patch(model)
+        print(f"  gate+up fusion applied: {ok4}")
 
     # Compile invalidates trace cache; do a warmup with the new path
     decode_overlap(model, prompt_ids, args.warmup)

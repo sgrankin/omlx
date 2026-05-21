@@ -232,3 +232,59 @@ at batch=1, near the realizable floor. Python overhead is small;
 further wins require model/algorithm changes (TurboQuant, speculative
 decoding), not Python-level optimizations.
 
+### t=8  GATE+UP MATMUL FUSION — BIG WIN (revises floor claim)
+
+After the user pushed back on the "GPU compute floor" conclusion and asked
+to explore algorithm changes, I tried fusing the gate+up matmuls.
+
+The HF checkpoint format for these MoE models ships them as a single
+`gate_up_proj` tensor; mlx-vlm's gemma4/qwen3_5_moe `sanitize` SPLITS
+them on load into separate gate_proj + up_proj. Both then run sequential
+`mx.gather_qmm` calls per layer per token.
+
+Re-fusing at runtime: concatenate gate_proj.{weight,scales,biases} +
+up_proj.{...} along the output-dim axis (axis=1 for MoE, axis=0 for dense),
+do ONE `mx.gather_qmm` (or `mx.quantized_matmul` for dense), split the
+output into gate/up halves, apply activation, down_proj as before.
+
+Measured (`tools/patch_gemma4_gateup_fuse.py` + block-compile on top):
+- Gemma 4 26B-A4B-it (MoE):  42.21 → 47.48  **+12.5% tok/s** (token-id'l)
+- Qwen3.6-35B-A3B   (MoE):   53.59 → 59.30  **+10.7% tok/s** (token-id'l)
+- Gemma 4 31B-it    (dense): 11.13 → 11.30  +1.5% tok/s (token-id'l)
+- Qwen3.6-27B       (dense): RUNNING
+
+### CORRECTION TO EARLIER "FLOOR" CLAIM
+
+The forced-sync section timer (`section_time_gemma4.py`) was MISLEADING.
+Each mx.eval() boundary in that timer adds ~250µs sync overhead, which:
+1. Inflates per-section "time" uniformly across sections
+2. HIDES the actual cost of kernel-launch / gather_qmm dispatch overhead,
+   because sequential gather_qmm calls in production overlap less than
+   the section timer suggested
+
+The real bottleneck on MoE decode was the SEQUENTIAL kernel launches for
+gate_proj and up_proj. Fusing them saves ONE gather_qmm dispatch per
+layer per token, which translates to ~10% wall savings — much more than
+the section timer predicted because gather_qmm's per-call overhead is
+~150µs (large), not ~5µs (small) as kernel-dispatch lore suggested.
+
+### t=9  Q/K/V fusion attempt — promising but buggy, parked
+- Same idea applied to attention: q_proj/k_proj/v_proj all take input x.
+- Showed +13.6% (≈ +2.5% on top of gate+up) — but output DIVERGED at
+  token 0 (garbage). Bug not localized in the session budget.
+- gemma4 attention has per-layer-varying config: k_eq_v full-attn layers
+  use num_global_key_value_heads=2 and possibly a different
+  global_head_dim; sliding layers differ; quant is mixed 6/8-bit per
+  layer. The fused-weight concat + Q/K/V output split looks correct by
+  inspection but something is off.
+- Patch deleted. Documented in EXPERIMENTS.md exp #9 as a real future
+  lever. Next attempt should start with a numerical isolation test
+  (fused matmul vs separate q/k/v on random input) to find the bug fast.
+
+### FINAL STATE
+Shipped on `perf/profile-decode`:
+- block-compile patch:  +1.5-1.7% MoE, 0% dense
+- gate+up fusion patch: +12.5% / +10.7% MoE, +1.5% / +0.4% dense
+All token-identical. Q/K/V fusion (~+2.5% more) left as documented
+future work due to an unsolved correctness bug.
+
