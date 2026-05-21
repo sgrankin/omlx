@@ -1160,10 +1160,13 @@ def steering_eval_command(args) -> int:
     from .steering import SteeringVector
     from .steering_eval import evaluate_steering
 
+    scales_spec = args.scales
+    if scales_spec is None:
+        scales_spec = "0,0.5,1,1.5" if args.mode == "project" else "-3,-1.5,0,1.5,3"
     try:
-        scales = [float(s) for s in args.scales.split(",") if s.strip()]
+        scales = [float(s) for s in scales_spec.split(",") if s.strip()]
     except ValueError as e:
-        print(f"Invalid --scales {args.scales!r}: {e}")
+        print(f"Invalid --scales {scales_spec!r}: {e}")
         return 1
     if not scales:
         print("--scales is empty")
@@ -1979,11 +1982,12 @@ Example directory structure:
     steering_eval.add_argument(
         "--scales",
         type=str,
-        default="-3,-1.5,0,1.5,3",
-        help="Comma-separated strengths; 0 = baseline. For add mode, "
-        "strength is a band-width-independent total budget (divided across "
-        "the steered layers); sweep to find the model's window, then narrow "
-        "in. Larger strengths break output.",
+        default=None,
+        help="Comma-separated strengths; 0 = baseline. Default depends on "
+        "--mode: add → '-3,-1.5,0,1.5,3' (band-width-independent total "
+        "budget divided across steered layers); project → '0,0.5,1,1.5' "
+        "(baseline, half-ablate, full-ablate, over-project). Sweep to find "
+        "the model's window, then narrow in. Larger strengths break output.",
     )
     steering_eval.add_argument(
         "--mode",
