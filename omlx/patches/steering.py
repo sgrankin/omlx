@@ -47,6 +47,32 @@ def find_layers_container(model: Any) -> Any | None:
     return None
 
 
+def _residual_dtype(container: Any) -> Any:
+    """Probe the model's residual-stream compute dtype.
+
+    Looks for an ``nn.RMSNorm`` / ``nn.LayerNorm`` inside the first
+    transformer block — these are never quantized, so their weight's
+    dtype is the model's compute dtype even on int4/int8 checkpoints.
+    Falls back to ``fp32`` when no norm module is found (e.g. on
+    synthetic test blocks): correct but slower (per-call downcast in
+    ``_SteeredLayer._steer``). Real models hit the probe path.
+    """
+    layers = getattr(container, "layers", None) or []
+    if not layers:
+        return mx.float32
+    block = layers[0]
+    walker = getattr(block, "modules", None)
+    if not callable(walker):
+        return mx.float32
+    fp_dtypes = (mx.float16, mx.bfloat16, mx.float32)
+    for sub in walker():
+        if isinstance(sub, (nn.RMSNorm, nn.LayerNorm)):
+            w = getattr(sub, "weight", None)
+            if w is not None and getattr(w, "dtype", None) in fp_dtypes:
+                return w.dtype
+    return mx.float32
+
+
 def model_hidden_size(model: Any) -> int | None:
     """Best-effort lookup of the model's hidden size (``n_embd``).
 
@@ -111,12 +137,17 @@ class _SteeredLayer(nn.Module):
         object.__setattr__(self, "_steer_proj", projections)
 
     def _steer(self, h: mx.array) -> mx.array:
-        # Cast steering data to the hidden dtype so a bf16/fp16 residual
-        # stream is not silently promoted to f32.
+        # Steering data is pre-cast to the model's compute dtype at patch
+        # time (see apply_steering_patch), so the hot path is cast-free.
+        # The cast still happens lazily on the rare mismatched-dtype path
+        # (e.g. after model.set_dtype() was called post-patch).
         if self._steer_add is not None:
-            h = h + self._steer_add.astype(h.dtype)
+            add = self._steer_add
+            if add.dtype != h.dtype:
+                add = add.astype(h.dtype)
+            h = h + add
         for unit, strength in self._steer_proj:
-            u = unit.astype(h.dtype)
+            u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
             # Per-token component of h along the (unit) direction.
             coeff = (h * u).sum(axis=-1, keepdims=True)
             h = h - strength * coeff * u
@@ -173,6 +204,7 @@ def apply_steering_patch(
         raise ValueError("could not locate the transformer layer list on model")
     layers = container.layers
     n_layers = len(layers)
+    compute_dtype = _residual_dtype(container)
 
     expected = model_hidden_size(model) or n_embd
     if expected is not None:
@@ -207,7 +239,7 @@ def apply_steering_patch(
                 norm = mx.linalg.norm(direction)
                 unit = direction / norm if float(norm) > 1e-8 else direction
                 projections.setdefault(il, []).append(
-                    (unit.astype(mx.float32), spec.strength)
+                    (unit.astype(compute_dtype), spec.strength)
                 )
 
     patched = 0
@@ -219,9 +251,12 @@ def apply_steering_patch(
                 n_layers,
             )
             continue
-        layers[il] = _SteeredLayer(
-            layers[il], add_bias.get(il), projections.get(il, [])
-        )
+        # Additive contribs are accumulated in fp32 for precision, then
+        # cast once to the compute dtype before being handed to the layer.
+        bias = add_bias.get(il)
+        if bias is not None:
+            bias = bias.astype(compute_dtype)
+        layers[il] = _SteeredLayer(layers[il], bias, projections.get(il, []))
         patched += 1
 
     if patched:
