@@ -34,6 +34,35 @@ import mlx.core as mx
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 
+import contextlib
+
+
+@contextlib.contextmanager
+def _drop_mtp_weights_on_load():
+    """Filter ``mtp.*`` tensors out of nn.Module.load_weights so Qwen3.6 etc.
+    load cleanly without their MTP-head weights. Copied verbatim from
+    `_drop_mtp_weights_on_load` on the main branch's omlx/cli.py because
+    perf/profile-decode is rooted on `vlok` (before that change landed).
+    """
+    import mlx.nn as _nn
+
+    original = _nn.Module.load_weights
+
+    def _filtered(self, weights, *args, **kwargs):
+        if isinstance(weights, list):
+            weights = [
+                (k, v) for k, v in weights
+                if ".mtp." not in k and not k.startswith("mtp.")
+            ]
+        return original(self, weights, *args, **kwargs)
+
+    _nn.Module.load_weights = _filtered
+    try:
+        yield
+    finally:
+        _nn.Module.load_weights = original
+
+
 def _load_model(model_path: str):
     """VLM- and oQ-aware load (lifted from omlx CLI helpers).
 
@@ -76,12 +105,14 @@ def _load_model(model_path: str):
         with (
             _strip_audio_config_if_orphaned(Path(model_path)),
             _remap_nested_visual_on_load(Path(model_path)),
+            _drop_mtp_weights_on_load(),
         ):
             model, processor = vlm_load(model_path)
         return model, getattr(processor, "tokenizer", processor)
 
     from mlx_lm import load as lm_load
-    return lm_load(model_path)
+    with _drop_mtp_weights_on_load():
+        return lm_load(model_path)
 
 
 def _text_model(model: Any) -> Any:
