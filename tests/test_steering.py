@@ -131,6 +131,28 @@ class RealModel(nn.Module):
         self.args = SimpleNamespace(hidden_size=n_embd)
 
 
+class NormedBlock(nn.Module):
+    """Block with an RMSNorm — used to exercise the dtype probe."""
+
+    def __init__(self, n_embd: int, norm_dtype=mx.float16):
+        super().__init__()
+        self.input_layernorm = nn.RMSNorm(n_embd)
+        self.input_layernorm.weight = self.input_layernorm.weight.astype(norm_dtype)
+        self.proj = nn.Linear(n_embd, n_embd)
+
+    def __call__(self, h, *args, **kwargs):
+        return self.proj(h)
+
+
+class NormedModel(nn.Module):
+    """An nn.Module model whose blocks carry a (typed) layernorm."""
+
+    def __init__(self, n_layers: int, n_embd: int, norm_dtype=mx.float16):
+        super().__init__()
+        self.layers = [NormedBlock(n_embd, norm_dtype) for _ in range(n_layers)]
+        self.args = SimpleNamespace(hidden_size=n_embd)
+
+
 class FakeVLM:
     """A VLM-shaped model: the text decoder lives under .language_model."""
 
@@ -643,6 +665,24 @@ def test_model_hidden_size_resolves_via_language_model():
     assert model_hidden_size(vlm) == N_EMBD
 
 
+def test_model_hidden_size_prefers_text_decoder_over_stray_top_level():
+    """VLM-style: top-level config has a misleading default hidden_size.
+
+    mlx-vlm's Gemma 4 ModelConfig declares ``hidden_size: int = 1536`` at the
+    top level (a stray field unrelated to the text stream); the real text
+    decoder size is ``text_config.hidden_size``. ``model_hidden_size`` must
+    return the text decoder's size since that's what steering wraps.
+    """
+    from omlx.patches.steering import model_hidden_size
+
+    vlm = FakeVLM(N_LAYERS, N_EMBD)
+    vlm.config = SimpleNamespace(
+        hidden_size=1536,
+        text_config=SimpleNamespace(hidden_size=N_EMBD),
+    )
+    assert model_hidden_size(vlm) == N_EMBD
+
+
 def test_apply_patch_normalizes_add_by_layer_count():
     """Additive strength is divided across the steered layers."""
     model = FakeModel(N_LAYERS, N_EMBD)
@@ -686,6 +726,43 @@ def test_patch_preserves_hidden_dtype():
     apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD, dtype=mx.float32)})])
     out, _aux = model.model.layers[0](mx.zeros((1, 1, N_EMBD), dtype=mx.bfloat16))
     assert out.dtype == mx.bfloat16
+
+
+def test_patch_precasts_add_bias_to_norm_dtype():
+    """Probe must pick the layernorm dtype and pre-cast the additive bias."""
+    model = NormedModel(2, N_EMBD, norm_dtype=mx.bfloat16)
+    apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD, dtype=mx.float32)})])
+    layer = model.layers[0]
+    assert isinstance(layer, _SteeredLayer)
+    assert layer._steer_add.dtype == mx.bfloat16
+
+
+def test_patch_precasts_projection_unit_to_norm_dtype():
+    model = NormedModel(2, N_EMBD, norm_dtype=mx.float16)
+    apply_steering_patch(
+        model,
+        [_spec(
+            {0: mx.arange(N_EMBD, dtype=mx.float32) + 1.0},
+            mode="project", strength=1.0,
+        )],
+    )
+    layer = model.layers[0]
+    assert isinstance(layer, _SteeredLayer)
+    assert len(layer._steer_proj) == 1
+    unit, _strength = layer._steer_proj[0]
+    assert unit.dtype == mx.float16
+
+
+def test_patch_falls_back_to_fp32_when_no_norm():
+    """A synthetic block without any layernorm hits the fp32 fallback.
+
+    Real models always carry layernorms, so this path only fires on
+    test scaffolds or unusual architectures — fp32 is correct but pays
+    a per-call downcast inside ``_steer``.
+    """
+    model = FakeModel(N_LAYERS, N_EMBD)  # FakeBlock has no nn.Module structure
+    apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD, dtype=mx.float32)})])
+    assert model.model.layers[0]._steer_add.dtype == mx.float32
 
 
 def test_remove_patch_restores_blocks():
