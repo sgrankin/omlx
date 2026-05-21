@@ -73,6 +73,8 @@ def main():
                         help="Also apply RoPE compile patch (gemma4 only)")
     parser.add_argument("--with-gateup", action="store_true",
                         help="Also apply gate+up matmul fusion (any model with SwitchGLU)")
+    parser.add_argument("--with-qkv", action="store_true",
+                        help="Also apply Q/K/V fusion, decode-only gated (gemma4 only)")
     args = parser.parse_args()
 
     path = (
@@ -119,6 +121,10 @@ def main():
         from tools.patch_gemma4_gateup_fuse import apply_gemma4_gateup_fuse_patch
         ok4 = apply_gemma4_gateup_fuse_patch(model)
         print(f"  gate+up fusion applied: {ok4}")
+    if args.with_qkv and args.arch == "gemma4":
+        from tools.patch_qkv_fuse import apply_qkv_fuse_patch
+        ok5 = apply_qkv_fuse_patch()
+        print(f"  qkv fusion applied: {ok5}")
 
     # Compile invalidates trace cache; do a warmup with the new path
     decode_overlap(model, prompt_ids, args.warmup)

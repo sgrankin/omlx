@@ -35,10 +35,58 @@ Baseline tok/s (no patches, decode_overlap, 64 steps, async overlap):
 | 5 | Cache bound-method refs in `__dict__` to skip __getattr__ | Edit `patched_call` to store input_layernorm + self_attn refs in `self.__dict__` on first call | +1.5% | - | - | - | ✓ | NEUTRAL/slight regression. The __getattr__ overhead is in upstream mlx-vlm but accessing through mlx Module's `_children` dict isn't bypassed by storing in `__dict__` (mlx Module __getattr__ still runs first). Reverted. |
 | 6 | Compile gemma4 RoPE (ProportionalRoPE.__call__ — ~8-10 slice/concat ops + mx.fast.rope) | `tools/patch_gemma4_rope_compile.py` on top of #2 | +1.3% | - | - | - | ✓ | NEUTRAL/slight regression. Most "slices" are zero-cost views, not kernel dispatches, so there's no Python frame overhead to fuse. Compile dispatch overhead > savings. |
 | 7 | Forced-sync per-section timer to identify expensive GPU regions | `tools/section_time_gemma4.py` (measurement, not optimization) | - | - | - | - | - | **MISLEADING** (not a real perf change anyway): the forced sync at each boundary added ~250µs overhead per section, making everything look ~similar. The "GPU compute floor" conclusion I drew from this was wrong — see experiment #8. |
-| 8 | **Gate+up matmul fusion**: HF checkpoint ships gate+up as one fused tensor; mlx-vlm splits on load. Re-fuse at runtime by concatenating weights/scales/biases and doing one matmul, split output. | `tools/patch_gemma4_gateup_fuse.py` — patches SwitchGLU (MoE), gemma4 MLP and Qwen3_5MLP (dense). | **+12.5%** | +1.5% | **+10.7%** | +0.4% | ✓ | **MAJOR WIN on MoE.** Token-identical. The gather_qmm kernel has high per-call fixed overhead (~150µs), and saving one dispatch per layer per token compounds. Dense models get a small win because their MLP matmul itself dominates the dispatch overhead. This invalidates the earlier "98% of floor" claim from exp #7. |
-| 9 | **Q/K/V matmul fusion**: same idea applied to attention's q_proj/k_proj/v_proj (all take the same input x). | `tools/patch_qkv_fuse.py` (REMOVED — buggy) | +13.6%* | - | - | - | ✗ | PROMISING but BUGGY. Showed +13.6% (≈ +2.5% on top of gate+up) but output DIVERGED at token 0 (garbage repeated token). Bug not found by inspection in the session budget — gemma4 attention has per-layer-varying config (k_eq_v full-attn layers use num_global_key_value_heads=2 + possibly global_head_dim; sliding layers differ; mixed 6/8-bit quant per layer). Patch deleted; documented here as a real future lever worth ~2-3% if the Q/K/V split bug is fixed. Suggest: write a numerical isolation test (fused matmul output vs separate q/k/v on random input) to localize the bug fast. |
+| 8 | **Gate+up matmul fusion (MoE / SwitchGLU)**: HF checkpoint ships gate+up as one fused tensor; mlx-vlm splits on load. Re-fuse at runtime — concat weights/scales/biases, one mx.gather_qmm, split output. | `tools/patch_gemma4_gateup_fuse.py` (SwitchGLU path, always on) | **+11.9%** | n/a | **+9.4%** | n/a | ✓ | **MAJOR WIN on MoE.** Token-identical (verified 128 tokens on a realistic 53-token prompt). gather_qmm has ~150µs per-call fixed overhead; saving one dispatch per MoE layer per token compounds. This invalidates the earlier "98% of floor" claim from exp #7. |
+| 8b | Same fusion for the **dense** MLP (gemma4 MLP / Qwen3_5MLP) via mx.quantized_matmul. | same patch, dense path — GATED OFF behind env `OMLX_GATEUP_DENSE=1` | n/a | +1.5%\* | n/a | +0.4%\* | ✗ | Token-correct STANDALONE but CORRUPTS output when run inside the block-compile patch's mx.compile'd body (gemma4 MoE blocks call the dense `self.mlp` inside that body). Unresolved mx.compile × quantized_matmul interaction; gather_qmm (8) is immune. Win is tiny (+0.4-1.5%) so gated off, not worth the risk. |
 
-\* exp #9 delta includes gate+up; QKV's own marginal contribution ≈ +2.5%. Output incorrect.
+\* 8b dense numbers measured standalone (no block-compile); not shippable alongside block-compile.
+| 8c | Fuse the Qwen3.6-MoE **shared_expert** (a dense Qwen3_5MLP that runs every token alongside the sparse experts) — i.e. dense path enabled for q35m. | `OMLX_GATEUP_DENSE=1` on q35m | n/a | n/a | +8.6%\*\* | n/a | ✓ | NEUTRAL-to-NEGATIVE. Token-identical (no gemma-style corruption on Qwen) but the within-process delta is +8.6% vs +9.4% with the dense path OFF — fusing the shared_expert ≈0.8pp WORSE. The shared_expert is one small dense matmul: compute-bound, not dispatch-bound, so gate+up fusion saves no dispatch cost and the concat/split overhead nets negative. Confirms: gate+up only helps the SPARSE experts (gather_qmm, K small matmuls), not dense MLPs. |
+| 9 | **Q/K/V matmul fusion**: same idea applied to attention's q_proj/k_proj/v_proj. | `tools/patch_qkv_fuse.py` (kept as artifact, NOT shipped) | +13.6%* | - | - | - | ✗ | FAST (+2.5% on top of gate+up) but NOT token-identical. Root cause found, see below. |
+
+\* exp #9 delta includes gate+up; QKV's own marginal contribution ≈ +2.5%.
+\*\* exp #8c is a within-process baseline→patched delta; compare to exp #8's +9.4% (dense OFF).
+
+### Exp #9 update — QKV fixed for correctness, but no perf win
+
+The L>1 non-equivalence (below) was fixed by **decode-only gating**: take
+the fused path only when L==1 (bit-exact), fall through to separate
+matmuls at L>1 (prefill). Result: token-identical end to end. BUT the
+re-bench then showed QKV fusion adds **~0%** on top of gate+up (46.98 vs
+47.20 tok/s, equal within noise). The earlier "+2.5%" was an artifact of
+benching the broken garbage-output config.
+
+Why no win: attention q/k/v use `mx.quantized_matmul`, which is NOT
+dispatch-bound (cf. exp #8c — same finding for the dense shared_expert).
+Only the MoE `gather_qmm` has the ~150µs per-call overhead that makes
+fusion pay off. **QKV not shipped** — kept as artifact; the L==1-gating
+technique is the reusable takeaway.
+
+### Root cause of the QKV non-equivalence (important finding)
+
+Isolation tests (`tools/debug_qkv_fuse.py`, `debug_qkv_full.py`):
+- The fused matmul is **bit-exact at L=1** (decode) — Q/K/V split matches
+  separate projections exactly (diff=0.0).
+- At **L>1 (prefill)** the fused `mx.quantized_matmul` differs from the
+  separate matmuls by **~1-2 ulp fp16** (~0.008-0.016 absolute). This is
+  FP non-associativity: widening the matmul's output dim (N) changes the
+  gemm kernel's tiling, which changes the accumulation order.
+- That ~1ulp prefill perturbation compounds across 30 layers and flips
+  argmax → different decode tokens.
+
+**Why gate+up (#8) survives but QKV (#9) doesn't:** gate+up was
+rigorously re-verified token-identical over 128 decode tokens on a
+realistic 53-token prompt for BOTH the MoE model (gather_qmm) and the
+dense model (quantized_matmul) — see `tools/verify_gateup_equiv.py`.
+The same ~1ulp matmul-widening effect exists in principle, but for
+gate+up's shapes it either doesn't trigger a tiling change or the
+perturbation lands post-activation where it doesn't flip tokens. For
+QKV's shapes (q_dim + 2·kv_dim, unequal parts) it does flip tokens.
+
+**Disposition:** QKV not shipped. It IS correct in the
+fp-rounding-equivalent sense (the output is a valid fp16 result, just
+not bit-matching the unfused path) — acceptable for serving if you
+accept rounding-level output drift, but it fails strict token-identity.
+A future attempt could try fusing only K+V (two equal-dim parts, like
+gate+up) for ~half the win with a better chance of bit-exactness.
 
 ## Cumulative profile of patched gemma 4 26B-A4B-it (128 steps)
 After applying experiment #2 (block compile), cProfile shows where Python

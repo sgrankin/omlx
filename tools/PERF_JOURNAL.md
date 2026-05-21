@@ -268,23 +268,137 @@ layer per token, which translates to ~10% wall savings — much more than
 the section timer predicted because gather_qmm's per-call overhead is
 ~150µs (large), not ~5µs (small) as kernel-dispatch lore suggested.
 
-### t=9  Q/K/V fusion attempt — promising but buggy, parked
+### t=9  Q/K/V fusion — root-caused, NOT shipped
+
 - Same idea applied to attention: q_proj/k_proj/v_proj all take input x.
-- Showed +13.6% (≈ +2.5% on top of gate+up) — but output DIVERGED at
-  token 0 (garbage). Bug not localized in the session budget.
-- gemma4 attention has per-layer-varying config: k_eq_v full-attn layers
-  use num_global_key_value_heads=2 and possibly a different
-  global_head_dim; sliding layers differ; quant is mixed 6/8-bit per
-  layer. The fused-weight concat + Q/K/V output split looks correct by
-  inspection but something is off.
-- Patch deleted. Documented in EXPERIMENTS.md exp #9 as a real future
-  lever. Next attempt should start with a numerical isolation test
-  (fused matmul vs separate q/k/v on random input) to find the bug fast.
+- Showed +13.6% (≈ +2.5% on top of gate+up) but output DIVERGED.
+- Root-caused with isolation tests (debug_qkv_fuse.py / debug_qkv_full.py):
+  - fused matmul is BIT-EXACT at L=1 (decode)
+  - at L>1 (prefill) the fused `mx.quantized_matmul` differs by ~1-2 ulp
+    fp16 (~0.008-0.016) — widening the output dim N changes the gemm
+    kernel's tiling, hence the accumulation order. That perturbation
+    compounds across 30 layers and flips argmax.
+- This is FP non-associativity, not a logic bug. The QKV output is a
+  valid fp16 result, just not bit-matching the unfused path.
+- NOT shipped — fails strict token-identity. Kept patch_qkv_fuse.py +
+  debug tools as artifacts.
+
+### t=10  Re-verified gate+up rigorously (it holds)
+- Worried the same ~1ulp matmul-widening effect would hit gate+up.
+- `tools/verify_gateup_equiv.py`: realistic 53-token prompt, 128 decode
+  tokens, gate+up vs baseline.
+  - Gemma 4 26B-A4B-it (MoE, gather_qmm):  token-identical ✓
+  - Gemma 4 31B-it (dense, quantized_matmul): token-identical ✓
+- gate+up's shapes either don't trigger a tiling change or the
+  perturbation lands where it can't flip a token. Either way, verified
+  safe on realistic inputs. SHIP gate+up.
+
+### t=11  Dense gate+up × block-compile interaction — found + gated off
+
+- The combined bench (block-compile + gate+up) started producing garbage
+  tokens after I added the dense-MLP gate+up path. Isolation:
+  - block-compile alone: token-identical ✓
+  - gate+up alone (incl. dense): token-identical ✓ (verify_gateup_equiv)
+  - block-compile + gate+up (MoE+dense): garbage ✗
+- Root cause: gemma4 MoE blocks call BOTH `self.mlp` (dense) and
+  `self.experts` (MoE) inside the post-attn body. block-compile wraps
+  that body in mx.compile. The dense fusion's `mx.quantized_matmul`,
+  traced inside that compiled body, produces corrupt output. The MoE
+  fusion's `mx.gather_qmm` does NOT hit this — gather_qmm is immune.
+- An eager-build of the fused weights (build + mx.eval at patch-apply
+  time, not lazily mid-trace) did NOT fix it — so it is a deeper
+  mx.compile × quantized_matmul issue, not just mid-trace mx.eval.
+- Fix: gate the dense path behind env `OMLX_GATEUP_DENSE=1` (off by
+  default). The MoE/SwitchGLU path stays always-on. Dense win was only
+  +0.4-1.5% anyway.
+- Re-verified: block-compile + gate+up(MoE-only) is token-identical,
+  +11.9% (Gemma 4 26B-A4B-it), +9.4% (Qwen3.6-35B-A3B).
 
 ### FINAL STATE
 Shipped on `perf/profile-decode`:
-- block-compile patch:  +1.5-1.7% MoE, 0% dense
-- gate+up fusion patch: +12.5% / +10.7% MoE, +1.5% / +0.4% dense
-All token-identical. Q/K/V fusion (~+2.5% more) left as documented
-future work due to an unsolved correctness bug.
+- block-compile patch:  +1.5-1.7% MoE, 0% dense (token-identical)
+- gate+up fusion (MoE / SwitchGLU only): **+11.9% / +9.4% on the two
+  MoE models** (Gemma 4 26B-A4B-it, Qwen3.6-35B-A3B), token-identical,
+  rigorously verified (128-token decode, realistic 53-token prompt).
+- Dense models (Gemma 4 31B, Qwen3.6-27B): ~0% — no MoE, gate+up no-op,
+  block-compile flat on dense.
+
+NOT shipped:
+- gate+up dense path — env-gated off (corrupts under block-compile;
+  also neutral-to-negative perf — see below).
+- Q/K/V fusion — now CORRECT (decode-only L==1 gating makes it
+  token-identical) but gives ~0% perf. See t=12.
+
+### t=12  QKV correctness solved, but no perf — the unifying principle
+
+- Fixed QKV equivalence: gate the fused path on L==1. The fused matmul
+  is bit-exact at L=1 (decode); only L>1 (prefill) drifts ~1ulp. Prefill
+  falls through to separate matmuls. Result: token-identical end to end.
+- But re-benched: QKV adds ~0% on top of gate+up (46.98 vs 47.20 tok/s).
+  The old "+2.5%" was measured on the broken garbage config — invalid.
+- This + exp 8c (Qwen shared_expert dense fusion = neutral/negative)
+  gives the UNIFYING PRINCIPLE:
+
+    Fusing gate+up / q+k+v only helps when the underlying matmul is
+    DISPATCH-BOUND. That is true ONLY for `mx.gather_qmm` (MoE sparse
+    experts — K tiny per-expert matmuls, ~150µs/call fixed overhead).
+    It is NOT true for `mx.quantized_matmul` (dense MLP, attention
+    projections, shared_expert) — those are compute-bound, the dispatch
+    overhead is a small fraction, and concat/split overhead cancels any
+    saving.
+
+  So the entire decode-fusion opportunity reduces to: fuse gate+up in
+  SwitchGLU. That is what shipped (+10-12% MoE). Everything else
+  (QKV, dense gate+up, shared_expert) is a wash. The fusion well is dry.
+
+### What's actually left for decode perf (none are session-sized)
+- Speculative decoding: native MTP is ALREADY SUPPORTED for Qwen3.6 in
+  omlx — `model_settings.mtp_enabled` (default False). When True,
+  `utils/model_loading.maybe_apply_pre_load_patches` applies the
+  mlx_lm_mtp patch and `set_mtp_active(True)`, attaching the MTP head and
+  routing decode through the BatchGenerator draft+verify path. Compatible
+  model_types: qwen3_5*/qwen3_6*/deepseek_v4* that declare MTP heads.
+  Mutually exclusive with dflash and turboquant_kv.
+  CORRECTION: an earlier note here said omlx "drops MTP heads via
+  _drop_mtp_weights_on_load" — WRONG. That helper is steering-CLI only
+  (cli.py `_load_steering_model`); the perf tools here copied it so
+  benches load in plain non-MTP mode. The production engine keeps and
+  uses the MTP heads when mtp_enabled=True. So all benches in this
+  journal are NON-MTP baseline numbers.
+  Enabling MTP is 2-4x — far bigger than any fusion — and it already
+  exists; it's a per-model setting, not a code change.
+
+## Future directions (NOT this session — but tractable, not multi-day)
+
+### A. Compile-friendly KV cache
+Goal: let `mx.compile` wrap a region that includes the KV cache update +
+SDPA, so the whole attention block can be one compiled graph (today the
+block-compile patch has to keep self_attn OUT because `update_and_fetch`
+mutates `cache.keys`/`cache.values` in place — a side effect compile
+can't trace).
+Approach: a KVCache variant with a FUNCTIONAL update — `update(k, v)`
+returns `(new_keys, new_values)` plus the slice to attend over, instead
+of mutating. The pre-allocated 256-step buffer is already there; the
+only change is to thread the buffer in/out as compile inputs/outputs
+rather than mutating an attribute. mlx-lm caches are small, self-
+contained classes; this is a focused ~1-day job, not a fork. Payoff:
+attention's q/k/v/o + rope + SDPA collapse into one dispatch group.
+
+### B. Custom Metal kernel for the quantized matvec (affine_qmv_fast)
+Decode is batch=1 → every projection is a quantized matrix-VECTOR.
+`affine_qmv_fast` is MLX's kernel for it. omlx ALREADY ships a
+hand-written `mx.fast.metal_kernel` (see
+`patches/deepseek_v4/hyper_connection.py` — a fused sinkhorn+collapse
+kernel), so writing/tuning a Metal kernel is within the existing
+toolbox, not "out of scope". Options, easiest first:
+  1. Tune launch params (threadgroup size, tiling) for the specific
+     (group_size=64, bits=6/8, head_dim) shapes these models use.
+  2. A fused qmv that reads the quantized weight once and writes Q/K/V
+     (or gate/up) in one pass — the kernel-level version of the fusion
+     this session did at the op level, and it WOULD beat separate
+     quantized_matmul calls (the op-level QKV fusion didn't, because
+     mx.quantized_matmul isn't dispatch-bound — but a single custom
+     kernel changes that calculus).
+  3. Upstream a fix/variant to MLX if the win generalizes.
+This is the path to actually lower the ~23ms/token GPU-compute floor.
 
