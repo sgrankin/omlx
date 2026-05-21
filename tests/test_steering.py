@@ -890,6 +890,40 @@ def test_projection_negative_strength_amplifies():
     assert mx.allclose(after, before * 2.0, atol=1e-4)
 
 
+def test_steer_matches_sequential_loop_form():
+    """Stacked-tensor implementation preserves sequential-loop semantics.
+
+    The projection list applies sequentially — each step subtracts the
+    component along ``u_i`` from h *after* prior projections — and the
+    result depends on order when the u's are not mutually orthogonal.
+    Regression guard against any "fuse into one matmul" rewrite that
+    would silently break this contract for stacked specs.
+    """
+    mx.random.seed(0)
+    n_embd = 64
+    P = 5
+    units = mx.random.normal((P, n_embd), dtype=mx.float32)
+    units = units / mx.linalg.norm(units, axis=-1, keepdims=True)
+    strengths = [0.4, -0.7, 1.3, 0.05, -0.2]
+    add = mx.random.normal((n_embd,), dtype=mx.float32)
+    h = mx.random.normal((2, 7, n_embd), dtype=mx.float32)
+
+    # Reference: explicit sequential loop on Python tuples (pre-stacking).
+    ref = h + add
+    for i in range(P):
+        u = units[i]
+        coeff = (ref * u).sum(axis=-1, keepdims=True)
+        ref = ref - strengths[i] * coeff * u
+
+    proj_list = [(units[i], strengths[i]) for i in range(P)]
+    layer = _SteeredLayer(IdentityBlock(), add, proj_list)
+    got = layer(h)
+
+    assert mx.allclose(got, ref, atol=1e-5, rtol=1e-5), (
+        f"max abs diff = {float(mx.abs(got - ref).max())}"
+    )
+
+
 def test_apply_patch_project_mode_normalizes_direction():
     """A non-unit projection direction is unit-normalised by the patch."""
     model = FakeModel(N_LAYERS, N_EMBD)

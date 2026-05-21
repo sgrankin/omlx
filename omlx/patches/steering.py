@@ -154,22 +154,53 @@ class _SteeredLayer(nn.Module):
         self["block"] = block
         object.__setattr__(self, "_steer_add", add_bias)
         object.__setattr__(self, "_steer_proj", projections)
+        # Build a compiled forward fn for the projection chain. Each
+        # projection contributes (mul, sum, mul, sub) — four dispatches —
+        # and at P × N_layers per forward pass that adds up to a 3–20 %
+        # decode regression on tested models (Qwen3.6, Gemma 4). mx.compile
+        # traces the loop into a single graph captured per-instance with
+        # the projection arrays as constants, removing the per-op Python /
+        # dispatch overhead. Add-only layers are not compiled: the trace
+        # cost exceeds the saving on a single elementwise op.
+        if projections:
+            proj_copy = [(u, float(s)) for u, s in projections]
+            add_const = add_bias
+
+            if add_const is not None:
+                def _body(h: mx.array) -> mx.array:
+                    a = add_const if add_const.dtype == h.dtype else add_const.astype(h.dtype)
+                    h = h + a
+                    for unit, strength in proj_copy:
+                        u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
+                        coeff = (h * u).sum(axis=-1, keepdims=True)
+                        h = h - strength * coeff * u
+                    return h
+            else:
+                def _body(h: mx.array) -> mx.array:
+                    for unit, strength in proj_copy:
+                        u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
+                        coeff = (h * u).sum(axis=-1, keepdims=True)
+                        h = h - strength * coeff * u
+                    return h
+
+            object.__setattr__(self, "_steer_fn", mx.compile(_body))
+        else:
+            object.__setattr__(self, "_steer_fn", None)
 
     def _steer(self, h: mx.array) -> mx.array:
+        # Compiled fast path: projection-bearing layers go through the
+        # mx.compile-fused body built in __init__.
+        if self._steer_fn is not None:
+            return self._steer_fn(h)
+        # Add-only layer (or no-op). Direct path, no compile overhead.
         # Steering data is pre-cast to the model's compute dtype at patch
-        # time (see apply_steering_patch), so the hot path is cast-free.
-        # The cast still happens lazily on the rare mismatched-dtype path
-        # (e.g. after model.set_dtype() was called post-patch).
+        # time (see apply_steering_patch); the cast here is a safety net
+        # for the rare path where set_dtype() ran after the patch.
         if self._steer_add is not None:
             add = self._steer_add
             if add.dtype != h.dtype:
                 add = add.astype(h.dtype)
             h = h + add
-        for unit, strength in self._steer_proj:
-            u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
-            # Per-token component of h along the (unit) direction.
-            coeff = (h * u).sum(axis=-1, keepdims=True)
-            h = h - strength * coeff * u
         return h
 
     def __call__(self, *args: Any, **kwargs: Any) -> Any:
