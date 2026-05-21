@@ -402,3 +402,48 @@ toolbox, not "out of scope". Options, easiest first:
   3. Upstream a fix/variant to MLX if the win generalizes.
 This is the path to actually lower the ~23ms/token GPU-compute floor.
 
+### t=13  Does the fusion work with / accelerate native MTP?
+
+CORRECTION first: native MTP IS supported for Qwen3.6 in omlx — toggled
+by `ModelSettings.mtp_enabled` (default False). When True,
+`utils/model_loading.maybe_apply_pre_load_patches` applies the
+mlx_lm_mtp + mlx_vlm_mtp patches and `set_mtp_active(True)`. Earlier
+notes calling MTP "dropped" were wrong — `_drop_mtp_weights_on_load` is
+a steering-CLI-only helper.
+
+Tested (`tools/test_mtp_fusion.py`, Qwen3.6-35B-A3B, mtp_enabled=True):
+- VERIFIED: model loads with the MTP head attached; `is_mtp_active()`
+  True; `mtp_forward` present; `_model_has_mtp_module` True →
+  the omlx-patched GenerationBatch WOULD engage draft+verify.
+- VERIFIED: gate+up fusion COMPOSES with the MTP-loaded model — applies
+  cleanly (n_fused>0), token-identical output, no crash.
+- gate+up perf on the MTP-loaded model's backbone, plain serial decode:
+  +2.0% (44.8 → 45.7 tok/s). NOTE this is a SERIAL loop — sync-bound,
+  so it underestimates fusion benefit; the same model+patch on an
+  async-overlap loop gave ~+9%. +2% is a floor, not the real figure.
+- COULD NOT measure the actual draft+verify tok/s A/B: the VLM+MTP
+  decode path is custom omlx engine code — the model `__call__` returns
+  `(logits, hidden_pre_norm, gdn_states)` and `batch_generator._step_mtp`
+  unpacks it; stock mlx-lm `batch_generate` / `GenerationBatch._step`
+  can't drive an mlx-vlm-loaded model. A proper test = run the omlx
+  engine with mtp_enabled + the fusion patches wired into the load path.
+
+Compatibility, by code analysis (high confidence):
+- gate+up patches `SwitchGLU.__call__`; the MTP patch never touches
+  SwitchGLU → no conflict. Both MTP draft and verify run the backbone
+  `self.mlp` → SparseMoeBlock → SwitchGLU, so gate+up accelerates every
+  MTP forward. **gate+up + MTP: compatible, and accelerates.**
+- block-compile patches `DecoderLayer.__call__`; the MTP patch ALSO
+  patches `DecoderLayer.__call__` (to forward `n_confirmed` to linear
+  attention). **block-compile + MTP: CONFLICT** — last-applied wins,
+  the other breaks. Fix: rewrite block-compile's patched_call to accept
+  and forward `n_confirmed`, and compose on top of the MTP-patched call
+  rather than replacing it.
+
+### Productionization note
+The fusion patches are still standalone monkey-patches applied only by
+the bench tools. To actually ship (MTP or not), wire
+`apply_gemma4_gateup_fuse_patch(model)` into
+`utils/model_loading.apply_post_load_transforms` (gated on a setting).
+That's also the only way to get a real engine-path MTP+fusion A/B.
+
