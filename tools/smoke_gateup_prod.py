@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Smoke-test the production wiring of gate+up fusion.
+"""Smoke-test the production wiring of the decode-perf post-load transforms.
 
 Loads a real MoE model and runs it through omlx's apply_post_load_transforms
-(the actual engine load-path hook), confirming the fusion fires and the
-decoded tokens are unchanged vs a pre-transform baseline.
+(the actual engine load-path hook), confirming the gate+up fusion AND the
+block compile both fire and the decoded tokens are unchanged vs a
+pre-transform baseline.
 """
 
 from __future__ import annotations
@@ -45,26 +46,31 @@ def main():
     # The real engine hook.
     from omlx.utils.model_loading import apply_post_load_transforms
     from omlx.patches.gateup_fuse import _FUSED_ATTR
+    from omlx.patches.block_compile import _COMPILED_ATTR
 
     print("Running apply_post_load_transforms ...")
     apply_post_load_transforms(model, model_settings=None)
 
-    # Count fused SwitchGLU instances.
+    # Count fused SwitchGLU + block-compiled feed-forward submodules.
     from mlx_lm.models.switch_layers import SwitchGLU
     tm = _text_model(model)
     root = getattr(tm, "model", tm)
-    fused = sum(
-        1 for m in root.modules()
+    mods = list(root.modules())
+    glu_total = sum(1 for m in mods if isinstance(m, SwitchGLU))
+    glu_fused = sum(
+        1 for m in mods
         if isinstance(m, SwitchGLU) and getattr(m, _FUSED_ATTR, None) is not None
     )
-    total = sum(1 for m in root.modules() if isinstance(m, SwitchGLU))
-    print(f"  SwitchGLU fused: {fused}/{total}")
+    blk = sum(1 for m in mods if getattr(m, _COMPILED_ATTR, None) is not None)
+    print(f"  SwitchGLU gate+up fused: {glu_fused}/{glu_total}")
+    print(f"  block-compiled submodules: {blk}")
 
     print("Patched decode (post-transform)...")
     patched = decode(model, prompt_ids, 32)
 
     if base == patched:
-        print(f"\n✓ prod wiring OK: {fused} layers fused, token-identical")
+        print(f"\n✓ prod wiring OK: gate+up={glu_fused}, block-compile={blk}, "
+              f"token-identical")
         return 0
     print("\n✗ token mismatch after apply_post_load_transforms")
     return 1

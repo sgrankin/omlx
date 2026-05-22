@@ -447,3 +447,45 @@ the bench tools. To actually ship (MTP or not), wire
 `utils/model_loading.apply_post_load_transforms` (gated on a setting).
 That's also the only way to get a real engine-path MTP+fusion A/B.
 
+
+### t=15  Productionized — gate+up and block-compile wired into the engine
+
+Both decode-perf wins are now real engine features, not bench-only
+monkey-patches. New `omlx/patches/gateup_fuse.py` and
+`omlx/patches/block_compile.py`, both called from
+`utils/model_loading.apply_post_load_transforms` (default-on, the same
+hook as the existing gated_delta_advance / qwen3_5_attention patches).
+
+- gate+up: re-fuses SwitchGLU gate/up into one gather_qmm. ~+10% MoE.
+- block-compile: mx.compile's the feed-forward SUBMODULE
+  (Qwen3_5MoeSparseMoeBlock / gemma4 MLP+Experts), NOT
+  DecoderLayer.__call__ — so it composes with native MTP (which owns
+  DecoderLayer.__call__). ~+5% on top of gate+up.
+
+MTP question, answered: block-compile is MTP-safe by construction
+(disjoint patch target). The earlier "block-compile conflicts with MTP"
+applied only to the OLD full-block-reimplementation approach; the
+submodule-compile approach has no conflict.
+
+### MEASUREMENT TRAP worth remembering
+Benching `apply_post_load_transforms` from a standalone harness gave a
+bogus -26%. Cause: apply_post_load_transforms also applies the existing
+`qwen3_5_attention` patch, whose attention path does per-call `.item()`
+probes UNLESS wrapped in the engine's `force_text_only_rope()` context.
+A standalone bench doesn't use that context → every attention call
+syncs → -26%. The real engine uses force_text_only_rope during decode,
+so this is a harness artifact, not a real regression. Clean measurement
+(applying gateup_fuse + block_compile directly, skipping
+apply_post_load_transforms): +10.7% combined, token-identical.
+
+Also: block-compile's timed runs have a long warmup tail (Metal
+pipeline-state JIT over the first few hundred dispatches) — a one-time
+per-process cost, amortized by a long-running server. Bench with a
+heavy warmup or the number undershoots.
+
+### FINAL — shipped on perf/profile-decode
+- gateup_fuse.py  — gate+up MoE fusion, default-on, ~+10% MoE, token-id'l
+- block_compile.py — feed-forward submodule mx.compile, default-on,
+  ~+5% on top, token-id'l, MTP-safe
+- both auto-detected (dense models / non-target classes: no-op)
+- tests: test_gateup_fuse.py, test_block_compile.py

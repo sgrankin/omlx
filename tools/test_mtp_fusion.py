@@ -124,7 +124,8 @@ def main():
             nxt = int(mx.argmax(logits[0, -1]).item())
         return toks
 
-    print("\n=== Backbone decode: baseline vs gate+up (MTP head loaded) ===")
+    print("\n=== Backbone decode on the MTP-loaded model ===")
+    print("    baseline vs apply_post_load_transforms (gate+up + block-compile)")
     decode(8)  # warmup — JIT/compile before timing
     base_runs = []
     for _ in range(3):
@@ -135,25 +136,37 @@ def main():
     print(f"  baseline   {base_dt:.3f}s  tok/s={n_tokens/base_dt:.1f}  "
           f"({'/'.join(f'{r:.2f}' for r in base_runs)})")
 
-    from tools.patch_gemma4_gateup_fuse import apply_gemma4_gateup_fuse_patch
-    ok = apply_gemma4_gateup_fuse_patch(model)
-    print(f"  gate+up applied: {ok}")
-    decode(8)  # warmup the fused path
+    # Run the REAL engine hook on the MTP-loaded model. This applies
+    # gate+up fusion + block compile on top of the already-applied MTP
+    # patches — the exact production composition we need to verify.
+    from omlx.utils.model_loading import apply_post_load_transforms
+    from omlx.patches.gateup_fuse import _FUSED_ATTR
+    from omlx.patches.block_compile import _COMPILED_ATTR
+
+    apply_post_load_transforms(model, model_settings=None)
+    root = getattr(text_model, "model", text_model)
+    mods = list(root.modules())
+    n_gu = sum(1 for m in mods if getattr(m, _FUSED_ATTR, None) is not None)
+    n_bc = sum(1 for m in mods if getattr(m, _COMPILED_ATTR, None) is not None)
+    print(f"  apply_post_load_transforms: gate+up={n_gu}, block-compile={n_bc}")
+
+    decode(8)  # warmup the transformed path
     fused_runs = []
     for _ in range(3):
         t = time.perf_counter()
         fused = decode(n_tokens)
         fused_runs.append(time.perf_counter() - t)
     fused_dt = min(fused_runs)
-    print(f"  gate+up    {fused_dt:.3f}s  tok/s={n_tokens/fused_dt:.1f}  "
+    print(f"  transformed {fused_dt:.3f}s  tok/s={n_tokens/fused_dt:.1f}  "
           f"({'/'.join(f'{r:.2f}' for r in fused_runs)})")
 
     print("\n=== Result ===")
-    print(f"  token-identical: {'YES' if base == fused else 'NO'}")
-    print(f"  speedup: {100*(base_dt-fused_dt)/base_dt:+.1f}%")
-    print(f"  Note: this is a plain decode loop on the MTP-loaded model. The")
-    print(f"  draft+verify tok/s needs omlx's engine VLM-MTP path; standalone")
-    print(f"  mlx-lm batch_generate can't bridge the mlx-vlm model object.")
+    ok = base == fused
+    print(f"  gate+up + block-compile compose with native MTP: "
+          f"{'YES — token-identical' if ok else 'NO — DIVERGED'}")
+    print(f"  backbone speedup: {100*(base_dt-fused_dt)/base_dt:+.1f}%")
+    print(f"  Note: plain decode loop (serial — sync-bound, underestimates")
+    print(f"  fusion); the draft+verify tok/s needs omlx's engine VLM-MTP path.")
 
 
 if __name__ == "__main__":

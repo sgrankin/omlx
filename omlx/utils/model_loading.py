@@ -1091,6 +1091,17 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     if n_gateup:
         logger.info("gate+up fusion applied to %d SwitchGLU layers", n_gateup)
 
+    # Block compile: mx.compile the per-layer feed-forward submodules to
+    # remove Python per-op dispatch overhead. Runs AFTER gate+up so the
+    # compiled MoE trace captures the already-fused SwitchGLU. Composes
+    # with native MTP (it patches the mlp/experts submodules, not
+    # DecoderLayer.__call__ which MTP owns). Token-identical.
+    from ..patches.block_compile import apply_block_compile
+
+    n_blocks = apply_block_compile(model)
+    if n_blocks:
+        logger.info("Block compile applied to %d feed-forward submodules", n_blocks)
+
     if model_settings is None:
         return model
 
