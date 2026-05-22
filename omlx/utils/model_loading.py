@@ -1061,6 +1061,7 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     - Bonsai t5: free unused bias tensors (the symmetric t5 kernels never
       read them; the repacked safetensors carries them for format compat)
     - IndexCache: skip redundant indexer computation in DSA layers
+    - gate+up fusion: collapse MoE SwitchGLU gate/up matmuls (decode perf)
 
     Args:
         model: A loaded mlx-lm model instance.
@@ -1080,6 +1081,15 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
             logger.info("t5 bias tensors freed: %.0f MB recovered", freed / 1e6)
     except Exception:
         logger.debug("t5 bias free skipped", exc_info=True)
+
+    # gate+up matmul fusion for MoE SwitchGLU layers: always applied,
+    # auto-detected (dense models have no SwitchGLU and are untouched;
+    # token-identical to the unfused path). ~10% decode throughput on MoE.
+    from ..patches.gateup_fuse import apply_gateup_fusion
+
+    n_gateup = apply_gateup_fusion(model)
+    if n_gateup:
+        logger.info("gate+up fusion applied to %d SwitchGLU layers", n_gateup)
 
     if model_settings is None:
         return model
