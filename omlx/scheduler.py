@@ -1255,6 +1255,27 @@ def _prompt_cache_needs_snapshots(prompt_cache: list[Any]) -> bool:
     return False
 
 
+def _specprefill_snapshot_layers(prompt_cache: list[Any]) -> list[Any] | None:
+    """Layers to boundary-snapshot for a draft cache, or None if unneeded.
+
+    Mirrors the main prefill path: gate on _prompt_cache_needs_snapshots,
+    then blank known-sliceable layers exactly like
+    Scheduler._emit_prefill_boundary_snapshot. prefix_cache slices those
+    from the live cache at store time and never reads them from the
+    snapshot (_extract_block_tensor_slice), so carrying them would cost
+    a full KV copy per block boundary.
+
+    None means "this cache needs no snapshots at all" — the caller then
+    skips block-aligned chunking and keeps full prefill_step_size chunks.
+    """
+    if not _prompt_cache_needs_snapshots(prompt_cache):
+        return None
+    return [
+        c if type(c).__name__ not in _KNOWN_SLICEABLE_CACHE_TYPES else None
+        for c in prompt_cache
+    ]
+
+
 def _batch_generator_all_tokens(request: Any) -> list[int]:
     """Seed tokens for mlx-lm's TokenBuffer before the kickoff token."""
     token_ids = getattr(request, "prompt_token_ids", None)
@@ -7529,6 +7550,23 @@ class Scheduler:
             )
             return [], None
 
+        # Only the CacheList branches emit a list-valued ``state`` (the
+        # sub-cache states, one of which may itself be a live ArraysCache
+        # list returned by reference); every other branch already emits a
+        # tuple. Shallow-copy those lists so downstream consumers — notably
+        # BoundarySnapshotSSDStore's pending_writes cache and the in-memory
+        # boundary fallback — see a stable snapshot rather than live state
+        # mutated by subsequent prefill/decode steps.
+        def _freeze(v):
+            if isinstance(v, list):
+                return [_freeze(e) for e in v]
+            return v
+
+        for layer in extracted:
+            state = layer.get("state")
+            if isinstance(state, list):
+                layer["state"] = _freeze(state)
+
         return extracted, model_cache_config
 
     @staticmethod
@@ -8520,6 +8558,8 @@ class Scheduler:
             draft_prefix_cache=self._draft_prefix_cache,
             model_id=self.config.model_name,
             prefill_step_size=self.config.prefill_step_size,
+            block_size=self.config.paged_cache_block_size,
+            snapshot_layers=_specprefill_snapshot_layers,
             stream=self._stream,
             extract_cache_states=self._extract_cache_states,
             sync_and_clear_cache=lambda: _sync_and_clear_cache(self._stream),

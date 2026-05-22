@@ -6,6 +6,7 @@ Utility functions for text processing.
 
 import json
 import re
+from collections import Counter
 from typing import Any, List
 
 from .openai_models import Message
@@ -97,6 +98,57 @@ SPECIAL_TOKENS_PATTERN = re.compile(
     r"</s>|<s>|<pad>|\[PAD\]|\[SEP\]|\[CLS\]|"
     r"<eos>|<bos>|<end_of_turn>|<start_of_turn>"  # Gemma special tokens (fixes #1087)
 )
+
+
+def summarize_message_content(messages: List[Any], tail: int = 3) -> str:
+    """Verbose tail-only content-block summary for diagnostic logging.
+
+    Shows the last ``tail`` messages in ``role=[type,type×N,...]`` form; any
+    earlier history is elided as ``[N earlier]``. ``×N`` suffixes appear only
+    for counts > 1 (single blocks are common and noisy otherwise). Nested
+    tool_result content surfaces as ``tool_result(text,image)``.
+
+    Example (9-turn conversation, tail=3):
+        [6 earlier] u=[tool_result(text,image)] a=[text] u=[text]
+    """
+
+    def _g(obj, key, default=None):
+        if isinstance(obj, dict):
+            return obj.get(key, default)
+        return getattr(obj, key, default)
+
+    def _fmt_block(block) -> str:
+        btype = _g(block, "type") or "?"
+        if btype == "tool_result":
+            inner = _g(block, "content")
+            if isinstance(inner, list) and inner:
+                inner_types = [_g(sub, "type") or "?" for sub in inner]
+                return f"tool_result({','.join(inner_types)})"
+        if btype == "tool_use":
+            name = _g(block, "name")
+            if name:
+                return f"tool_use({name})"
+        return btype
+
+    def _fmt_msg(msg) -> str:
+        role = _g(msg, "role", "?")
+        content = _g(msg, "content")
+        if not content:
+            return f"{role}=[empty]"
+        if isinstance(content, str):
+            return f"{role}=[text]"
+        if isinstance(content, list):
+            counts = Counter(_fmt_block(b) for b in content)
+            parts = [f"{k}×{v}" if v > 1 else k for k, v in counts.items()]
+            return f"{role}=[{','.join(parts)}]"
+        return f"{role}=[?]"
+
+    n = len(messages)
+    if n <= tail:
+        return " ".join(_fmt_msg(m) for m in messages)
+    elided = n - tail
+    shown = " ".join(_fmt_msg(m) for m in messages[-tail:])
+    return f"[{elided} earlier] {shown}"
 
 
 def clean_special_tokens(text: str) -> str:
@@ -884,7 +936,7 @@ def _apply_reasoning_reconstruction(
     content: Any,
     reasoning: str | None,
     native: bool,
-) -> tuple[Any, str | None]:
+) -> tuple[Any, str | None, bool]:
     """Reconstruct reasoning on a historical assistant message.
 
     External clients echo reasoning back via the OpenAI ``reasoning_content``
@@ -897,27 +949,37 @@ def _apply_reasoning_reconstruction(
     * ``native=False`` — template only parses ``<think>...</think>`` embedded
       in content.  Reasoning is inlined into content as a fallback.
 
-    Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
-    string to attach as a ``reasoning_content`` field, or ``None`` to skip.
+    Returns ``(new_content, reasoning_out, preserve_boundary)``.
+    ``reasoning_out`` is the string to attach as a ``reasoning_content``
+    field, or ``None`` to skip.  ``preserve_boundary`` asks the caller to
+    stamp ``_PRESERVE_BOUNDARY_KEY`` so two reasoning turns never merge
+    into one message carrying two ``<think>`` blocks.
     """
+    from .thinking import extract_thinking
+
     if role != "assistant" or not reasoning:
         if role != "assistant" or not native:
-            return content, None
+            return content, None, False
         text = content if isinstance(content, str) else ""
         if isinstance(content, list):
             text = _extract_text_from_content_list(content)
-        from .thinking import extract_thinking
-
         inline_reasoning, inline_content = extract_thinking(text)
         if inline_reasoning:
-            return inline_content, inline_reasoning
-        return content, None
+            return inline_content, inline_reasoning, True
+        return content, None, False
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
+    # Client already inlined <think>...</think> into content — trust their
+    # form over the echoed reasoning field instead of emitting two blocks.
+    inline_reasoning, inline_content = extract_thinking(text)
+    if inline_reasoning:
+        if native:
+            return inline_content, inline_reasoning, True
+        return content, None, True
     if native:
-        return text, reasoning
-    return f"<think>\n{reasoning}\n</think>\n\n{text}", None
+        return text, reasoning, True
+    return f"<think>\n{reasoning}\n</think>\n\n{text}", None, True
 
 
 def extract_text_content(
@@ -961,7 +1023,7 @@ def extract_text_content(
         # mode passes reasoning as a separate field; fallback inlines it as
         # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
-        content, reasoning_out = _apply_reasoning_reconstruction(
+        content, reasoning_out, preserve_boundary = _apply_reasoning_reconstruction(
             role, content, reasoning, native_reasoning_content
         )
 
@@ -1082,6 +1144,9 @@ def extract_text_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
+        # Each reasoning turn owns its <think> block — never merge two.
+        if preserve_boundary:
+            _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         # Handle None content
         if content is None:
@@ -1139,7 +1204,7 @@ def extract_multimodal_content(
 
         # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
-        content, reasoning_out = _apply_reasoning_reconstruction(
+        content, reasoning_out, preserve_boundary = _apply_reasoning_reconstruction(
             role, content, reasoning, native_reasoning_content
         )
 
@@ -1251,6 +1316,9 @@ def extract_multimodal_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
+        # Each reasoning turn owns its <think> block — never merge two.
+        if preserve_boundary:
+            _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         if content is None:
             processed_messages.append({"role": role, "content": "", **_extra})

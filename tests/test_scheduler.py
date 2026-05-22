@@ -5137,17 +5137,30 @@ class TestOutputParserSmoke:
             self.last_segment = ""
 
     class _GemmaTokenizer:
-        def __init__(self, token_map):
+        def __init__(self, token_map, marker_ids=None):
             self._token_map = token_map
+            self._marker_ids = marker_ids or {}
+            self._id_to_marker = {tid: name for name, tid in self._marker_ids.items()}
             self.eos_token_id = 2
             self.pad_token_id = 0
             self.bos_token_id = 1
+            # Real tokenizers map unknown strings onto the unk id rather than
+            # a fresh id. Callers that probe with convert_tokens_to_ids rely
+            # on that to detect "this marker isn't a single token" and fall
+            # back to encode().
+            self.unk_token_id = -1
+
+        def _decode_one(self, token_id):
+            if token_id in self._id_to_marker:
+                return self._id_to_marker[token_id]
+            return self._token_map.get(token_id, "")
 
         @property
         def detokenizer(self):
-            return TestOutputParserSmoke._Detokenizer(
-                lambda token_id: self._token_map[token_id]
-            )
+            return TestOutputParserSmoke._Detokenizer(self._decode_one)
+
+        def convert_tokens_to_ids(self, token: str) -> int:
+            return self._marker_ids.get(token, -1)
 
         def encode(self, text: str, add_special_tokens: bool = True):
             if text == "\n":
@@ -5159,7 +5172,14 @@ class TestOutputParserSmoke:
             return [10]
 
         def decode(self, token_ids, skip_special_tokens: bool = True):
-            return "".join(self._token_map.get(token_id, "") for token_id in token_ids)
+            parts = []
+            for tid in token_ids:
+                if tid in self._id_to_marker:
+                    if not skip_special_tokens:
+                        parts.append(self._id_to_marker[tid])
+                    continue
+                parts.append(self._token_map.get(tid, ""))
+            return "".join(parts)
 
     class _DeepSeekV4Tokenizer(_GemmaTokenizer):
         has_tool_calling = True
@@ -5174,14 +5194,19 @@ class TestOutputParserSmoke:
     def test_gemma4_session_selected_and_markers_hidden(self, mock_model):
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
-            {
-                11: "<|channel>",
-                12: "thought\n",
-                13: "reasoning",
-                14: "<channel|>",
+            token_map={
+                12: "thought",
+                13: "\n",
+                14: "reasoning",
                 15: "answer",
-                16: "<turn|>",
-            }
+            },
+            marker_ids={
+                "<|channel>": 100,
+                "<channel|>": 101,
+                "<turn|>": 106,
+                "<|tool_call>": 48,
+                "<tool_call|>": 49,
+            },
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -5206,24 +5231,26 @@ class TestOutputParserSmoke:
         scheduler.request_id_to_uid[request.request_id] = 99
 
         responses = [
-            type("Resp", (), {"uid": 99, "token": 11, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 100, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 12, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 101, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "length"})(),
+            type("Resp", (), {"uid": 99, "token": 106, "finish_reason": "length"})(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
         assert finished_ids == {"gemma-req"}
         assert outputs[-1].finished is True
-        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+        assert outputs[-1].output_text == "<think>reasoning</think>answer"
 
         full_stream = "".join(output.new_text for output in outputs)
         assert "<|channel>" not in full_stream
         assert "<channel|>" not in full_stream
-        assert full_stream == "<think>\nreasoning</think>\nanswer"
+        assert "<turn|>" not in full_stream
+        assert full_stream == "<think>reasoning</think>answer"
 
     def test_gemma4_prefilled_thought_after_tool_response(self, mock_model):
         """Tool continuations open the thought channel in the prompt.
@@ -5234,12 +5261,17 @@ class TestOutputParserSmoke:
         """
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
-            {
+            token_map={
                 13: "reasoning",
-                14: "<channel|>",
                 15: "answer",
-                16: "<turn|>",
-            }
+            },
+            marker_ids={
+                "<|channel>": 100,
+                "<channel|>": 101,
+                "<turn|>": 106,
+                "<|tool_call>": 48,
+                "<tool_call|>": 49,
+            },
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -5266,18 +5298,18 @@ class TestOutputParserSmoke:
 
         responses = [
             type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 101, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "stop"})(),
+            type("Resp", (), {"uid": 99, "token": 106, "finish_reason": "stop"})(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
         assert finished_ids == {request.request_id}
         assert "".join(output.new_text for output in outputs) == (
-            "<think>\nreasoning</think>\nanswer"
+            "<think>reasoning</think>answer"
         )
-        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+        assert outputs[-1].output_text == "<think>reasoning</think>answer"
 
         disabled = Request(
             request_id="gemma-thinking-disabled",
@@ -6101,3 +6133,103 @@ class TestSupportsSkipLmHead:
 
         scheduler = self._scheduler_with_model(NoCall())
         assert scheduler._supports_skip_lm_head() is False
+
+
+class TestExtractCacheStatesFreeze:
+    """The ArraysCache state mutation guarantee.
+
+    _extract_cache_states must return a snapshot whose list state cannot be
+    corrupted by subsequent in-place mutation of the source cache object.
+    BoundarySnapshotSSDStore caches the extracted dict in _pending_writes
+    for fast-path reads; if the fast path returned a live reference,
+    ongoing prefill/decode would leak post-boundary state into stored
+    intermediate blocks and corrupt hybrid-model prefix caches.
+    """
+
+    @pytest.fixture
+    def scheduler(self):
+        from omlx.scheduler import Scheduler
+
+        mock_scheduler = MagicMock(spec=Scheduler)
+        mock_scheduler.model_name = "test"
+        mock_scheduler._extract_cache_states = Scheduler._extract_cache_states.__get__(
+            mock_scheduler, Scheduler
+        )
+        return mock_scheduler
+
+    def test_arrays_cache_state_snapshot_isolated_from_mutation(self, scheduler):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache
+
+        ac = ArraysCache(size=2)
+        ac.cache[0] = mx.array([1.0, 2.0, 3.0])
+        ac.cache[1] = mx.array([10.0, 20.0, 30.0])
+
+        extracted, _ = scheduler._extract_cache_states([ac])
+        snap_state = extracted[0]["state"]
+
+        # Simulate a post-extraction prefill chunk that replaces the state
+        # in place via the usual cache[i] = new_array pattern.
+        ac.cache[0] = mx.array([99.0, 99.0, 99.0])
+        ac.cache[1] = mx.array([88.0, 88.0, 88.0])
+
+        # Snapshot still points at the pre-mutation arrays.
+        assert float(mx.sum(snap_state[0]).item()) == 6.0
+        assert float(mx.sum(snap_state[1]).item()) == 60.0
+
+    def test_cache_list_nested_state_isolated_from_mutation(self, scheduler):
+        import mlx.core as mx
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal(shape=(1, 4, 10, 64)),
+            mx.random.normal(shape=(1, 4, 10, 64)),
+        )
+        ac = ArraysCache(size=2)
+        ac.cache[0] = mx.array([7.0, 8.0])
+        ac.cache[1] = mx.array([70.0, 80.0])
+        cl = CacheList(kv, ac)
+
+        extracted, _ = scheduler._extract_cache_states([cl])
+        snap_state = extracted[0]["state"]
+
+        # Mutate the inner ArraysCache after extraction.
+        ac.cache[0] = mx.array([99.0, 99.0])
+
+        # CacheList snapshot's nested state preserves the original list
+        # entries — the sub-cache state for ac appears at index 1.
+        ac_snapshot = snap_state[1]
+        assert isinstance(ac_snapshot, list)
+        assert float(mx.sum(ac_snapshot[0]).item()) == 15.0
+
+
+class TestSpecprefillSnapshotLayers:
+    """_specprefill_snapshot_layers gates and blanks like the main prefill path."""
+
+    def test_all_sliceable_returns_none(self):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        result = _specprefill_snapshot_layers([KVCache(), KVCache()])
+        assert result is None
+
+    def test_mixed_blanks_sliceable_layers(self):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        kv = KVCache()
+        arrays = ArraysCache(size=2)
+        result = _specprefill_snapshot_layers([kv, arrays])
+        assert result == [None, arrays]
+
+    def test_cache_list_layer_is_not_blanked(self):
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        cl = CacheList(KVCache(), ArraysCache(size=2))
+        result = _specprefill_snapshot_layers([cl])
+        assert result == [cl]

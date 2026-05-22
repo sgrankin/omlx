@@ -671,6 +671,8 @@
   "modal.model_settings.vlm_mtp_draft_model": "Drafter 模型",
   "modal.model_settings.vlm_mtp_draft_model_placeholder": "選擇 assistant 或 MTP drafter…",
   "modal.model_settings.vlm_mtp_block_size": "Draft 區塊大小（每輪 token 數，留空 = 4）",
+  "modal.model_settings.turboquant_skip_last": "跳過最後一層",
+  "modal.model_settings.turboquant_skip_last_hint": "保持最後一個全注意力層不量化。建議用於快取類型混合的模型（例如 gemma-4-31B）。",
   "modal.model_settings.index_cache": "索引快取",
   "modal.model_settings.index_cache_hint": "跳過DSA層中冗餘的索引器運算（DeepSeek V3/GLM-5）。",
   "modal.model_settings.index_cache_freq": "頻率（每N層保留索引器）",

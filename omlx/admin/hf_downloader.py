@@ -38,6 +38,10 @@ _HF_API_TIMEOUT = 10
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
 
+# Bound on the size-estimating dry run (seconds). See the comment at its
+# call site for why this can't reap the underlying thread on timeout.
+_DRY_RUN_TIMEOUT = 120
+
 # Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
 # endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
 # 308-redirect to huggingface.co when accessed from IPs outside their region;
@@ -863,8 +867,26 @@ class HFDownloader:
                 if ignore_patterns:
                     dl_kwargs["ignore_patterns"] = ignore_patterns
 
+                # Start progress polling before dry_run so the UI reflects
+                # byte-level progress during both the dry_run and the real
+                # download. total_size stays 0 until dry_run fills it in;
+                # the poller handles that by showing downloaded bytes only.
+                self._progress_tasks[task_id] = asyncio.create_task(
+                    self._poll_progress(task_id, target_dir)
+                )
+
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
+                # Bounded by wait_for: a mirror that accepts the TCP
+                # connection and then never answers (etag_timeout only
+                # bounds requests that actually get a response) would
+                # otherwise hang the task forever. wait_for cannot kill
+                # the to_thread worker itself, so on timeout the thread
+                # leaks and keeps running in the background rather than
+                # being reaped -- accepted here because the alternative,
+                # falling through to the real download, would race a
+                # second snapshot_download against it on the same
+                # local_dir.
                 size_estimated = False
                 try:
                     dry_result = await asyncio.wait_for(
@@ -873,9 +895,18 @@ class HFDownloader:
                             **dl_kwargs,
                             dry_run=True,
                         ),
-                        timeout=30,
+                        timeout=_DRY_RUN_TIMEOUT,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
+                except TimeoutError:
+                    task.status = DownloadStatus.FAILED
+                    task.error = (
+                        f"Dry run timed out after {_DRY_RUN_TIMEOUT}s for "
+                        f"{task.repo_id}. The HF endpoint may be unreachable "
+                        "or stalled."
+                    )
+                    logger.error(f"Dry run timed out for {task.repo_id}")
+                    return
                 except Exception as e:
                     if st_estimate:
                         task.total_size = st_estimate
@@ -886,11 +917,6 @@ class HFDownloader:
                     logger.warning(
                         f"Dry run failed for {task.repo_id}: {e}. {detail}"
                     )
-
-                # Start progress polling
-                self._progress_tasks[task_id] = asyncio.create_task(
-                    self._poll_progress(task_id, target_dir)
-                )
 
                 # Run snapshot_download in a thread (blocking call). Cancel
                 # reaches the thread two ways: the cancellable tqdm raises on
@@ -1003,7 +1029,12 @@ class HFDownloader:
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
+                # rglob over a large partial download can take a while on a
+                # stalled or slow filesystem; run it off the event loop so
+                # it can't block other coroutines (including cancellation).
+                current_size = await asyncio.to_thread(
+                    self._get_dir_size, target_dir
+                )
                 task.downloaded_size = current_size
 
                 if task.total_size > 0:
@@ -1017,7 +1048,9 @@ class HFDownloader:
                     last_size = current_size
                     last_activity_at = time.time()
                 else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
+                    latest_mtime = await asyncio.to_thread(
+                        self._get_latest_mtime, target_dir
+                    )
                     if latest_mtime > last_activity_at:
                         last_activity_at = latest_mtime
 

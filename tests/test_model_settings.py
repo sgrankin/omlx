@@ -73,6 +73,16 @@ class TestModelSettings:
         from omlx.model_profiles import EXCLUDED_FROM_PROFILES
         assert "trust_remote_code" in EXCLUDED_FROM_PROFILES
 
+    def test_block_compile_enabled_default_false(self):
+        """Block compile is opt-in. Default off."""
+        settings = ModelSettings()
+        assert settings.block_compile_enabled is False
+
+    def test_block_compile_enabled_excluded_from_profiles(self):
+        """Load-time perf experiment must never propagate via profiles."""
+        from omlx.model_profiles import EXCLUDED_FROM_PROFILES
+        assert "block_compile_enabled" in EXCLUDED_FROM_PROFILES
+
     def test_max_context_window(self):
         """Test max_context_window field."""
         settings = ModelSettings(max_context_window=4096)

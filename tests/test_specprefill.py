@@ -906,3 +906,230 @@ class TestTargetPrefillLeftoverCleanup:
         # Entry cleanup must restore the genuine rope before prefill runs
         assert seen["rope"] is genuine
         assert layer.self_attn.rope is genuine
+
+
+class TestLookaheadSnapshotRestore:
+    """Snapshot/restore invariance for the score_tokens lookahead cleanup.
+
+    Regression guard: ensures the cleanup loop correctly reverts every cache
+    type's post-lookahead mutation, not just caches exposing ``keys``.  A
+    silent no-op on ArraysCache / CacheList / RotatingKVCache metadata caused
+    draft-prefix-cache corruption that collapsed generation.
+    """
+
+    @staticmethod
+    def _snapshot_and_restore(caches, mutate):
+        """Capture (state, meta_state), run ``mutate``, then restore.
+
+        Mirrors the logic in score_tokens: shallow-copy any list containers so
+        in-place mutation of a live state list (ArraysCache.cache) doesn't
+        corrupt the snapshot.
+        """
+        def _freeze(v):
+            if isinstance(v, list):
+                return [_freeze(e) for e in v]
+            return v
+
+        snaps = [(_freeze(c.state), _freeze(c.meta_state)) for c in caches]
+        mutate()
+        for c, (state, meta) in zip(caches, snaps):
+            c.state = state
+            c.meta_state = meta
+
+    def test_kvcache_offset_and_shape(self):
+        from mlx_lm.models.cache import KVCache
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal(shape=(1, 4, 10, 64)),
+            mx.random.normal(shape=(1, 4, 10, 64)),
+        )
+        pre_offset = kv.offset
+
+        def mutate():
+            kv.update_and_fetch(
+                mx.random.normal(shape=(1, 4, 5, 64)),
+                mx.random.normal(shape=(1, 4, 5, 64)),
+            )
+            assert kv.offset == 15
+
+        self._snapshot_and_restore([kv], mutate)
+        assert kv.offset == pre_offset
+
+    def test_rotating_kv_cache_idx_restored_via_meta_state(self):
+        """_idx lives in meta_state — missing it leaves the cache inconsistent."""
+        from mlx_lm.models.cache import RotatingKVCache
+
+        rkv = RotatingKVCache(max_size=32)
+        rkv.update_and_fetch(
+            mx.random.normal(shape=(1, 4, 10, 64)),
+            mx.random.normal(shape=(1, 4, 10, 64)),
+        )
+        pre_idx = rkv._idx
+        pre_offset = rkv.offset
+
+        def mutate():
+            rkv.update_and_fetch(
+                mx.random.normal(shape=(1, 4, 5, 64)),
+                mx.random.normal(shape=(1, 4, 5, 64)),
+            )
+            assert rkv._idx != pre_idx
+
+        self._snapshot_and_restore([rkv], mutate)
+        assert rkv._idx == pre_idx
+        assert rkv.offset == pre_offset
+
+    def test_sized_arrays_cache_state_refs_preserved(self):
+        from mlx_lm.models.cache import ArraysCache
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        inner = ArraysCache(size=2)
+        inner.cache[0] = mx.array([1.0, 2.0, 3.0])
+        inner.cache[1] = mx.array([10.0, 20.0, 30.0])
+        sc = SizedArraysCache(inner, token_count=100)
+        pre_c0_id = id(sc.cache[0])
+        pre_c1_id = id(sc.cache[1])
+
+        def mutate():
+            inner.cache[0] = mx.array([99.0, 99.0, 99.0])
+            inner.cache[1] = mx.array([88.0, 88.0, 88.0])
+
+        self._snapshot_and_restore([sc], mutate)
+        assert id(sc.cache[0]) == pre_c0_id
+        assert id(sc.cache[1]) == pre_c1_id
+
+    def test_cache_list_hybrid_kv_plus_arrays(self):
+        """CacheList must propagate restore to every sub-cache."""
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+        from omlx.cache.type_handlers import SizedArraysCache
+
+        kv = KVCache()
+        kv.update_and_fetch(
+            mx.random.normal(shape=(1, 4, 10, 64)),
+            mx.random.normal(shape=(1, 4, 10, 64)),
+        )
+        inner = ArraysCache(size=2)
+        inner.cache[0] = mx.array([7.0, 8.0])
+        inner.cache[1] = mx.array([70.0, 80.0])
+        sc = SizedArraysCache(inner, token_count=10)
+        cl = CacheList(kv, sc)
+
+        pre_kv_offset = kv.offset
+        pre_arr_id = id(inner.cache[0])
+
+        def mutate():
+            kv.update_and_fetch(
+                mx.random.normal(shape=(1, 4, 3, 64)),
+                mx.random.normal(shape=(1, 4, 3, 64)),
+            )
+            inner.cache[0] = mx.array([99.0, 99.0])
+
+        self._snapshot_and_restore([cl], mutate)
+        assert kv.offset == pre_kv_offset
+        assert id(inner.cache[0]) == pre_arr_id
+
+
+class TestPrefillDraftBoundaryCapture:
+    """Block-aligned chunking is opt-in: only when a capture_fn is supplied."""
+
+    @staticmethod
+    def _model_and_cache(chunks):
+        class _Cache:
+            def __init__(self):
+                self.state = mx.zeros((1,))
+
+        def model(arr, cache=None):
+            chunks.append(arr.shape[1])
+            return mx.zeros((1, arr.shape[1], 4))
+
+        return model, [_Cache()]
+
+    def test_no_capture_fn_uses_full_step_size(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        model, cache = self._model_and_cache(chunks)
+        result = _prefill_draft(
+            model, list(range(600)), cache, step_size=512, block_size=256
+        )
+        assert chunks == [512, 87, 1]
+        assert not isinstance(result, tuple)
+
+    def test_capture_fn_clamps_chunks_to_block_boundaries(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        result = _prefill_draft(
+            model,
+            list(range(600)),
+            cache,
+            step_size=512,
+            block_size=256,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert chunks == [256, 256, 87, 1]
+        assert seen == [256, 512]
+        assert not isinstance(result, tuple)
+
+    def test_starting_offset_aligns_absolute_positions(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        _prefill_draft(
+            model,
+            list(range(600)),
+            cache,
+            step_size=512,
+            block_size=256,
+            starting_offset=100,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert chunks == [156, 256, 187, 1]
+        assert seen == [256, 512]
+
+    def test_zero_block_size_disables_capture(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        _prefill_draft(
+            model,
+            list(range(10)),
+            cache,
+            step_size=4,
+            block_size=0,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert seen == []
+
+
+class TestResolveBoundaryCapture:
+    """Truth table for the capture-gate helper."""
+
+    def test_none_callback_returns_none(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        assert _resolve_boundary_capture(object(), None, lambda c: True) is None
+
+    def test_needs_capture_false_returns_none(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, lambda c: False) is None
+
+    def test_needs_capture_true_returns_callback(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, lambda c: True) is callback
+
+    def test_needs_capture_none_returns_callback(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, None) is callback

@@ -129,11 +129,13 @@ class ModelSettingsRequest(BaseModel):
     ttl_seconds: int | None = None
     index_cache_freq: int | None = None
     enable_thinking: bool | None = None
+    preserve_thinking: bool | None = None
     thinking_budget_enabled: bool | None = None
     thinking_budget_tokens: int | None = None
     # TurboQuant KV cache (mlx-vlm backend)
     turboquant_kv_enabled: bool | None = None
     turboquant_kv_bits: float | None = None
+    turboquant_skip_last: bool | None = None
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill
     qwen35_ane_prefill_enabled: bool | None = None
     qwen35_ane_prefill_sequence_length: int | None = None
@@ -404,6 +406,7 @@ class OQStartRequest(BaseModel):
     imatrix_num_samples: int = 128
     imatrix_seq_length: int = 512
     mtp_assistant_model_path: str = ""
+    skip_sensitivity: bool = False
 
 
 class HFUploadRequest(BaseModel):
@@ -2302,6 +2305,8 @@ async def update_model_settings(
         )
     if "enable_thinking" in sent:
         current_settings.enable_thinking = request.enable_thinking
+    if "preserve_thinking" in sent:
+        current_settings.preserve_thinking = request.preserve_thinking
     if "thinking_budget_enabled" in sent:
         current_settings.thinking_budget_enabled = (
             request.thinking_budget_enabled or False
@@ -2333,6 +2338,12 @@ async def update_model_settings(
         current_settings.turboquant_kv_enabled = request.turboquant_kv_enabled or False
     if "turboquant_kv_bits" in sent:
         current_settings.turboquant_kv_bits = request.turboquant_kv_bits or 4
+    if "turboquant_skip_last" in sent:
+        current_settings.turboquant_skip_last = (
+            True
+            if request.turboquant_skip_last is None
+            else request.turboquant_skip_last
+        )
     # Private Qwen3.5/3.6/3.8 ANE/GPU fixed-shape prefill. These are all load-time
     # controls; the runtime signature below causes a loaded model to be
     # re-created when the user applies a changed profile.
@@ -7493,6 +7504,7 @@ async def start_oq_quantization(
             imatrix_num_samples=request.imatrix_num_samples,
             imatrix_seq_length=request.imatrix_seq_length,
             mtp_assistant_model_path=request.mtp_assistant_model_path,
+            skip_sensitivity=request.skip_sensitivity,
         )
         return {"success": True, "task": task.to_dict()}
     except ValueError as e:

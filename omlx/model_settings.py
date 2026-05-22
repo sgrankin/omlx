@@ -101,6 +101,8 @@ class ModelSettings:
         model_alias: API-visible alternative to the directory name.
         index_cache_freq: IndexCache: every Nth layer keeps indexer (DeepSeek DSA
             only; GLM-5.2 uses its native checkpoint schedule).
+        block_compile_enabled: mx.compile the per-layer feed-forward submodules at load
+            (decode perf; opt-in, applies at model load only).
         enable_thinking: Explicit toggle for thinking/reasoning mode (None = auto).
         thinking_budget_enabled: Whether a thinking token budget is active.
         thinking_budget_tokens: Max tokens for thinking/reasoning.
@@ -328,6 +330,14 @@ class ModelSettings:
     #   layer_start: first steered layer, inclusive (None = unbounded)
     #   layer_end:   last steered layer, inclusive (None = unbounded)
     steering_vectors: Optional[list[dict]] = None
+
+    # Block compile: mx.compile each decoder layer's feed-forward submodule
+    # (mlp / experts) at load time to drop Python per-op dispatch overhead
+    # (~1-2% decode on MoE). Opt-in: only the Gemma 4 / Qwen3.5 MoE
+    # feed-forward classes are targeted and the win is small, so it is not
+    # worth the compile-cache risk by default. Applied at model load — a
+    # loaded model must be unloaded and reloaded for a change to take effect.
+    block_compile_enabled: bool = False
 
     # Model management flags
     is_pinned: bool = False
@@ -704,6 +714,22 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings:
+                        # Legacy records may carry explicit None/"" "unset"
+                        # markers; canonicalize by dropping them so saved
+                        # settings (which never contain these) can compare
+                        # equal to the profile without a separate
+                        # equivalence helper. Numeric 0 is a real value
+                        # (e.g. min_p=0) and is left alone.
+                        cleaned = {
+                            k: v
+                            for k, v in settings.items()
+                            if v is not None and v != ""
+                        }
+                        if cleaned != settings:
+                            profile["settings"] = cleaned
+                            changed = True
+                            model_changed = True
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:

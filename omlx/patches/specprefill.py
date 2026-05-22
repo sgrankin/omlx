@@ -96,9 +96,14 @@ def _accepts_extractor_kwargs(extractor, kwargs) -> bool:
 def _qwen35_extract_queries(attn, x, cache=None, **kwargs):
     """Qwen3.5: gate split + q_norm + RoPE."""
     B, L, D = x.shape
+    n_heads = getattr(
+        attn,
+        "num_attention_heads",
+        getattr(attn, "n_heads", getattr(attn, "num_heads", None)),
+    )
     q_out = attn.q_proj(x)
     queries, _gate = mx.split(
-        q_out.reshape(B, L, attn.num_attention_heads, -1), 2, axis=-1
+        q_out.reshape(B, L, n_heads, -1), 2, axis=-1
     )
     queries = attn.q_norm(queries).transpose(0, 2, 1, 3)
     if cache is not None:
@@ -344,13 +349,53 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
-def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None):
-    """Prefill draft model with all prompt tokens. Returns last logits."""
+def _resolve_boundary_capture(cache, capture_snapshot_fn, needs_capture_fn):
+    """Capture callback to use for ``cache``, or None to disable capture.
+
+    A fully sliceable draft cache (plain KVCache) is rebuilt by slicing the
+    final state, so boundary snapshots buy nothing — while block-aligned
+    chunking costs one model() call per block_size tokens instead of per
+    prefill_step_size (8x at the defaults, plus a full cache extraction
+    every block).
+    """
+    if capture_snapshot_fn is None:
+        return None
+    if needs_capture_fn is not None and not needs_capture_fn(cache):
+        return None
+    return capture_snapshot_fn
+
+
+def _prefill_draft(
+    model,
+    tokens,
+    cache,
+    step_size=2048,
+    progress_callback=None,
+    block_size: Optional[int] = None,
+    starting_offset: int = 0,
+    capture_fn: Optional[Callable[[List[Any], int], None]] = None,
+):
+    """Prefill draft model with all prompt tokens. Returns last logits.
+
+    When ``block_size`` and ``capture_fn`` are both provided, chunks are
+    shrunk as needed to land on every block boundary in the absolute token
+    sequence (starting_offset + processed), and ``capture_fn(cache, end_pos)``
+    is invoked at each boundary to record a per-boundary cache snapshot.
+    """
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
+    capture = capture_fn is not None and block_size is not None and block_size > 0
+
     while n - processed > 1:
-        chunk = min(step_size, n - processed - 1)
+        chunk_max = min(step_size, n - processed - 1)
+        if capture:
+            current_pos = starting_offset + processed
+            # Distance to the next block boundary strictly after current_pos.
+            dist_to_boundary = block_size - (current_pos % block_size)
+            chunk = min(chunk_max, dist_to_boundary)
+        else:
+            chunk = chunk_max
         if progress_callback is not None:
             # Mark the chunk as active before the MLX eval without advancing
             # completed-token progress. Advancing here makes tok/s math lie
@@ -361,11 +406,20 @@ def _prefill_draft(model, tokens, cache, step_size=2048, progress_callback=None)
         processed += chunk
         if progress_callback is not None:
             progress_callback(processed, n)
+        if capture:
+            end_pos = starting_offset + processed
+            if end_pos % block_size == 0:
+                capture_fn(cache, end_pos)
         mx.clear_cache()
+
     logits = model(prompt[processed:][None], cache=cache)
     mx.eval(logits)
     if progress_callback is not None:
         progress_callback(n, n)
+    if capture:
+        end_pos = starting_offset + n
+        if end_pos % block_size == 0:
+            capture_fn(cache, end_pos)
     return logits
 
 
@@ -455,7 +509,11 @@ def score_tokens(
     prefill_step_size: int = 2048,
     query_extractor: Optional[Callable] = None,
     existing_cache: Optional[List[Any]] = None,
+    existing_cache_tokens: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
+    block_size: Optional[int] = None,
+    capture_snapshot_fn: Optional[Callable[[List[Any], int], None]] = None,
+    needs_capture_fn: Optional[Callable[[List[Any]], bool]] = None,
 ) -> Tuple[mx.array, Any]:
     """Score token importance using attention patterns on a draft model.
 
@@ -475,6 +533,23 @@ def score_tokens(
         query_extractor: custom function(attn, x, cache) -> queries
         existing_cache: pre-populated cache from paged cache restore.
             If provided, only the suffix beyond cached tokens is prefilled.
+        existing_cache_tokens: number of prompt tokens already represented
+            by ``existing_cache``. Required for hybrid caches where layer 0
+            may be an ArraysCache without an ``.offset`` attribute — the
+            old inspection-based detection returns 0 for those and re-
+            prefills every token on top of restored state, producing
+            garbage. Falls back to ``cache[0].offset`` when unset.
+        block_size: when provided together with ``capture_snapshot_fn``,
+            prefill chunks are aligned to every ``block_size`` boundary and
+            the callback is invoked after each one. Enables per-block
+            boundary snapshots for non-sliceable caches so prefix-cache
+            fetches at arbitrary block counts reconstruct correctly.
+        capture_snapshot_fn: ``(cache, end_pos) -> None``, invoked at each
+            block boundary to record a snapshot. Only invoked at block
+            boundaries.
+        needs_capture_fn: predicate on the resolved draft cache; capture is
+            skipped entirely when it returns False, which also removes
+            block-aligned chunk clamping.
 
     Returns:
         (importance, cache) — importance scores (M,) and the draft cache
@@ -505,7 +580,10 @@ def score_tokens(
     # Phase 1: Prefill (full or suffix-only if cache provided)
     if existing_cache is not None:
         cache = existing_cache
-        cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
+        if existing_cache_tokens is not None:
+            cached_len = existing_cache_tokens
+        else:
+            cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
             logits = _prefill_draft(
@@ -517,6 +595,11 @@ def score_tokens(
                     (lambda processed, total: progress_callback(cached_len + processed, n_prompt, "scoring"))
                     if progress_callback is not None
                     else None
+                ),
+                block_size=block_size,
+                starting_offset=cached_len,
+                capture_fn=_resolve_boundary_capture(
+                    cache, capture_snapshot_fn, needs_capture_fn
                 ),
             )
         else:
@@ -535,12 +618,31 @@ def score_tokens(
                 if progress_callback is not None
                 else None
             ),
+            block_size=block_size,
+            starting_offset=0,
+            capture_fn=_resolve_boundary_capture(
+                cache, capture_snapshot_fn, needs_capture_fn
+            ),
         )
 
-    # Record cache offset before lookahead so we can trim afterwards.
-    # Lookahead decode appends n_lookahead+1 tokens to the cache which
-    # must NOT be persisted when the caller stores the cache to SSD.
-    pre_lookahead_offset = cache[0].offset if hasattr(cache[0], "offset") else n_prompt
+    # Snapshot cache state before lookahead so we can restore afterwards.
+    # Lookahead decode appends n_lookahead+1 tokens to the cache which must
+    # NOT be persisted when the caller stores the cache to SSD. Use the
+    # (state, meta_state) property pair each mlx-lm cache class defines for
+    # its from_state serialisation: covers KVCache keys/values, RotatingKVCache
+    # _idx (inside meta_state), ArraysCache recurrent state, and CacheList
+    # nesting — all handled by the cache's own setters.
+    #
+    # ArraysCache.state returns its live ``self.cache`` list (and CacheList.state
+    # nests such lists), so in-place mutation of the list would corrupt the
+    # snapshot. Shallow-copy every list we encounter; MLX arrays and tuples
+    # are immutable so references are safe.
+    def _freeze(v):
+        if isinstance(v, list):
+            return [_freeze(e) for e in v]
+        return v
+
+    cache_snapshots = [(_freeze(c.state), _freeze(c.meta_state)) for c in cache]
 
     # Phase 2: Lookahead decode with query capture
     query_buffer = [[] for _ in range(n_attn_layers)]
@@ -556,6 +658,8 @@ def score_tokens(
         _unpatch_attention_capture(model, patches)
 
     # Phase 3: Compute importance
+    # (Reads cache.keys[..., :n_prompt, :]; lookahead-appended keys past
+    # n_prompt are ignored, so the snapshot-based restore below is safe.)
     layer_to_cache = _build_layer_to_cache_map(model)
     attn_caches = [cache[layer_to_cache[i]] for i in attn_indices]
     importance = _compute_importance(
@@ -570,16 +674,11 @@ def score_tokens(
     if progress_callback is not None:
         progress_callback(n_prompt, n_prompt, "importance")
 
-    # Trim lookahead tokens from cache before returning.
-    # KVCache stores keys/values as contiguous tensors; slicing back
-    # to pre_lookahead_offset removes the lookahead-generated entries.
-    for c in cache:
-        if hasattr(c, "offset") and c.offset > pre_lookahead_offset:
-            trim = c.offset - pre_lookahead_offset
-            if hasattr(c, "keys") and c.keys is not None:
-                c.keys = c.keys[..., :pre_lookahead_offset, :]
-                c.values = c.values[..., :pre_lookahead_offset, :]
-            c.offset = pre_lookahead_offset
+    # Restore pre-lookahead cache state via each cache's own state/meta_state
+    # setters — mirrors _BaseCache.from_state and handles every cache class.
+    for c, (saved_state, saved_meta) in zip(cache, cache_snapshots):
+        c.state = saved_state
+        c.meta_state = saved_meta
 
     del logits, query_buffer, attn_caches
     mx.clear_cache()

@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -104,6 +105,27 @@ _NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
     return _OQ_BPW_TARGETS.get(oq_level)
+
+
+def _positional_sensitivity_map(config: dict) -> dict[str, float]:
+    """Position-based stand-in for measured per-layer sensitivity.
+
+    Early and late layers score highest, the middle band lowest. Both
+    ``estimate_bpw_and_size`` and the measurement-skipping paths in
+    ``quantize_oq_streaming`` use this, so the advertised estimate matches the
+    plan the quantizer actually builds.
+    """
+    tc = config.get("text_config", {})
+    num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
+    scores: dict[str, float] = {}
+    for i in range(num_layers):
+        if i < num_layers // 8 or i >= 7 * num_layers // 8:
+            scores[str(i)] = 0.05
+        elif i < num_layers // 4 or i >= 3 * num_layers // 4:
+            scores[str(i)] = 0.02
+        else:
+            scores[str(i)] = 0.01
+    return scores
 
 
 def _is_deepseek_v4_config(config: dict) -> bool:
@@ -1196,6 +1218,7 @@ def resolve_output_name(
     dtype: str = "bfloat16",
     preserve_mtp: bool = False,
     enhanced: bool = False,
+    skip_sensitivity: bool = False,
 ) -> str:
     """Generate output model name: strip existing quant suffixes, append oQ tag.
 
@@ -1203,6 +1226,9 @@ def resolve_output_name(
     produces no dtype suffix (backwards compatible). When preserve_mtp is True,
     appends `-mtp` so the resulting name reflects that mtp.* tensors and
     config fields were preserved through quantization.
+
+    Appends `-nosens` when sensitivity is skipped, so the bootstrap build
+    doesn't collide with a later sensitivity-targeted run of the same level.
 
     Examples:
         "Qwen3.5-122B-A10B" + 4 + bfloat16 -> "Qwen3.5-122B-A10B-oQ4"
@@ -1212,7 +1238,7 @@ def resolve_output_name(
         "Qwen3.5-27B" + 4 + bfloat16 + preserve_mtp -> "Qwen3.5-27B-oQ4-mtp"
     """
     pattern = re.compile(
-        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp)$",
+        r"-(oQ[\d.]+e?|[0-9]+[_-]?bit|fp\d+|bf\d+|mtp|nosens)$",
         flags=re.IGNORECASE,
     )
     base = model_name
@@ -1223,6 +1249,8 @@ def resolve_output_name(
         base = new
     level_str = f"{oq_level:g}"
     suffix = f"-oQ{level_str}{'e' if enhanced else ''}"
+    if skip_sensitivity:
+        suffix += "-nosens"
     if dtype == "float16":
         suffix += "-fp16"
     if preserve_mtp:
@@ -2938,15 +2966,18 @@ class _DiscoveredPlan:
             arr = self._materialize_source(sources[0])
             return arr.astype(info["dtype"])
 
-        if transform.startswith("transpose_"):
-            axes = [int(a) for a in transform.split("_")[1:]]
+        if transform == "transpose" or transform.startswith("transpose_"):
             arr = self._materialize_source(sources[0])
+            if transform == "transpose":
+                return mx.transpose(arr)  # legacy: full axis reverse
+            axes = tuple(int(p) for p in transform.split("_")[1:])
             return mx.transpose(arr, axes=axes)
 
-        if transform.startswith("moveaxis_"):
-            parts = transform.split("_")
-            src_ax, dst_ax = int(parts[1]), int(parts[2])
+        if transform == "moveaxis" or transform.startswith("moveaxis_"):
             arr = self._materialize_source(sources[0])
+            if transform == "moveaxis":
+                return mx.moveaxis(arr, 2, 1)  # legacy: conv1d weight permute
+            src_ax, dst_ax = (int(p) for p in transform.split("_")[1:])
             return mx.moveaxis(arr, src_ax, dst_ax)
 
         if "split_" in transform:
@@ -3093,6 +3124,11 @@ def estimate_bpw_and_size(
             "output_size_formatted": "?",
         }
 
+    try:
+        _validate_shard_set_complete(source, weight_files)
+    except ValueError as e:
+        logger.warning("estimate_bpw_and_size: shard set looks incomplete: %s", e)
+
     if preserve_mtp:
         from omlx.utils.model_loading import _checkpoint_has_mtp_weights
 
@@ -3183,17 +3219,7 @@ def estimate_bpw_and_size(
     # Build budget plan for accurate estimate (position-based sensitivity)
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
-        tc = config.get("text_config", {})
-        num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
-        pos_sens = {}
-        for i in range(num_layers):
-            if i < num_layers // 8 or i >= 7 * num_layers // 8:
-                pos_sens[str(i)] = 0.05
-            elif i < num_layers // 4 or i >= 3 * num_layers // 4:
-                pos_sens[str(i)] = 0.02
-            else:
-                pos_sens[str(i)] = 0.01
-        config["_oq_sensitivity_map"] = pos_sens
+        config["_oq_sensitivity_map"] = _positional_sensitivity_map(config)
 
         plan = _build_quant_plan(
             named_shapes,
@@ -3283,7 +3309,18 @@ def estimate_bpw_and_size(
             total_output_bytes = int(effective_bpw * total_params / 8)
 
     source_total = sum(sf.stat().st_size for sf in source.glob("*.safetensors"))
-    streaming_peak = int(source_total * 1.5) + 5 * 1024**3
+    max_shard_size = max(
+        (sf.stat().st_size for sf in source.glob("*.safetensors")),
+        default=0,
+    )
+
+    # Peak memory differs by level:
+    # - oQ8 skips sensitivity (see quantize_oq_streaming); only true streaming cost.
+    # - oQ2-oQ6 run sensitivity forward pass over the source, which dominates.
+    if oq_level == 8:
+        streaming_peak = max_shard_size * 2 + 7 * 1024**3
+    else:
+        streaming_peak = int(source_total * 1.5) + 5 * 1024**3
 
     return {
         "effective_bpw": round(effective_bpw, 2),
@@ -5331,6 +5368,56 @@ def _quantize_chunked(w, group_size, bits, mode, importance=None):
 # --- end chunked-quantize helpers ---
 
 
+_SHARD_PATTERN = re.compile(r"^model-(\d{5})-of-(\d{5})\.safetensors$")
+
+
+def _validate_shard_set_complete(source: Path, weight_files: list[Path]) -> None:
+    """Refuse to quantize from an incomplete shard set.
+
+    If model.safetensors.index.json is present, every shard it references
+    must exist. Otherwise, parse the 'model-NNNNN-of-MMMMM' naming pattern
+    and require the full 1..MMMMM range. Single-file or custom-named layouts
+    skip validation.
+
+    A partial download otherwise streams successfully through whatever
+    shards are present and produces a silently corrupt output.
+    """
+    index_path = source / "model.safetensors.index.json"
+    if index_path.exists():
+        with open(index_path) as f:
+            idx = json.load(f)
+        wm = idx.get("weight_map", {})
+        referenced = sorted({Path(v).name for v in wm.values()})
+        present = {p.name for p in weight_files}
+        missing = [r for r in referenced if r not in present]
+        if missing:
+            raise ValueError(
+                f"Incomplete model at {source}: index.json references "
+                f"{len(referenced)} shards but {len(missing)} are missing "
+                f"({', '.join(missing[:5])}{'…' if len(missing) > 5 else ''})"
+            )
+        return
+
+    matches = [_SHARD_PATTERN.match(p.name) for p in weight_files]
+    if not all(matches):
+        return
+    totals = {int(m.group(2)) for m in matches}
+    if len(totals) != 1:
+        raise ValueError(
+            f"Inconsistent shard naming at {source}: total counts {sorted(totals)}"
+        )
+    total = totals.pop()
+    present_idx = {int(m.group(1)) for m in matches}
+    missing = sorted(set(range(1, total + 1)) - present_idx)
+    if missing:
+        raise ValueError(
+            f"Incomplete model at {source}: {total} shards expected, "
+            f"missing {len(missing)} "
+            f"(indices {missing[:5]}{'…' if len(missing) > 5 else ''}). "
+            f"No model.safetensors.index.json — finish the download first."
+        )
+
+
 def quantize_oq_streaming(
     model_path: str,
     output_path: str,
@@ -5352,6 +5439,7 @@ def quantize_oq_streaming(
     imatrix_num_samples: int = 128,
     imatrix_seq_length: int = 512,
     sensitivity_map_override: dict[int | str, float] | None = None,
+    skip_sensitivity: bool = False,
 ) -> None:
     """Tensor-by-tensor quantization. Memory: ~3-4GB regardless of model size.
 
@@ -5462,13 +5550,14 @@ def quantize_oq_streaming(
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
-    output.mkdir(parents=True, exist_ok=True)
-
     cb("loading", 5.0, "Reading model config")
 
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
+    _validate_shard_set_complete(source, weight_files)
+
+    output.mkdir(parents=True, exist_ok=True)
 
     cb("loading", 8.0, "Indexing source weights")
 
@@ -5672,7 +5761,19 @@ def quantize_oq_streaming(
         # Model.sanitize which corrupts mutable state in the MTP sanitize
         # patch (weights.pop on tracked objects). Running sensitivity first
         # ensures vlm_load_model sees a pristine patch chain.
-        if sensitivity_model_path:
+        #
+        # oQ8 has no budget plan (level 8 is not in _OQ_BPW_TARGETS) and every
+        # sensitivity-driven boost in universal_quant_predicate is clamped by
+        # bits(n)=max(n, base_bits=8) — the measurement cannot change any
+        # output bits, so skip the load+forward cost and use the positional
+        # stand-in the estimator already assumes.
+        if oq_level == 8:
+            logger.info(f"oQ{oq_level:g}: sensitivity skipped (no effect at base=8)")
+            sensitivity_map = _positional_sensitivity_map(config)
+        elif skip_sensitivity:
+            logger.info(f"oQ{oq_level:g}: sensitivity skipped (skip_sensitivity=True)")
+            sensitivity_map = _positional_sensitivity_map(config)
+        elif sensitivity_model_path:
             logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
             sensitivity_map = _measure_sensitivity_from_quantized_model(
                 sensitivity_model_path,
@@ -5815,8 +5916,18 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-    config["_oq_sensitivity_map"] = {str(k): v for k, v in sensitivity_map.items()}
-    logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(sensitivity_map)} layers)")
+    finite_map = {str(k): v for k, v in sensitivity_map.items() if math.isfinite(v)}
+    if not finite_map or max(finite_map.values()) == 0.0:
+        logger.warning(
+            f"oQ{oq_level:g}: sensitivity map degenerate "
+            f"({len(sensitivity_map) - len(finite_map)} non-finite, "
+            f"max={max(finite_map.values(), default=0.0):.6f}); "
+            "falling back to position-based"
+        )
+        config["_oq_sensitivity_map"] = _positional_sensitivity_map(config)
+    else:
+        config["_oq_sensitivity_map"] = finite_map
+        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)")
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
@@ -6359,26 +6470,44 @@ def _load_builtin_calibration(
 def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: int):
     """Load calibration data from HuggingFace datasets."""
     try:
-        from datasets import load_dataset
+        from datasets import DownloadConfig, load_dataset
     except ImportError:
         raise ImportError(
             "datasets library required for non-default calibration. "
             "Install with: pip install datasets"
         )
 
+    # Fail fast on a dead/unreachable endpoint instead of burning the
+    # library's default retry budget (~60-90s per call) -- this fallback
+    # path only exists for tokenizers that need more tokens than the
+    # built-in corpus provides, so a long retry doesn't help.
+    dl_config = DownloadConfig(max_retries=0)
+
     logger.info(f"Loading calibration dataset: {dataset}")
 
     if dataset == "wikitext":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        ds = load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="test", download_config=dl_config
+        )
         texts = "\n".join(t for t in ds["text"] if t.strip())
     elif dataset == "c4":
-        ds = load_dataset("allenai/c4", "en", split="validation", streaming=True)
+        ds = load_dataset(
+            "allenai/c4",
+            "en",
+            split="validation",
+            streaming=True,
+            download_config=dl_config,
+        )
         texts = "\n".join(
             item["text"] for i, item in enumerate(ds) if i < num_samples * 2
         )
     elif dataset == "code":
         ds = load_dataset(
-            "bigcode/starcoderdata", "python", split="train", streaming=True
+            "bigcode/starcoderdata",
+            "python",
+            split="train",
+            streaming=True,
+            download_config=dl_config,
         )
         texts = "\n".join(
             item["content"] for i, item in enumerate(ds) if i < num_samples * 2
@@ -6389,7 +6518,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         all_texts = []
         for lang in langs:
             try:
-                ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
+                ds = load_dataset(
+                    "uonlp/CulturaX",
+                    lang,
+                    split="train",
+                    streaming=True,
+                    download_config=dl_config,
+                )
                 lang_texts = [
                     item["text"] for i, item in enumerate(ds) if i < per_lang * 2
                 ]
@@ -6402,7 +6537,11 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         code_texts = []
         try:
             ds = load_dataset(
-                "bigcode/starcoderdata", "python", split="train", streaming=True
+                "bigcode/starcoderdata",
+                "python",
+                split="train",
+                streaming=True,
+                download_config=dl_config,
             )
             code_texts = [item["content"] for i, item in enumerate(ds) if i < half * 2]
         except Exception:
@@ -6411,7 +6550,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         ml_texts = []
         for lang in ["en", "ko", "zh", "ja"]:
             try:
-                ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
+                ds = load_dataset(
+                    "uonlp/CulturaX",
+                    lang,
+                    split="train",
+                    streaming=True,
+                    download_config=dl_config,
+                )
                 ml_texts.extend(
                     item["text"] for i, item in enumerate(ds) if i < half // 2
                 )
@@ -7692,11 +7837,20 @@ def _measure_sensitivity_from_model(
             layer_idx=layer_idx,
         )
         if out_quant is not None:
-            raw_mse = ((out_float - out_quant) ** 2).mean()
-            out_magnitude = (out_float**2).mean()
+            diff32 = (out_float - out_quant).astype(mx.float32)
+            base32 = out_float.astype(mx.float32)
+            raw_mse = (diff32**2).mean()
+            out_magnitude = (base32**2).mean()
             mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            score = mse_val.item()
+            if math.isfinite(score):
+                sensitivity[layer_idx] = score
+            else:
+                logger.warning(
+                    f"oQ{oq_level:g}: layer {layer_idx} sensitivity is "
+                    f"non-finite ({score}); dropping from the map"
+                )
 
         _restore_saved_weights(block, saved)
 
@@ -7713,7 +7867,7 @@ def _measure_sensitivity_from_model(
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
         logger.info(
             f"oQ{oq_level:g}: layer sensitivity (descending): "
-            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+            + ", ".join(f"L{i}={s:.6f}" for i, s in ranked)
         )
 
     return sensitivity
@@ -8173,9 +8327,13 @@ def _measure_sensitivity_from_quantized_model(
             from mlx_lm.tokenizer_utils import load as load_tokenizer
             from mlx_vlm.utils import load_model as vlm_load_model
 
+            # strict=False: quantized Gemma 3n outputs carry k/v tensors for
+            # KV-shared layers the runtime class does not expose. This is a
+            # forward-only sensitivity measurement, so a partial load is fine.
             model = vlm_load_model(
                 Path(model_path),
                 lazy=True,
+                strict=False,
                 trust_remote_code=trust_remote_code,
             )
             tokenizer = load_tokenizer(Path(model_path))
@@ -8363,7 +8521,14 @@ def _measure_sensitivity_from_quantized_model(
             out_mag = (ob32**2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            score = mse_val.item()
+            if math.isfinite(score):
+                sensitivity[layer_idx] = score
+            else:
+                logger.warning(
+                    f"oQ{oq_level:g}: layer {layer_idx} sensitivity is "
+                    f"non-finite ({score}); dropping from the map"
+                )
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux
@@ -8383,7 +8548,7 @@ def _measure_sensitivity_from_quantized_model(
         ranked = sorted(sensitivity.items(), key=lambda x: -x[1])
         logger.info(
             f"oQ{oq_level:g}: proxy sensitivity (descending): "
-            + ", ".join(f"L{i}={s:.4f}" for i, s in ranked)
+            + ", ".join(f"L{i}={s:.6f}" for i, s in ranked)
         )
 
     return sensitivity

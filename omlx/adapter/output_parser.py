@@ -9,6 +9,7 @@ suppression) and exposes a uniform token-by-token interface.
 
 from __future__ import annotations
 
+import functools
 import json
 import logging
 from collections.abc import Callable
@@ -48,13 +49,34 @@ class OutputParserFinalizeResult:
 
 
 class OutputParserSession(Protocol):
-    """Protocol implemented by per-request output parser sessions."""
+    """Protocol implemented by per-request output parser sessions.
+
+    ``process_token`` and ``finalize`` are required. Two further hooks are
+    optional and discovered by capability sniffing at the call site; see
+    ``OPTIONAL_SESSION_HOOKS``.
+    """
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         """Process one generated token."""
 
     def finalize(self) -> OutputParserFinalizeResult:
         """Flush any buffered output when generation ends."""
+
+
+# Optional session hooks, looked up with getattr/hasattr rather than declared
+# on the Protocol so sessions that do not need them stay conformant:
+#
+# ``notify_prefilled_thought()`` — Scheduler._get_output_parser_session
+#   (omlx/scheduler.py:2668) calls it when the prompt already opened the
+#   model's thinking channel.
+# ``process_text(text)`` — text-lane engines (the serial diffusion lane in
+#   omlx/engine/vlm.py) feed decoded text instead of token ids; see
+#   ``select_text_parser_session``.
+#
+# A hook implemented by one session of a factory must be implemented by every
+# session that factory can produce — a getattr-dispatched hook that is missing
+# fails silently. Guarded by tests/test_output_parser.py.
+OPTIONAL_SESSION_HOOKS = ("notify_prefilled_thought", "process_text")
 
 
 @dataclass(frozen=True)
@@ -66,6 +88,10 @@ class OutputParserFactory:
     create_session_with_tools: (
         Callable[[Any, list[dict] | None], OutputParserSession] | None
     ) = None
+    # Session builder for engines that emit detokenized text instead of
+    # token ids (the serial diffusion lane). Only needed when the default
+    # ``create_session`` product lacks ``process_text``.
+    create_text_session: Callable[[Any], OutputParserSession] | None = None
     stop_token_ids: set[int] = field(default_factory=set)
     thinking_start_text: str | None = None
     thinking_start_output_text: str | None = None
@@ -77,6 +103,33 @@ class OutputParserFactory:
     # lane) preserve the token ids of these markers and let the parser
     # session remove them instead.
     protocol_marker_texts: tuple[str, ...] = ()
+
+
+def select_text_parser_session(
+    factory: OutputParserFactory, tokenizer: Any
+) -> OutputParserSession | None:
+    """Create a parser session that can consume detokenized text.
+
+    Text-lane engines (the serial diffusion lane) feed the parser text
+    segments via ``process_text`` instead of token ids. The factory's
+    default session may be token-ID based (gemma4's default), so fall back
+    to ``create_text_session`` when the default lacks ``process_text``.
+    Returns ``None`` — with a warning, since the caller has no session to
+    convert protocol structure — when neither session is text-capable.
+    """
+    session = factory.create_session(tokenizer)
+    if hasattr(session, "process_text"):
+        return session
+    if factory.create_text_session is not None:
+        session = factory.create_text_session(tokenizer)
+        if hasattr(session, "process_text"):
+            return session
+    logger.warning(
+        "output parser %r has no text-capable session; protocol output "
+        "(thought channels, tool calls) will reach clients unparsed",
+        factory.kind,
+    )
+    return None
 
 
 class HarmonyOutputParserSession:
@@ -1289,6 +1342,7 @@ def detect_output_parser(
     if is_gemma4_model(model_name, model_config):
         from .gemma4 import (
             _CLOSE_MARKER,
+            _Gemma4LegacyOutputParserSession,
             _OPEN_MARKER_BARE,
             _TOOL_RESPONSE_CLOSE,
             _TOOL_RESPONSE_OPEN,
@@ -1296,15 +1350,21 @@ def detect_output_parser(
             Gemma4OutputParserSession,
         )
 
+        legacy_session_cls: Callable[[Any], OutputParserSession] = functools.partial(
+            _Gemma4LegacyOutputParserSession, model_path=session_model_path
+        )
+
         return OutputParserFactory(
             kind="gemma4",
-            create_session=lambda session_tokenizer: Gemma4OutputParserSession(
-                session_tokenizer,
-                model_path=session_model_path,
+            create_session=functools.partial(
+                Gemma4OutputParserSession, model_path=session_model_path
             ),
+            # The token-ID session can't consume detokenized text; text-lane
+            # engines (diffusion) fall back to the legacy text-based session.
+            create_text_session=legacy_session_cls,
             stop_token_ids=set(),
             thinking_start_text="<|channel>thought",
-            thinking_start_output_text="<think>\n",
+            thinking_start_output_text="<think>",
             thinking_end_text="<channel|>",
             protocol_marker_texts=(
                 _OPEN_MARKER_BARE,

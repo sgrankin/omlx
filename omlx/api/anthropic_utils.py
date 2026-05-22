@@ -303,6 +303,7 @@ def convert_anthropic_to_internal(
                     }
                     if thinking_parts:
                         msg_dict["reasoning_content"] = "\n".join(thinking_parts)
+                        msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
                     if tool_calls:
                         msg_dict["tool_calls"] = tool_calls
                         msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
@@ -438,6 +439,7 @@ def convert_anthropic_to_internal(
             }
             if thinking_parts:
                 msg_dict["reasoning_content"] = "\n".join(thinking_parts)
+                msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
             if saw_tool_markup:
                 msg_dict[_PRESERVE_ROLE_BOUNDARY] = True
             processed_messages.append(msg_dict)
