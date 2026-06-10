@@ -7,6 +7,7 @@ Skipped when the Gemma 4 26B model is not present at MODEL_PATH.
 from __future__ import annotations
 
 import glob
+import json
 import os
 
 import pytest
@@ -15,11 +16,25 @@ from omlx.adapter.gemma4 import extract_gemma4_messages
 from omlx.api.openai_models import Message
 
 
+def _has_chat_template(path: str) -> bool:
+    if os.path.exists(os.path.join(path, "chat_template.jinja")):
+        return True
+    try:
+        with open(os.path.join(path, "tokenizer_config.json")) as f:
+            # .get(): exporters emit "chat_template": null, which a bare
+            # membership test would accept as present.
+            return bool(json.load(f).get("chat_template"))
+    except (OSError, ValueError):
+        return False
+
+
 def _find_gemma4_26b_model() -> str | None:
     pattern = os.path.join(
         os.path.expanduser("~"), ".omlx", "models", "gemma-4-26B-A4B-it*"
     )
-    matches = [p for p in glob.glob(pattern) if os.path.isdir(p)]
+    matches = sorted(
+        p for p in glob.glob(pattern) if os.path.isdir(p) and _has_chat_template(p)
+    )
     return matches[0] if matches else None
 
 
