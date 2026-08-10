@@ -12,6 +12,7 @@ base bits and add targeted routed-expert protection plus a higher bpw budget.
 import hashlib
 import json
 import logging
+import math
 import re
 import shutil
 import tempfile
@@ -104,6 +105,27 @@ _NATIVE_FLOAT8_QUANT_METHODS = frozenset(("fp8", "mxfp8"))
 def _bpw_targets_for_level(oq_level: float) -> tuple[float, float] | None:
     """Return (target_bpw, hard_cap_bpw) for the given oQ level, or None."""
     return _OQ_BPW_TARGETS.get(oq_level)
+
+
+def _positional_sensitivity_map(config: dict) -> dict[str, float]:
+    """Position-based stand-in for measured per-layer sensitivity.
+
+    Early and late layers score highest, the middle band lowest. Both
+    ``estimate_bpw_and_size`` and the measurement-skipping paths in
+    ``quantize_oq_streaming`` use this, so the advertised estimate matches the
+    plan the quantizer actually builds.
+    """
+    tc = config.get("text_config", {})
+    num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
+    scores: dict[str, float] = {}
+    for i in range(num_layers):
+        if i < num_layers // 8 or i >= 7 * num_layers // 8:
+            scores[str(i)] = 0.05
+        elif i < num_layers // 4 or i >= 3 * num_layers // 4:
+            scores[str(i)] = 0.02
+        else:
+            scores[str(i)] = 0.01
+    return scores
 
 
 def _is_deepseek_v4_config(config: dict) -> bool:
@@ -2561,7 +2583,6 @@ def _discover_sanitize_plan(sanitize_fn, lazy_index):
         "add_if_mean_lt_0_5",
         "transpose_",
         "moveaxis_",
-        "swapaxes_",
         "split_",
         "slice",
         "reshape",
@@ -2959,11 +2980,6 @@ class _DiscoveredPlan:
             src_ax, dst_ax = (int(p) for p in transform.split("_")[1:])
             return mx.moveaxis(arr, src_ax, dst_ax)
 
-        if transform.startswith("swapaxes_"):
-            arr = self._materialize_source(sources[0])
-            a, b = (int(p) for p in transform.split("_")[1:])
-            return mx.swapaxes(arr, a, b)
-
         if "split_" in transform:
             # split_N_M means take part N of M
             parts = transform.split("_")
@@ -3198,17 +3214,7 @@ def estimate_bpw_and_size(
     # Build budget plan for accurate estimate (position-based sensitivity)
     _level_targets = _bpw_targets_for_level(oq_level)
     if _level_targets is not None:
-        tc = config.get("text_config", {})
-        num_layers = config.get("num_hidden_layers") or tc.get("num_hidden_layers", 32)
-        pos_sens = {}
-        for i in range(num_layers):
-            if i < num_layers // 8 or i >= 7 * num_layers // 8:
-                pos_sens[str(i)] = 0.05
-            elif i < num_layers // 4 or i >= 3 * num_layers // 4:
-                pos_sens[str(i)] = 0.02
-            else:
-                pos_sens[str(i)] = 0.01
-        config["_oq_sensitivity_map"] = pos_sens
+        config["_oq_sensitivity_map"] = _positional_sensitivity_map(config)
 
         plan = _build_quant_plan(
             named_shapes,
@@ -5703,13 +5709,14 @@ def quantize_oq_streaming(
         # oQ8 has no budget plan (level 8 is not in _OQ_BPW_TARGETS) and every
         # sensitivity-driven boost in universal_quant_predicate is clamped by
         # bits(n)=max(n, base_bits=8) — the measurement cannot change any
-        # output bits, so skip the load+forward cost.
+        # output bits, so skip the load+forward cost and use the positional
+        # stand-in the estimator already assumes.
         if oq_level == 8:
             logger.info(f"oQ{oq_level:g}: sensitivity skipped (no effect at base=8)")
-            sensitivity_map = {}
+            sensitivity_map = _positional_sensitivity_map(config)
         elif skip_sensitivity:
             logger.info(f"oQ{oq_level:g}: sensitivity skipped (skip_sensitivity=True)")
-            sensitivity_map = {}
+            sensitivity_map = _positional_sensitivity_map(config)
         elif sensitivity_model_path:
             logger.info(f"oQ{oq_level:g}: measuring sensitivity via proxy model")
             sensitivity_map = _measure_sensitivity_from_quantized_model(
@@ -5789,12 +5796,11 @@ def quantize_oq_streaming(
                 trust_remote_code=trust_remote_code,
             )
 
-    # Single enforcement point — but only when measurement was attempted.
-    # The oq_level==8 and skip_sensitivity branches intentionally set
-    # sensitivity_map={} and want the run to proceed to position-based
-    # weighting; the inner measurement helpers also return {} on
-    # load / calibration / layer-discovery failure, which IS a hard error.
-    if oq_level != 8 and not skip_sensitivity and not sensitivity_map:
+    # Single enforcement point. Inner measurement helpers may return {} on
+    # load / calibration / layer-discovery failure; treat that as a hard
+    # error here so the rest of quantize_oq_streaming never runs without a
+    # data-driven sensitivity map.
+    if not sensitivity_map:
         _cleanup_ram_safe_proxy()
         raise RuntimeError(
             f"oQ{oq_level:g}: sensitivity measurement produced no scores. "
@@ -5854,22 +5860,18 @@ def quantize_oq_streaming(
                 logger.warning(f"Sanitize failed ({e2}), using original names")
 
     config["_oq_non_quantizable"] = _build_non_quantizable_set(config)
-    if oq_level != 8 and not skip_sensitivity:
-        finite_map = {
-            str(k): v for k, v in sensitivity_map.items() if v == v
-        }
-        if not finite_map or max(finite_map.values()) == 0.0:
-            logger.warning(
-                f"oQ{oq_level:g}: sensitivity map degenerate "
-                f"({len(sensitivity_map) - len(finite_map)} NaN, "
-                f"max={max(finite_map.values(), default=0.0):.4f}); "
-                "falling back to position-based"
-            )
-        else:
-            config["_oq_sensitivity_map"] = finite_map
-            logger.info(
-                f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)"
-            )
+    finite_map = {str(k): v for k, v in sensitivity_map.items() if math.isfinite(v)}
+    if not finite_map or max(finite_map.values()) == 0.0:
+        logger.warning(
+            f"oQ{oq_level:g}: sensitivity map degenerate "
+            f"({len(sensitivity_map) - len(finite_map)} non-finite, "
+            f"max={max(finite_map.values(), default=0.0):.6f}); "
+            "falling back to position-based"
+        )
+        config["_oq_sensitivity_map"] = _positional_sensitivity_map(config)
+    else:
+        config["_oq_sensitivity_map"] = finite_map
+        logger.info(f"oQ{oq_level:g}: sensitivity applied ({len(finite_map)} layers)")
 
     named_shapes = _collect_named_weight_shapes_from_weights(all_weights)
     if text_only:
@@ -7747,11 +7749,18 @@ def _measure_sensitivity_from_model(
         if out_quant is not None:
             diff32 = (out_float - out_quant).astype(mx.float32)
             base32 = out_float.astype(mx.float32)
-            raw_mse = (diff32 ** 2).mean()
-            out_magnitude = (base32 ** 2).mean()
+            raw_mse = (diff32**2).mean()
+            out_magnitude = (base32**2).mean()
             mse_val = raw_mse / mx.maximum(out_magnitude, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            score = mse_val.item()
+            if math.isfinite(score):
+                sensitivity[layer_idx] = score
+            else:
+                logger.warning(
+                    f"oQ{oq_level:g}: layer {layer_idx} sensitivity is "
+                    f"non-finite ({score}); dropping from the map"
+                )
 
         _restore_saved_weights(block, saved)
 
@@ -8170,27 +8179,6 @@ def _build_streaming_proxy_for_sensitivity(
     _copy_model_sidecars(source, output)
 
 
-def _vlm_load_tolerant(vlm_load_fn, model_path: Path, trust_remote_code: bool = False):
-    """Call mlx_vlm.utils.load_model with strict=False on the inner load_weights.
-
-    Quantized Gemma 3n outputs contain k/v tensors for KV-shared layers
-    that the runtime model class doesn't expose; the default strict load
-    rejects them. The proxy is a forward-only sensitivity measurement, so
-    a partial load is acceptable here.
-    """
-    orig_load = nn.Module.load_weights
-
-    def tolerant_load(self, weights, strict=True):
-        return orig_load(self, weights, strict=False)
-
-    nn.Module.load_weights = tolerant_load
-    try:
-        return vlm_load_fn(model_path, lazy=True, trust_remote_code=trust_remote_code)
-    finally:
-        nn.Module.load_weights = orig_load
-
-
-
 def _measure_sensitivity_from_quantized_model(
     model_path: str,
     config: dict,
@@ -8249,9 +8237,13 @@ def _measure_sensitivity_from_quantized_model(
             from mlx_lm.tokenizer_utils import load as load_tokenizer
             from mlx_vlm.utils import load_model as vlm_load_model
 
-            model = _vlm_load_tolerant(
-                vlm_load_model,
+            # strict=False: quantized Gemma 3n outputs carry k/v tensors for
+            # KV-shared layers the runtime class does not expose. This is a
+            # forward-only sensitivity measurement, so a partial load is fine.
+            model = vlm_load_model(
                 Path(model_path),
+                lazy=True,
+                strict=False,
                 trust_remote_code=trust_remote_code,
             )
             tokenizer = load_tokenizer(Path(model_path))
@@ -8439,7 +8431,14 @@ def _measure_sensitivity_from_quantized_model(
             out_mag = (ob32**2).mean()
             mse_val = raw_mse / mx.maximum(out_mag, 1e-10)
             mx.eval(mse_val)
-            sensitivity[layer_idx] = mse_val.item()
+            score = mse_val.item()
+            if math.isfinite(score):
+                sensitivity[layer_idx] = score
+            else:
+                logger.warning(
+                    f"oQ{oq_level:g}: layer {layer_idx} sensitivity is "
+                    f"non-finite ({score}); dropping from the map"
+                )
 
         if isinstance(position_ids, dict) and position_ids.get("kind") == "glm_moe_dsa":
             position_ids["prev_topk_indices"] = baseline_aux

@@ -62,6 +62,7 @@ from omlx.oq import (
     _normalize_sensitivity_map_override,
     _oqe_calibration_batch_plan,
     _perturb_bits_for,
+    _positional_sensitivity_map,
     _prepare_layer_inputs,
     _progress_total_bytes,
     _quantize_chunked,
@@ -708,16 +709,10 @@ class TestResolveOutputName:
         )
 
     def test_strips_nosens_suffix(self):
-        assert (
-            resolve_output_name("Model-oQ6-nosens", 4)
-            == "Model-oQ4"
-        )
+        assert resolve_output_name("Model-oQ6-nosens", 4) == "Model-oQ4"
 
     def test_strips_chained_nosens_fp16(self):
-        assert (
-            resolve_output_name("Model-oQ6-nosens-fp16", 4)
-            == "Model-oQ4"
-        )
+        assert resolve_output_name("Model-oQ6-nosens-fp16", 4) == "Model-oQ4"
 
 
 class TestOqDtypeModelSupport:
@@ -928,7 +923,6 @@ class TestSourceHasNextnTensors:
             )
             is False
         )
-
 
 
 # =============================================================================
@@ -1648,6 +1642,68 @@ class TestLevelBudgetPlan:
         # switch_mlp experts should NOT be boosted
         expert_boosts = [k for k in plan.boost_map if "switch_mlp" in k]
         assert len(expert_boosts) == 0, "Routed experts should stay at base bits"
+
+
+class TestPositionalSensitivityMap:
+    @pytest.mark.parametrize("num_layers", [4, 8, 12, 32, 40, 48, 60, 61, 80])
+    def test_matches_predicate_position_heuristic(self, num_layers):
+        """The synthesized map must select exactly the layers the position
+        fallback in universal_quant_predicate would call sensitive, so oQ8 and
+        skip-sensitivity runs produce byte-identical plans."""
+        m = _positional_sensitivity_map({"num_hidden_layers": num_layers})
+        scores = sorted(m.values(), reverse=True)
+        threshold = scores[max(0, len(scores) // 4 - 1)]
+        via_map = {i for i in range(num_layers) if m[str(i)] >= threshold}
+        via_position = {
+            i
+            for i in range(num_layers)
+            if i < num_layers // 8 or i >= 7 * num_layers // 8
+        }
+        assert via_map == via_position
+
+    def test_reads_text_config_and_defaults(self):
+        assert (
+            len(_positional_sensitivity_map({"text_config": {"num_hidden_layers": 8}}))
+            == 8
+        )
+        assert len(_positional_sensitivity_map({})) == 32
+        assert set(_positional_sensitivity_map({"num_hidden_layers": 4})) == {
+            "0",
+            "1",
+            "2",
+            "3",
+        }
+
+    @pytest.mark.parametrize("num_layers", [4, 12, 32, 61])
+    @pytest.mark.parametrize("num_experts", [0, 160, 512])
+    @pytest.mark.parametrize("oq_level", [2, 4, 6, 8])
+    def test_map_is_predicate_equivalent_to_position_fallback(
+        self, num_layers, num_experts, oq_level
+    ):
+        """Substituting the synthesized map for the position fallback must not
+        change a single predicate decision, so oQ8 and skip-sensitivity runs
+        emit the same bits/group_size/mode as before."""
+        cfg = {
+            "model_type": "llama",
+            "num_hidden_layers": num_layers,
+            "hidden_size": 4096,
+            "num_local_experts": num_experts,
+        }
+        with_map = {**cfg, "_oq_sensitivity_map": _positional_sensitivity_map(cfg)}
+        for i in range(num_layers):
+            for suffix in (
+                "self_attn.q_proj",
+                "self_attn.v_proj",
+                "self_attn.o_proj",
+                "mlp.gate_proj",
+                "mlp.down_proj",
+                "mlp.switch_mlp.down_proj",
+                "mlp.shared_expert.down_proj",
+            ):
+                path = f"model.layers.{i}.{suffix}"
+                assert universal_quant_predicate(
+                    path, None, cfg, oq_level
+                ) == universal_quant_predicate(path, None, with_map, oq_level)
 
 
 # =============================================================================
@@ -4990,6 +5046,7 @@ class TestMeasureSensitivityQuantizedVlm:
         vlm_load.assert_called_once()
         assert vlm_load.call_args.args[0] == Path("/fake/minimax-proxy")
         assert vlm_load.call_args.kwargs["lazy"] is True
+        assert vlm_load.call_args.kwargs["strict"] is False
         assert vlm_load.call_args.kwargs["trust_remote_code"] is True
         tokenizer_load.assert_called_once_with(Path("/fake/minimax-proxy"))
         lm_load.assert_not_called()
@@ -5435,6 +5492,164 @@ class TestPrecomputedSensitivityMap:
 
         with pytest.raises(expected_exc, match=expected_match or ".*"):
             quantize_oq_streaming(str(src), str(tmp_path / "out"), oq_level=4)
+
+
+@pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+class TestSkipSensitivityPositionalMap:
+    """The oQ8 and skip_sensitivity fast paths must populate a real
+    positional sensitivity map, matching what estimate_bpw_and_size already
+    assumes — not leave it unset, which made the advertised estimate
+    diverge from the plan the quantizer actually builds."""
+
+    @pytest.fixture
+    def src(self, tmp_path):
+        from safetensors.numpy import save_file as np_save
+
+        src = tmp_path / "src"
+        src.mkdir()
+        np_save(
+            {"w": np.zeros((128, 256), dtype=np.float32)},
+            str(src / "w.safetensors"),
+        )
+        (src / "config.json").write_text(
+            json.dumps(
+                {
+                    "model_type": "llama",
+                    "num_hidden_layers": 4,
+                    "hidden_size": 128,
+                    "intermediate_size": 256,
+                    "num_attention_heads": 8,
+                    "rms_norm_eps": 1e-5,
+                    "vocab_size": 256,
+                }
+            )
+        )
+        return src
+
+    def _block_measurement(self, monkeypatch, _oq):
+        for name in (
+            "_measure_sensitivity",
+            "_measure_sensitivity_from_quantized_model",
+            "_build_proxy_for_sensitivity",
+        ):
+            monkeypatch.setattr(
+                _oq, name, MagicMock(side_effect=RuntimeError("should not call"))
+            )
+
+    def test_skip_sensitivity_populates_positional_map(
+        self, src, tmp_path, monkeypatch
+    ):
+        from omlx import oq as _oq
+
+        self._block_measurement(monkeypatch, _oq)
+
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            skip_sensitivity=True,
+            auto_proxy_sensitivity=False,
+        )
+
+        assert len(captured_configs) == 1
+        expected = _positional_sensitivity_map({"num_hidden_layers": 4})
+        assert captured_configs[0]["_oq_sensitivity_map"] == expected
+        assert expected
+
+    def test_oq8_populates_positional_map(self, src, tmp_path, monkeypatch):
+        from omlx import oq as _oq
+
+        self._block_measurement(monkeypatch, _oq)
+
+        seen = []
+        orig = _oq._build_non_quantizable_set
+
+        def _capture_non_quantizable(cfg):
+            seen.append(cfg)
+            return orig(cfg)
+
+        monkeypatch.setattr(_oq, "_build_non_quantizable_set", _capture_non_quantizable)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=8,
+            auto_proxy_sensitivity=False,
+        )
+
+        expected = _positional_sensitivity_map({"num_hidden_layers": 4})
+        assert seen
+        assert seen[0]["_oq_sensitivity_map"] == expected
+
+    def test_degenerate_map_falls_back_to_positional(self, src, tmp_path, monkeypatch):
+        from omlx import oq as _oq
+
+        monkeypatch.setattr(
+            _oq,
+            "_measure_sensitivity",
+            MagicMock(return_value={0: 0.0, 1: 0.0, 2: 0.0, 3: 0.0}),
+        )
+
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            auto_proxy_sensitivity=False,
+        )
+
+        assert len(captured_configs) == 1
+        expected = _positional_sensitivity_map({"num_hidden_layers": 4})
+        assert captured_configs[0]["_oq_sensitivity_map"] == expected
+
+    def test_non_finite_scores_are_dropped(self, src, tmp_path, monkeypatch):
+        from omlx import oq as _oq
+
+        monkeypatch.setattr(
+            _oq,
+            "_measure_sensitivity",
+            MagicMock(return_value={0: float("nan"), 1: float("inf"), 2: 0.5, 3: 0.1}),
+        )
+
+        captured_configs = []
+        original_build_plan = _oq._build_quant_plan
+
+        def _capture_build_plan(named_shapes, config, oq_level, **kwargs):
+            captured_configs.append(dict(config))
+            return original_build_plan(named_shapes, config, oq_level, **kwargs)
+
+        monkeypatch.setattr(_oq, "_build_quant_plan", _capture_build_plan)
+
+        out = tmp_path / "out"
+        quantize_oq_streaming(
+            str(src),
+            str(out),
+            oq_level=4,
+            auto_proxy_sensitivity=False,
+        )
+
+        assert len(captured_configs) == 1
+        assert captured_configs[0]["_oq_sensitivity_map"] == {"2": 0.5, "3": 0.1}
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
