@@ -38,6 +38,10 @@ _HF_API_TIMEOUT = 10
 # Seconds with no download progress before considering the download stalled.
 _STALL_TIMEOUT = 300
 
+# Bound on the size-estimating dry run (seconds). See the comment at its
+# call site for why this can't reap the underlying thread on timeout.
+_DRY_RUN_TIMEOUT = 120
+
 # Cache of (configured_endpoint -> resolved_endpoint) so we only probe each
 # endpoint once per process lifetime. Mirrors like hf-mirror.com permanently
 # 308-redirect to huggingface.co when accessed from IPs outside their region;
@@ -873,19 +877,36 @@ class HFDownloader:
 
                 # Get accurate total size via dry run so the progress
                 # denominator matches what will actually be downloaded.
-                # No asyncio.wait_for wrapper: it cannot cancel the
-                # underlying thread, so its timeout would just spawn a
-                # second snapshot_download racing on the HF cache and
-                # block shutdown. etag_timeout in dl_kwargs bounds the
-                # per-request network waits inside the thread itself.
+                # Bounded by wait_for: a mirror that accepts the TCP
+                # connection and then never answers (etag_timeout only
+                # bounds requests that actually get a response) would
+                # otherwise hang the task forever. wait_for cannot kill
+                # the to_thread worker itself, so on timeout the thread
+                # leaks and keeps running in the background rather than
+                # being reaped -- accepted here because the alternative,
+                # falling through to the real download, would race a
+                # second snapshot_download against it on the same
+                # local_dir.
                 size_estimated = False
                 try:
-                    dry_result = await asyncio.to_thread(
-                        snapshot_download,
-                        **dl_kwargs,
-                        dry_run=True,
+                    dry_result = await asyncio.wait_for(
+                        asyncio.to_thread(
+                            snapshot_download,
+                            **dl_kwargs,
+                            dry_run=True,
+                        ),
+                        timeout=_DRY_RUN_TIMEOUT,
                     )
                     task.total_size = sum(f.file_size for f in dry_result)
+                except TimeoutError:
+                    task.status = DownloadStatus.FAILED
+                    task.error = (
+                        f"Dry run timed out after {_DRY_RUN_TIMEOUT}s for "
+                        f"{task.repo_id}. The HF endpoint may be unreachable "
+                        "or stalled."
+                    )
+                    logger.error(f"Dry run timed out for {task.repo_id}")
+                    return
                 except Exception as e:
                     if st_estimate:
                         task.total_size = st_estimate
@@ -1008,7 +1029,12 @@ class HFDownloader:
                 if task.status != DownloadStatus.DOWNLOADING:
                     break
 
-                current_size = self._get_dir_size(target_dir)
+                # rglob over a large partial download can take a while on a
+                # stalled or slow filesystem; run it off the event loop so
+                # it can't block other coroutines (including cancellation).
+                current_size = await asyncio.to_thread(
+                    self._get_dir_size, target_dir
+                )
                 task.downloaded_size = current_size
 
                 if task.total_size > 0:
@@ -1022,7 +1048,9 @@ class HFDownloader:
                     last_size = current_size
                     last_activity_at = time.time()
                 else:
-                    latest_mtime = self._get_latest_mtime(target_dir)
+                    latest_mtime = await asyncio.to_thread(
+                        self._get_latest_mtime, target_dir
+                    )
                     if latest_mtime > last_activity_at:
                         last_activity_at = latest_mtime
 

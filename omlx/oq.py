@@ -6359,26 +6359,44 @@ def _load_builtin_calibration(
 def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: int):
     """Load calibration data from HuggingFace datasets."""
     try:
-        from datasets import load_dataset
+        from datasets import DownloadConfig, load_dataset
     except ImportError:
         raise ImportError(
             "datasets library required for non-default calibration. "
             "Install with: pip install datasets"
         )
 
+    # Fail fast on a dead/unreachable endpoint instead of burning the
+    # library's default retry budget (~60-90s per call) -- this fallback
+    # path only exists for tokenizers that need more tokens than the
+    # built-in corpus provides, so a long retry doesn't help.
+    dl_config = DownloadConfig(max_retries=0)
+
     logger.info(f"Loading calibration dataset: {dataset}")
 
     if dataset == "wikitext":
-        ds = load_dataset("wikitext", "wikitext-2-raw-v1", split="test")
+        ds = load_dataset(
+            "wikitext", "wikitext-2-raw-v1", split="test", download_config=dl_config
+        )
         texts = "\n".join(t for t in ds["text"] if t.strip())
     elif dataset == "c4":
-        ds = load_dataset("allenai/c4", "en", split="validation", streaming=True)
+        ds = load_dataset(
+            "allenai/c4",
+            "en",
+            split="validation",
+            streaming=True,
+            download_config=dl_config,
+        )
         texts = "\n".join(
             item["text"] for i, item in enumerate(ds) if i < num_samples * 2
         )
     elif dataset == "code":
         ds = load_dataset(
-            "bigcode/starcoderdata", "python", split="train", streaming=True
+            "bigcode/starcoderdata",
+            "python",
+            split="train",
+            streaming=True,
+            download_config=dl_config,
         )
         texts = "\n".join(
             item["content"] for i, item in enumerate(ds) if i < num_samples * 2
@@ -6389,7 +6407,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         all_texts = []
         for lang in langs:
             try:
-                ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
+                ds = load_dataset(
+                    "uonlp/CulturaX",
+                    lang,
+                    split="train",
+                    streaming=True,
+                    download_config=dl_config,
+                )
                 lang_texts = [
                     item["text"] for i, item in enumerate(ds) if i < per_lang * 2
                 ]
@@ -6402,7 +6426,11 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         code_texts = []
         try:
             ds = load_dataset(
-                "bigcode/starcoderdata", "python", split="train", streaming=True
+                "bigcode/starcoderdata",
+                "python",
+                split="train",
+                streaming=True,
+                download_config=dl_config,
             )
             code_texts = [item["content"] for i, item in enumerate(ds) if i < half * 2]
         except Exception:
@@ -6411,7 +6439,13 @@ def _load_hf_calibration(tokenizer, dataset: str, num_samples: int, seq_length: 
         ml_texts = []
         for lang in ["en", "ko", "zh", "ja"]:
             try:
-                ds = load_dataset("uonlp/CulturaX", lang, split="train", streaming=True)
+                ds = load_dataset(
+                    "uonlp/CulturaX",
+                    lang,
+                    split="train",
+                    streaming=True,
+                    download_config=dl_config,
+                )
                 ml_texts.extend(
                     item["text"] for i, item in enumerate(ds) if i < half // 2
                 )

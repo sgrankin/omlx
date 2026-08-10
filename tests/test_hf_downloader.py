@@ -895,6 +895,86 @@ class TestHFDownloader:
         assert task.status == DownloadStatus.COMPLETED
         assert task.error == ""
 
+    @pytest.mark.asyncio
+    async def test_poller_started_before_dry_run_completes(self, model_dir):
+        """The progress poller must be running while dry_run is still in flight."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-poller", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        dry_run_started = threading.Event()
+        release_dry_run = threading.Event()
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                dry_run_started.set()
+                release_dry_run.wait(timeout=5)
+                return []
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ):
+            run_task = asyncio.create_task(
+                downloader._run_download(task.task_id, "")
+            )
+            await asyncio.to_thread(dry_run_started.wait, 5)
+
+            assert task.task_id in downloader._progress_tasks
+            assert not downloader._progress_tasks[task.task_id].done()
+
+            release_dry_run.set()
+            await run_task
+
+    @pytest.mark.asyncio
+    async def test_dry_run_timeout_fails_task_without_starting_real_download(
+        self, model_dir
+    ):
+        """A dry_run that never returns must FAIL the task, not fall through
+        to the real download (which would race two snapshot_downloads)."""
+        model_dir.mkdir(parents=True, exist_ok=True)
+        downloader = HFDownloader(model_dir=str(model_dir))
+
+        task = DownloadTask(task_id="t-dry-timeout", repo_id="owner/model")
+        downloader._tasks[task.task_id] = task
+
+        mock_api = MagicMock()
+        mock_info = MagicMock()
+        mock_info.safetensors = {}
+        mock_api.model_info.return_value = mock_info
+
+        real_download_called = threading.Event()
+
+        def fake_snapshot_download(**kwargs):
+            if kwargs.get("dry_run"):
+                # Never returns within the (patched, short) timeout.
+                time.sleep(0.3)
+                return []
+            real_download_called.set()
+
+        with patch(
+            "omlx.admin.hf_downloader._get_hf_api",
+            return_value=(mock_api, None),
+        ), patch(
+            "omlx.admin.hf_downloader.snapshot_download",
+            side_effect=fake_snapshot_download,
+        ), patch("omlx.admin.hf_downloader._DRY_RUN_TIMEOUT", 0.05):
+            await downloader._run_download(task.task_id, "")
+
+        assert task.status == DownloadStatus.FAILED
+        assert "timed out" in task.error.lower()
+        assert not real_download_called.is_set()
+
 
 # =============================================================================
 # API Routes Tests
