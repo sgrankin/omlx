@@ -349,6 +349,22 @@ def _unpatch_attention_capture(model, originals):
         _set_attn_module(model.layers[layer_idx], orig)
 
 
+def _resolve_boundary_capture(cache, capture_snapshot_fn, needs_capture_fn):
+    """Capture callback to use for ``cache``, or None to disable capture.
+
+    A fully sliceable draft cache (plain KVCache) is rebuilt by slicing the
+    final state, so boundary snapshots buy nothing — while block-aligned
+    chunking costs one model() call per block_size tokens instead of per
+    prefill_step_size (8x at the defaults, plus a full cache extraction
+    every block).
+    """
+    if capture_snapshot_fn is None:
+        return None
+    if needs_capture_fn is not None and not needs_capture_fn(cache):
+        return None
+    return capture_snapshot_fn
+
+
 def _prefill_draft(
     model,
     tokens,
@@ -357,22 +373,19 @@ def _prefill_draft(
     progress_callback=None,
     block_size: Optional[int] = None,
     starting_offset: int = 0,
-    capture_fn: Optional[Callable[[List[Any]], Any]] = None,
-) -> Tuple[Any, Dict[int, Any]]:
-    """Prefill draft model with all prompt tokens.
+    capture_fn: Optional[Callable[[List[Any], int], None]] = None,
+):
+    """Prefill draft model with all prompt tokens. Returns last logits.
 
     When ``block_size`` and ``capture_fn`` are both provided, chunks are
     shrunk as needed to land on every block boundary in the absolute token
-    sequence (starting_offset + processed) so that ``capture_fn`` can record
-    a per-boundary cache snapshot. The returned ``snapshots`` dict is keyed
-    by absolute token position (``starting_offset + processed``) and holds
-    whatever ``capture_fn`` returned. Returns (last_logits, snapshots).
+    sequence (starting_offset + processed), and ``capture_fn(cache, end_pos)``
+    is invoked at each boundary to record a per-boundary cache snapshot.
     """
     prompt = mx.array(tokens) if not isinstance(tokens, mx.array) else tokens
     n = len(tokens)
     processed = 0
-    snapshots: Dict[int, Any] = {}
-    capture = block_size is not None and capture_fn is not None
+    capture = capture_fn is not None and block_size is not None and block_size > 0
 
     while n - processed > 1:
         chunk_max = min(step_size, n - processed - 1)
@@ -396,7 +409,7 @@ def _prefill_draft(
         if capture:
             end_pos = starting_offset + processed
             if end_pos % block_size == 0:
-                snapshots[end_pos] = capture_fn(cache)
+                capture_fn(cache, end_pos)
         mx.clear_cache()
 
     logits = model(prompt[processed:][None], cache=cache)
@@ -406,8 +419,8 @@ def _prefill_draft(
     if capture:
         end_pos = starting_offset + n
         if end_pos % block_size == 0:
-            snapshots[end_pos] = capture_fn(cache)
-    return logits, snapshots
+            capture_fn(cache, end_pos)
+    return logits
 
 
 def _lookahead_decode(model, first_logits, cache, n_steps, temp=0.6, top_p=0.95):
@@ -499,8 +512,9 @@ def score_tokens(
     existing_cache_tokens: Optional[int] = None,
     progress_callback: Optional[Callable[[int, int, str], None]] = None,
     block_size: Optional[int] = None,
-    capture_snapshot_fn: Optional[Callable[[List[Any]], Any]] = None,
-) -> Tuple[mx.array, Any, Dict[int, Any]]:
+    capture_snapshot_fn: Optional[Callable[[List[Any], int], None]] = None,
+    needs_capture_fn: Optional[Callable[[List[Any]], bool]] = None,
+) -> Tuple[mx.array, Any]:
     """Score token importance using attention patterns on a draft model.
 
     Pipeline:
@@ -530,15 +544,16 @@ def score_tokens(
             the callback is invoked after each one. Enables per-block
             boundary snapshots for non-sliceable caches so prefix-cache
             fetches at arbitrary block counts reconstruct correctly.
-        capture_snapshot_fn: callable taking the live cache list and
-            returning an opaque snapshot to record. Only invoked at block
+        capture_snapshot_fn: ``(cache, end_pos) -> None``, invoked at each
+            block boundary to record a snapshot. Only invoked at block
             boundaries.
+        needs_capture_fn: predicate on the resolved draft cache; capture is
+            skipped entirely when it returns False, which also removes
+            block-aligned chunk clamping.
 
     Returns:
-        (importance, cache, boundary_snapshots) — importance scores (M,),
-        the draft cache for storage in paged cache, and a dict mapping
-        absolute-token-position to the snapshot returned by
-        ``capture_snapshot_fn`` (empty when capture is disabled).
+        (importance, cache) — importance scores (M,) and the draft cache
+        for storage in paged cache.
     """
     from mlx_lm.models.cache import make_prompt_cache
 
@@ -563,7 +578,6 @@ def score_tokens(
         query_extractor = _detect_query_extractor(attn_obj)
 
     # Phase 1: Prefill (full or suffix-only if cache provided)
-    boundary_snapshots: Dict[int, Any] = {}
     if existing_cache is not None:
         cache = existing_cache
         if existing_cache_tokens is not None:
@@ -572,7 +586,7 @@ def score_tokens(
             cached_len = cache[0].offset if hasattr(cache[0], "offset") else 0
         suffix = tokens[cached_len:]
         if suffix:
-            logits, boundary_snapshots = _prefill_draft(
+            logits = _prefill_draft(
                 model,
                 suffix,
                 cache,
@@ -584,7 +598,9 @@ def score_tokens(
                 ),
                 block_size=block_size,
                 starting_offset=cached_len,
-                capture_fn=capture_snapshot_fn,
+                capture_fn=_resolve_boundary_capture(
+                    cache, capture_snapshot_fn, needs_capture_fn
+                ),
             )
         else:
             # Exact cache hit — run last token to get logits
@@ -592,7 +608,7 @@ def score_tokens(
             mx.eval(logits)
     else:
         cache = make_prompt_cache(model)
-        logits, boundary_snapshots = _prefill_draft(
+        logits = _prefill_draft(
             model,
             tokens,
             cache,
@@ -604,7 +620,9 @@ def score_tokens(
             ),
             block_size=block_size,
             starting_offset=0,
-            capture_fn=capture_snapshot_fn,
+            capture_fn=_resolve_boundary_capture(
+                cache, capture_snapshot_fn, needs_capture_fn
+            ),
         )
 
     # Snapshot cache state before lookahead so we can restore afterwards.
@@ -665,7 +683,7 @@ def score_tokens(
     del logits, query_buffer, attn_caches
     mx.clear_cache()
 
-    return importance, cache, boundary_snapshots
+    return importance, cache
 
 
 def select_chunks(

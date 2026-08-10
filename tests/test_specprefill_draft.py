@@ -77,6 +77,7 @@ class _DraftCache:
         self.preloads: list[Any] = []
         self.reconstructions: list[Any] = []
         self.stores: list[tuple[str, list[int], list[Any], Any]] = []
+        self.boundary_snapshots: list[Any] = []
 
     def fetch_cache(self, request_id: str, tokens: list[int]) -> tuple[Any, list[int]]:
         self.fetches.append((request_id, list(tokens)))
@@ -103,6 +104,7 @@ class _DraftCache:
         self.stores.append(
             (request_id, list(tokens), cache_data, model_cache_config)
         )
+        self.boundary_snapshots.append(boundary_snapshots)
 
 
 def _request_and_plan() -> tuple[Request, Any]:
@@ -136,6 +138,8 @@ def _run(
     draft_cache: _DraftCache | None = None,
     score_tokens: Callable[..., Any] | None = None,
     extract_cache_states: Callable[[list[Any]], tuple[list[dict[str, Any]], Any]] | None = None,
+    block_size: int | None = None,
+    snapshot_layers: Callable[..., Any] | None = None,
 ) -> tuple[_Tracker, _Logger, dict[str, Any]]:
     tracker = _Tracker()
     logger = _Logger()
@@ -145,10 +149,9 @@ def _run(
 
     def default_score_tokens(
         model: Any, tokens: list[int], **kwargs: Any
-    ) -> tuple[Any, list[str], dict[int, Any]]:
+    ) -> tuple[Any, list[str]]:
         trace["score_calls"].append(kwargs)
-        # oMLX's score_tokens also returns per-block boundary snapshots.
-        return mx.zeros(plan.n_to_score), ["draft-cache"], {}
+        return mx.zeros(plan.n_to_score), ["draft-cache"]
 
     def select_chunks(importance: Any, keep_pct: float) -> Any:
         return selected_indices
@@ -177,6 +180,8 @@ def _run(
             extract_cache_states=extract_cache_states or (lambda cache: ([], None)),
             sync_and_clear_cache=lambda: trace["syncs"].append(stream),
             log=logger,
+            block_size=block_size,
+            snapshot_layers=snapshot_layers,
         )
     trace["selected_indices"] = selected_indices
     trace["stream"] = stream
@@ -259,3 +264,76 @@ def test_scoring_error_clears_request_and_tracker():
     assert logger.error_messages == [
         "SpecPrefill scoring failed, falling back to normal path: boom"
     ]
+
+
+def test_boundary_snapshots_forwarded_to_store_cache():
+    """A non-sliceable draft cache accumulates capture_fn calls, then stores them."""
+    request, plan = _request_and_plan()
+    draft_cache = _DraftCache()
+
+    def fake_score_tokens(
+        model: Any, tokens: list[int], **kwargs: Any
+    ) -> tuple[Any, list[str]]:
+        kwargs["capture_snapshot_fn"](["live"], 256)
+        return mx.zeros(plan.n_to_score), ["draft-cache"]
+
+    def extract_cache_states(cache: list[Any]) -> tuple[list[dict[str, Any]], Any]:
+        return [{"state": "snap"}], object()
+
+    _run(
+        request,
+        plan,
+        draft_cache=draft_cache,
+        score_tokens=fake_score_tokens,
+        extract_cache_states=extract_cache_states,
+        block_size=256,
+        snapshot_layers=lambda cache: [None, "arrays"],
+    )
+
+    assert draft_cache.boundary_snapshots == [{256: [{"state": "snap"}]}]
+
+
+def test_sliceable_draft_cache_disables_capture():
+    """snapshot_layers -> None disables capture; the callback is a no-op."""
+    request, plan = _request_and_plan()
+    draft_cache = _DraftCache()
+    captured: dict[str, Any] = {}
+
+    def fake_score_tokens(
+        model: Any, tokens: list[int], **kwargs: Any
+    ) -> tuple[Any, list[str]]:
+        captured["needs_capture"] = kwargs["needs_capture_fn"](["live"])
+        kwargs["capture_snapshot_fn"](["live"], 256)
+        return mx.zeros(plan.n_to_score), ["draft-cache"]
+
+    _run(
+        request,
+        plan,
+        draft_cache=draft_cache,
+        score_tokens=fake_score_tokens,
+        extract_cache_states=lambda cache: ([{"state": "x"}], None),
+        block_size=256,
+        snapshot_layers=lambda cache: None,
+    )
+
+    assert captured["needs_capture"] is False
+    # capture_snapshot_fn no-ops when the draft cache is sliceable, so even
+    # though extracted_cache is non-empty and store_cache runs, no per-boundary
+    # entries were ever recorded (empty dict collapses via `or None`).
+    assert draft_cache.boundary_snapshots == [None]
+
+
+def test_no_snapshot_layers_disables_capture():
+    """Without snapshot_layers, needs_capture_fn always reports False."""
+    request, plan = _request_and_plan()
+    captured: dict[str, Any] = {}
+
+    def fake_score_tokens(
+        model: Any, tokens: list[int], **kwargs: Any
+    ) -> tuple[Any, list[str]]:
+        captured["needs_capture"] = kwargs["needs_capture_fn"](["live"])
+        return mx.zeros(plan.n_to_score), ["draft-cache"]
+
+    _run(request, plan, score_tokens=fake_score_tokens)
+
+    assert captured["needs_capture"] is False

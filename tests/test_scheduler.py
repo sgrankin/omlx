@@ -6170,3 +6170,34 @@ class TestExtractCacheStatesFreeze:
         ac_snapshot = snap_state[1]
         assert isinstance(ac_snapshot, list)
         assert float(mx.sum(ac_snapshot[0]).item()) == 15.0
+
+
+class TestSpecprefillSnapshotLayers:
+    """_specprefill_snapshot_layers gates and blanks like the main prefill path."""
+
+    def test_all_sliceable_returns_none(self):
+        from mlx_lm.models.cache import KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        result = _specprefill_snapshot_layers([KVCache(), KVCache()])
+        assert result is None
+
+    def test_mixed_blanks_sliceable_layers(self):
+        from mlx_lm.models.cache import ArraysCache, KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        kv = KVCache()
+        arrays = ArraysCache(size=2)
+        result = _specprefill_snapshot_layers([kv, arrays])
+        assert result == [None, arrays]
+
+    def test_cache_list_layer_is_not_blanked(self):
+        from mlx_lm.models.cache import ArraysCache, CacheList, KVCache
+
+        from omlx.scheduler import _specprefill_snapshot_layers
+
+        cl = CacheList(KVCache(), ArraysCache(size=2))
+        result = _specprefill_snapshot_layers([cl])
+        assert result == [cl]

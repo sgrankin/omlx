@@ -1027,3 +1027,109 @@ class TestLookaheadSnapshotRestore:
         self._snapshot_and_restore([cl], mutate)
         assert kv.offset == pre_kv_offset
         assert id(inner.cache[0]) == pre_arr_id
+
+
+class TestPrefillDraftBoundaryCapture:
+    """Block-aligned chunking is opt-in: only when a capture_fn is supplied."""
+
+    @staticmethod
+    def _model_and_cache(chunks):
+        class _Cache:
+            def __init__(self):
+                self.state = mx.zeros((1,))
+
+        def model(arr, cache=None):
+            chunks.append(arr.shape[1])
+            return mx.zeros((1, arr.shape[1], 4))
+
+        return model, [_Cache()]
+
+    def test_no_capture_fn_uses_full_step_size(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        model, cache = self._model_and_cache(chunks)
+        result = _prefill_draft(
+            model, list(range(600)), cache, step_size=512, block_size=256
+        )
+        assert chunks == [512, 87, 1]
+        assert not isinstance(result, tuple)
+
+    def test_capture_fn_clamps_chunks_to_block_boundaries(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        result = _prefill_draft(
+            model,
+            list(range(600)),
+            cache,
+            step_size=512,
+            block_size=256,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert chunks == [256, 256, 87, 1]
+        assert seen == [256, 512]
+        assert not isinstance(result, tuple)
+
+    def test_starting_offset_aligns_absolute_positions(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        _prefill_draft(
+            model,
+            list(range(600)),
+            cache,
+            step_size=512,
+            block_size=256,
+            starting_offset=100,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert chunks == [156, 256, 187, 1]
+        assert seen == [256, 512]
+
+    def test_zero_block_size_disables_capture(self):
+        from omlx.patches.specprefill import _prefill_draft
+
+        chunks = []
+        seen = []
+        model, cache = self._model_and_cache(chunks)
+        _prefill_draft(
+            model,
+            list(range(10)),
+            cache,
+            step_size=4,
+            block_size=0,
+            capture_fn=lambda c, pos: seen.append(pos),
+        )
+        assert seen == []
+
+
+class TestResolveBoundaryCapture:
+    """Truth table for the capture-gate helper."""
+
+    def test_none_callback_returns_none(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        assert _resolve_boundary_capture(object(), None, lambda c: True) is None
+
+    def test_needs_capture_false_returns_none(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, lambda c: False) is None
+
+    def test_needs_capture_true_returns_callback(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, lambda c: True) is callback
+
+    def test_needs_capture_none_returns_callback(self):
+        from omlx.patches.specprefill import _resolve_boundary_capture
+
+        callback = lambda c, pos: None  # noqa: E731
+        assert _resolve_boundary_capture(object(), callback, None) is callback
