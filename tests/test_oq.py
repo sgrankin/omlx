@@ -71,6 +71,7 @@ from omlx.oq import (
     _source_has_nextn_tensors,
     _TrackedTensor,
     _validate_oq_dtype_for_model,
+    _validate_shard_set_complete,
     _uses_minimax_mxfp8_scale_inv_source,
     estimate_bpw_and_size,
     estimate_memory,
@@ -3826,6 +3827,80 @@ class TestEstimateBpwHeaderOnly:
         assert (
             with_mtp["output_size_bytes"] - without["output_size_bytes"] == 64 * 64 * 2
         )
+
+
+class TestValidateShardSetComplete:
+    """Pure filesystem/JSON checks -- no tensors, no mlx needed."""
+
+    def test_index_present_missing_shard_raises(self, tmp_path):
+        d = tmp_path / "model"
+        d.mkdir()
+        (d / "model-00001-of-00002.safetensors").touch()
+        # model-00002-of-00002.safetensors is referenced but never written.
+        index = {
+            "weight_map": {
+                "layer.0.weight": "model-00001-of-00002.safetensors",
+                "layer.1.weight": "model-00002-of-00002.safetensors",
+            }
+        }
+        (d / "model.safetensors.index.json").write_text(json.dumps(index))
+        weight_files = sorted(d.glob("*.safetensors"))
+        with pytest.raises(ValueError, match="Incomplete model"):
+            _validate_shard_set_complete(d, weight_files)
+
+    def test_index_complete_passes(self, tmp_path):
+        d = tmp_path / "model"
+        d.mkdir()
+        (d / "model-00001-of-00002.safetensors").touch()
+        (d / "model-00002-of-00002.safetensors").touch()
+        index = {
+            "weight_map": {
+                "layer.0.weight": "model-00001-of-00002.safetensors",
+                "layer.1.weight": "model-00002-of-00002.safetensors",
+            }
+        }
+        (d / "model.safetensors.index.json").write_text(json.dumps(index))
+        weight_files = sorted(d.glob("*.safetensors"))
+        _validate_shard_set_complete(d, weight_files)  # must not raise
+
+    def test_pattern_only_gap_raises(self, tmp_path):
+        d = tmp_path / "model"
+        d.mkdir()
+        (d / "model-00001-of-00003.safetensors").touch()
+        (d / "model-00003-of-00003.safetensors").touch()
+        # model-00002-of-00003.safetensors missing, no index.json present.
+        weight_files = sorted(d.glob("*.safetensors"))
+        with pytest.raises(ValueError, match="Incomplete model"):
+            _validate_shard_set_complete(d, weight_files)
+
+    def test_single_file_passes(self, tmp_path):
+        d = tmp_path / "model"
+        d.mkdir()
+        (d / "model.safetensors").touch()
+        weight_files = sorted(d.glob("*.safetensors"))
+        _validate_shard_set_complete(d, weight_files)  # must not raise
+
+    def test_mixed_custom_names_skipped_passes(self, tmp_path):
+        d = tmp_path / "model"
+        d.mkdir()
+        (d / "model-00001-of-00002.safetensors").touch()
+        (d / "custom_extra.safetensors").touch()
+        # Not every file matches the NNNNN-of-MMMMM pattern, so the
+        # pattern-based check is skipped entirely -- even though this would
+        # be an incomplete shard-2-of-2 set if considered.
+        weight_files = sorted(d.glob("*.safetensors"))
+        _validate_shard_set_complete(d, weight_files)  # must not raise
+
+    @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")
+    def test_incomplete_source_leaves_no_output_dir(self, tmp_path):
+        src = tmp_path / "src"
+        src.mkdir()
+        (src / "config.json").write_text(json.dumps({"model_type": "llama"}))
+        (src / "model-00001-of-00002.safetensors").touch()
+        out = tmp_path / "out"
+        with pytest.raises(ValueError, match="Incomplete model"):
+            quantize_oq_streaming(str(src), str(out), oq_level=4)
+        assert not out.exists()
 
 
 @pytest.mark.skipif(not HAS_MLX, reason="MLX not available")

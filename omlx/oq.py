@@ -3093,6 +3093,11 @@ def estimate_bpw_and_size(
             "output_size_formatted": "?",
         }
 
+    try:
+        _validate_shard_set_complete(source, weight_files)
+    except ValueError as e:
+        logger.warning("estimate_bpw_and_size: shard set looks incomplete: %s", e)
+
     if preserve_mtp:
         from omlx.utils.model_loading import _checkpoint_has_mtp_weights
 
@@ -5367,8 +5372,7 @@ def _validate_shard_set_complete(source: Path, weight_files: list[Path]) -> None
     totals = {int(m.group(2)) for m in matches}
     if len(totals) != 1:
         raise ValueError(
-            f"Inconsistent shard naming at {source}: total counts "
-            f"{sorted(totals)}"
+            f"Inconsistent shard naming at {source}: total counts {sorted(totals)}"
         )
     total = totals.pop()
     present_idx = {int(m.group(1)) for m in matches}
@@ -5513,14 +5517,14 @@ def quantize_oq_streaming(
         )
     config["_oq_use_budget_plan"] = oq_level in _OQ_BPW_TARGETS
 
-    output.mkdir(parents=True, exist_ok=True)
-
     cb("loading", 5.0, "Reading model config")
 
     weight_files = sorted(source.glob("*.safetensors"))
     if not weight_files:
         raise ValueError(f"No .safetensors files found in {model_path}")
     _validate_shard_set_complete(source, weight_files)
+
+    output.mkdir(parents=True, exist_ok=True)
 
     cb("loading", 8.0, "Indexing source weights")
 
