@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for block compile (omlx/patches/block_compile.py).
 
-block_compile mx.compiles the per-layer feed-forward submodules. These
+block_compile mx.compiles the per-layer feed-forward submodules. It is
+opt-in (``ModelSettings.block_compile_enabled``, default off). These
 tests exercise the compile-and-dispatch mechanism on a synthetic pure
 module — fast, but they touch MLX ops, so run with the sandbox disabled.
 """
+
+from types import SimpleNamespace
 
 import mlx.core as mx
 import mlx.nn as nn
@@ -82,3 +85,91 @@ def test_apply_block_compile_noop_without_targets():
             self.lin = nn.Linear(8, 8)
 
     assert apply_block_compile(Tiny()) == 0
+
+
+class _ScaledFFN(nn.Module):
+    """A submodule whose __call__ takes a defaulted keyword arg."""
+
+    def __init__(self, dim: int = 16):
+        super().__init__()
+        self.lin = nn.Linear(dim, dim, bias=False)
+
+    def __call__(self, x, scale=1.0):
+        return self.lin(x) * scale
+
+
+def test_shim_passes_kwargs_through_to_original():
+    """A keyword-arg call falls through to the original, uncompiled path."""
+    mx.random.seed(2)
+    m = _ScaledFFN()
+    x = mx.random.normal((1, 4, 16))
+
+    expected = m(x, scale=2.0)
+    mx.eval(expected)
+
+    assert _attach_compiled(m) is True
+
+    out = m(x, scale=2.0)
+    mx.eval(out)
+    assert mx.allclose(expected, out, atol=1e-5, rtol=1e-5)
+
+
+def test_shim_falls_back_on_arity_mismatch():
+    """A call with fewer positional args than the compiled arity falls back."""
+    mx.random.seed(3)
+    m = _ScaledFFN()
+    x = mx.random.normal((1, 4, 16))
+
+    expected = m(x)  # default scale=1.0
+    mx.eval(expected)
+
+    assert _attach_compiled(m) is True  # compiled for arity 2 (x, scale)
+
+    out = m(x)  # single positional arg — must not raise
+    mx.eval(out)
+    assert mx.allclose(expected, out, atol=1e-5, rtol=1e-5)
+
+
+def test_block_compile_not_applied_by_default(monkeypatch):
+    """apply_post_load_transforms must not compile unless explicitly enabled."""
+    import omlx.patches.block_compile as bc_mod
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    calls = []
+
+    def _counting(model):
+        calls.append(1)
+        return 0
+
+    monkeypatch.setattr(bc_mod, "apply_block_compile", _counting)
+    apply_post_load_transforms(object(), None)
+    apply_post_load_transforms(
+        object(),
+        SimpleNamespace(index_cache_freq=None, steering_vectors=None),
+    )
+
+    assert calls == []
+
+
+def test_block_compile_applied_when_setting_enabled(monkeypatch):
+    """apply_post_load_transforms compiles when block_compile_enabled=True."""
+    import omlx.patches.block_compile as bc_mod
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    calls = []
+
+    def _counting(model):
+        calls.append(1)
+        return 0
+
+    monkeypatch.setattr(bc_mod, "apply_block_compile", _counting)
+    apply_post_load_transforms(
+        object(),
+        SimpleNamespace(
+            block_compile_enabled=True,
+            index_cache_freq=None,
+            steering_vectors=None,
+        ),
+    )
+
+    assert calls == [1]

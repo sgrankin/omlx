@@ -2,9 +2,10 @@
 """Smoke-test the production wiring of the decode-perf post-load transforms.
 
 Loads a real MoE model and runs it through omlx's apply_post_load_transforms
-(the actual engine load-path hook), confirming the gate+up fusion AND the
-block compile both fire and the decoded tokens are unchanged vs a
-pre-transform baseline.
+(the actual engine load-path hook). Gate+up fusion now runs separately, in
+the engine (omlx.patches.qwen35_moe_gate_up), so this only exercises block
+compile here; it confirms decoded tokens are unchanged vs a pre-transform
+baseline.
 """
 
 from __future__ import annotations
@@ -44,12 +45,15 @@ def main():
     base = decode(model, prompt_ids, 32)
 
     # The real engine hook.
+    from types import SimpleNamespace
+
     from omlx.utils.model_loading import apply_post_load_transforms
-    from omlx.patches.gateup_fuse import _FUSED_ATTR
     from omlx.patches.block_compile import _COMPILED_ATTR
 
     print("Running apply_post_load_transforms ...")
-    apply_post_load_transforms(model, model_settings=None)
+    apply_post_load_transforms(
+        model, model_settings=SimpleNamespace(block_compile_enabled=True)
+    )
 
     # Count fused SwitchGLU + block-compiled feed-forward submodules.
     from mlx_lm.models.switch_layers import SwitchGLU
@@ -58,8 +62,7 @@ def main():
     mods = list(root.modules())
     glu_total = sum(1 for m in mods if isinstance(m, SwitchGLU))
     glu_fused = sum(
-        1 for m in mods
-        if isinstance(m, SwitchGLU) and getattr(m, _FUSED_ATTR, None) is not None
+        1 for m in mods if isinstance(m, SwitchGLU) and hasattr(m, "gate_up_proj")
     )
     blk = sum(1 for m in mods if getattr(m, _COMPILED_ATTR, None) is not None)
     print(f"  SwitchGLU gate+up fused: {glu_fused}/{glu_total}")

@@ -58,14 +58,17 @@ def main():
 
     if mode == "transformed":
         # Production order: transforms applied at load, before any decode.
+        from types import SimpleNamespace
+
         from omlx.utils.model_loading import apply_post_load_transforms
-        from omlx.patches.gateup_fuse import _FUSED_ATTR
         from omlx.patches.block_compile import _COMPILED_ATTR
 
-        apply_post_load_transforms(model, model_settings=None)
+        apply_post_load_transforms(
+            model, model_settings=SimpleNamespace(block_compile_enabled=True)
+        )
         root = getattr(_text_model(model), "model", _text_model(model))
         mods = list(root.modules())
-        n_gu = sum(1 for m in mods if getattr(m, _FUSED_ATTR, None) is not None)
+        n_gu = sum(1 for m in mods if hasattr(m, "gate_up_proj"))
         n_bc = sum(1 for m in mods if getattr(m, _COMPILED_ATTR, None) is not None)
         print(f"[{mode}] gate+up fused={n_gu}  block-compiled={n_bc}")
 

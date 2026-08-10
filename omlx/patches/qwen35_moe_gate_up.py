@@ -46,9 +46,10 @@ logger = logging.getLogger(__name__)
 _CALL_PATCHED = False
 
 # Loaded model classes whose module path marks a supported SwitchGLU family
-# (mlx_lm qwen3_5 / qwen3_5_moe, the omlx single-checkpoint MTP wrapper, and
-# the vendored laguna module).
-_FAMILY_TOKENS = ("qwen3_5", "qwen3_6", "qwen35", "laguna")
+# (mlx_lm qwen3_5 / qwen3_5_moe, the omlx single-checkpoint MTP wrapper, the
+# vendored laguna module, and gemma4 — mlx-lm gemma4/gemma4_text and mlx-vlm
+# gemma4 hold a stock SwitchGLU at Experts.switch_glu).
+_FAMILY_TOKENS = ("qwen3_5", "qwen3_6", "qwen35", "laguna", "gemma4")
 
 
 def _is_supported_family(model: Any) -> bool:

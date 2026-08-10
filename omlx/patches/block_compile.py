@@ -5,7 +5,7 @@ The transformer block's post-attention feed-forward path is a chain of
 many small ops (norms, residual adds, gate/router, expert matmuls). Each
 is its own MLX dispatch; collapsing the chain into one compiled graph
 removes the Python-level per-op dispatch overhead. Worth ~1-2% decode
-throughput on MoE models.
+throughput on MoE models. Opt-in via ``ModelSettings.block_compile_enabled``.
 
 WHY THE SUBMODULE, NOT THE WHOLE BLOCK
 --------------------------------------
@@ -19,9 +19,12 @@ This version instead compiles the feed-forward **submodule**
 (``mlp`` / ``experts``), which neither MTP nor anything else patches. It
 composes cleanly: MTP keeps owning ``DecoderLayer.__call__``; the layer
 still calls ``self.mlp(...)`` / ``self.experts(...)``, which now dispatch
-a compiled graph. It also composes with the gate+up fusion — when
-``mx.compile`` traces the MoE block it traces through the already-fused
-``SwitchGLU`` (a ``gather_qmm`` over captured-constant fused weights).
+a compiled graph. It also composes with the (upstream, engine-side)
+gate+up fusion regardless of patch application order: ``mx.compile``
+traces lazily on first forward, which happens after the engine has
+already rewritten the ``SwitchGLU``, so the compiled trace captures the
+fused ``gather_qmm`` (over captured-constant fused weights) no matter
+when this patch was applied relative to the fusion.
 
 The feed-forward submodules are pure (no cache, no in-place state — the
 KV cache lives in attention), so compiling them is token-identical.
@@ -49,6 +52,8 @@ _COMPILED_ATTR = "_omlx_block_compiled"
 # Class-level markers set when the dispatch shim / saved original are installed.
 _PATCHED_FLAG = "_omlx_block_compile_patched"
 _ORIG_CALL = "_omlx_block_orig_call"
+# Per-instance positional arity the compiled forward was built for.
+_ARITY_ATTR = "_omlx_block_compile_arity"
 
 
 def _patch_class(cls: type) -> None:
@@ -63,11 +68,18 @@ def _patch_class(cls: type) -> None:
 
     original = cls.__call__
 
-    def patched(self, *args):
+    def patched(self, *args, **kwargs):
+        # The compiled closure is built for one exact positional arity and
+        # takes no keywords (mx.compile keys its trace cache on the wrapped
+        # signature). Anything else falls through to the original.
         fn = getattr(self, _COMPILED_ATTR, None)
-        if fn is not None:
+        if (
+            fn is not None
+            and not kwargs
+            and len(args) == getattr(self, _ARITY_ATTR, -1)
+        ):
             return fn(*args)
-        return original(self, *args)
+        return original(self, *args, **kwargs)
 
     setattr(cls, _ORIG_CALL, original)
     cls.__call__ = patched
@@ -107,6 +119,7 @@ def _attach_compiled(module: Any) -> bool:
         return False  # unsupported arity — leave on the original path
 
     _patch_class(cls)
+    object.__setattr__(module, _ARITY_ATTR, n_args)
     object.__setattr__(module, _COMPILED_ATTR, mx.compile(_forward))
     return True
 

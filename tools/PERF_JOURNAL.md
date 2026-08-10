@@ -489,3 +489,22 @@ heavy warmup or the number undershoots.
   ~+5% on top, token-id'l, MTP-safe
 - both auto-detected (dense models / non-target classes: no-op)
 - tests: test_gateup_fuse.py, test_block_compile.py
+
+### REVISED — code review fixes (2026-08-10)
+Upstream independently shipped the same gate+up idea
+(omlx/patches/qwen35_moe_gate_up.py, issue #2238) with three things ours
+lacked: it patches mlx_vlm's MTP verify helper too, it frees memory
+per-layer during fusion (_sync_and_clear_cache, bounds the load-time RAM
+transient), and fused weights live as a real `gate_up_proj` parameter
+(visible to parameters()/set_dtype/save) instead of a closure. Deleted
+gateup_fuse.py and test_gateup_fuse.py; added "gemma4" to upstream's
+_FAMILY_TOKENS so it also covers that family. block_compile.py is no
+longer default-on — it's gated behind the new
+ModelSettings.block_compile_enabled (default False; no admin UI yet).
+
+Coverage regression, deliberate but worth flagging: upstream's fusion is
+gated to _FAMILY_TOKENS = (qwen3_5, qwen3_6, qwen35, laguna, gemma4); the
+deleted fork fusion applied to any SwitchGLU. MoE families outside that
+list — deepseek_v3, glm, qwen3_moe, gpt_oss, mixtral — lose the ~10%
+decode win on this fork until upstream (or a follow-up patch here) widens
+the family list.

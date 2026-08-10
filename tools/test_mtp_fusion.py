@@ -125,7 +125,7 @@ def main():
         return toks
 
     print("\n=== Backbone decode on the MTP-loaded model ===")
-    print("    baseline vs apply_post_load_transforms (gate+up + block-compile)")
+    print("    baseline vs apply_post_load_transforms (block-compile)")
     decode(8)  # warmup — JIT/compile before timing
     base_runs = []
     for _ in range(3):
@@ -137,16 +137,18 @@ def main():
           f"({'/'.join(f'{r:.2f}' for r in base_runs)})")
 
     # Run the REAL engine hook on the MTP-loaded model. This applies
-    # gate+up fusion + block compile on top of the already-applied MTP
-    # patches — the exact production composition we need to verify.
+    # block compile on top of the already-applied MTP patches — the exact
+    # production composition we need to verify. (Gate+up fusion now runs
+    # separately, in the engine, via omlx.patches.qwen35_moe_gate_up.)
     from omlx.utils.model_loading import apply_post_load_transforms
-    from omlx.patches.gateup_fuse import _FUSED_ATTR
     from omlx.patches.block_compile import _COMPILED_ATTR
 
-    apply_post_load_transforms(model, model_settings=None)
+    apply_post_load_transforms(
+        model, model_settings=SimpleNamespace(block_compile_enabled=True)
+    )
     root = getattr(text_model, "model", text_model)
     mods = list(root.modules())
-    n_gu = sum(1 for m in mods if getattr(m, _FUSED_ATTR, None) is not None)
+    n_gu = sum(1 for m in mods if hasattr(m, "gate_up_proj"))
     n_bc = sum(1 for m in mods if getattr(m, _COMPILED_ATTR, None) is not None)
     print(f"  apply_post_load_transforms: gate+up={n_gu}, block-compile={n_bc}")
 

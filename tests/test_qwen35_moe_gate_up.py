@@ -28,6 +28,13 @@ class _FakeOtherModel:
 _FakeOtherModel.__module__ = "mlx_lm.models.deepseek_v3"
 
 
+class _FakeGemma4Model:
+    pass
+
+
+_FakeGemma4Model.__module__ = "mlx_vlm.models.gemma4.gemma4"
+
+
 def _make_model(quantize=True, model_cls=_FakeQwenModel, n_blocks=2):
     mx.random.seed(7)
     blocks = []
@@ -136,6 +143,37 @@ def test_laguna_family_fused_bit_exact():
     out = model(x)
     mx.eval(out)
     assert mx.array_equal(ref, out).item()
+
+
+def test_gemma4_family_fused_bit_exact():
+    """Gemma 4 Experts hold a stock SwitchGLU with a GeGLU activation."""
+    lang = pytest.importorskip("mlx_vlm.models.gemma4.language")
+
+    mx.random.seed(13)
+    glu = SwitchGLU(HIDDEN, INTER, E, activation=lang.GeGLU(), bias=False)
+    glu.gate_proj = glu.gate_proj.to_quantized(32, 4)
+    glu.up_proj = glu.up_proj.to_quantized(32, 4)
+    glu.down_proj = glu.down_proj.to_quantized(32, 4)
+
+    model = _FakeGemma4Model()
+    model.named_modules = lambda: [("experts.switch_glu", glu)]
+
+    x = (mx.random.normal(shape=(1, 1, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx = mx.random.randint(0, E, shape=(1, 1, TOPK))
+    # 40 tokens x top-2 = 80 indices >= 64 exercises the sorted branch too.
+    x_sorted = (mx.random.normal(shape=(1, 40, HIDDEN)) * 0.5).astype(mx.bfloat16)
+    idx_sorted = mx.random.randint(0, E, shape=(1, 40, TOPK))
+    ref, ref_sorted = glu(x, idx), glu(x_sorted, idx_sorted)
+    mx.eval(ref, ref_sorted)
+
+    assert apply_qwen35_moe_gate_up_fusion(model) == 1
+    assert hasattr(glu, "gate_up_proj")
+    assert not hasattr(glu, "gate_proj")
+
+    out, out_sorted = glu(x, idx), glu(x_sorted, idx_sorted)
+    mx.eval(out, out_sorted)
+    assert mx.array_equal(ref, out).item()
+    assert mx.array_equal(ref_sorted, out_sorted).item()
 
 
 def test_env_kill_switch(monkeypatch):

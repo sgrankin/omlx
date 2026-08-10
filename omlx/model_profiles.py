@@ -104,6 +104,9 @@ EXCLUDED_FROM_PROFILES = frozenset(
         "ttl_seconds",
         # Security flag must be explicit per model — never propagated via profiles.
         "trust_remote_code",
+        # Load-time perf experiment; no admin UI. Must be set explicitly per
+        # model, never propagated through profiles or templates.
+        "block_compile_enabled",
     }
 )
 

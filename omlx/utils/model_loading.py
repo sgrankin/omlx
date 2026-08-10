@@ -1061,7 +1061,8 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     - Bonsai t5: free unused bias tensors (the symmetric t5 kernels never
       read them; the repacked safetensors carries them for format compat)
     - IndexCache: skip redundant indexer computation in DSA layers
-    - gate+up fusion: collapse MoE SwitchGLU gate/up matmuls (decode perf)
+    - block compile: mx.compile the per-layer feed-forward submodules
+      (opt-in via ``block_compile_enabled``)
 
     Args:
         model: A loaded mlx-lm model instance.
@@ -1082,28 +1083,28 @@ def apply_post_load_transforms(model: Any, model_settings: Any = None) -> Any:
     except Exception:
         logger.debug("t5 bias free skipped", exc_info=True)
 
-    # gate+up matmul fusion for MoE SwitchGLU layers: always applied,
-    # auto-detected (dense models have no SwitchGLU and are untouched;
-    # token-identical to the unfused path). ~10% decode throughput on MoE.
-    from ..patches.gateup_fuse import apply_gateup_fusion
-
-    n_gateup = apply_gateup_fusion(model)
-    if n_gateup:
-        logger.info("gate+up fusion applied to %d SwitchGLU layers", n_gateup)
-
-    # Block compile: mx.compile the per-layer feed-forward submodules to
-    # remove Python per-op dispatch overhead. Runs AFTER gate+up so the
-    # compiled MoE trace captures the already-fused SwitchGLU. Composes
-    # with native MTP (it patches the mlp/experts submodules, not
-    # DecoderLayer.__call__ which MTP owns). Token-identical.
-    from ..patches.block_compile import apply_block_compile
-
-    n_blocks = apply_block_compile(model)
-    if n_blocks:
-        logger.info("Block compile applied to %d feed-forward submodules", n_blocks)
-
     if model_settings is None:
         return model
+
+    if getattr(model_settings, "block_compile_enabled", False):
+        # mx.compile the per-layer feed-forward submodules to remove Python
+        # per-op dispatch overhead (~1-2% decode on MoE). Opt-in. Composes
+        # with native MTP: it patches the mlp/experts submodules, not
+        # DecoderLayer.__call__, which MTP owns. Compilation is lazy, so the
+        # first forward traces whatever weight layout the engine ended up
+        # with — the gate+up fusion may run before or after this call
+        # depending on engine (engine/batched.py: after; engine/vlm.py and
+        # engine/dflash.py: before).
+        try:
+            from ..patches.block_compile import apply_block_compile
+
+            n_blocks = apply_block_compile(model)
+            if n_blocks:
+                logger.info(
+                    "Block compile applied to %d feed-forward submodules", n_blocks
+                )
+        except Exception:
+            logger.debug("Block compile skipped", exc_info=True)
 
     index_cache_freq = getattr(model_settings, "index_cache_freq", None)
     if index_cache_freq is not None and index_cache_freq >= 2:
