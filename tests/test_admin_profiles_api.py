@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Tests for admin profile/template API routes."""
 
+import json
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
@@ -701,32 +703,61 @@ class TestActiveProfileDriftClearing:
         assert r.status_code == 200
         assert r.json()["settings"].get("active_profile_name") is None
 
-    def test_active_preserved_when_disabled_field_varies_between_null_and_zero(
-        self, client
+    def test_legacy_unset_marker_canonicalized_preserves_active_profile(
+        self, client, tmp_path
     ):
-        # UI's formValuesForProfile stores null for disabled toggles, but
-        # saveModelSettings sends 0 for the same disabled state. The two
-        # shouldn't count as drift.
-        c, _ = client
-        c.post("/admin/api/models/model-a/profiles", json={
-            "name": "coding", "display_name": "Coding",
-            "settings": {
-                "temperature": 0.7,
-                "thinking_budget_tokens": None,
-                "max_tool_result_tokens": None,
-                "index_cache_freq": None,
-            },
-        })
+        """A profile record written before profiles canonicalized "unset"
+        markers can have an explicit "" (or None) value on disk for a field
+        that current code always omits — `save_profile`/`update_profile`
+        both run settings through `filter_profile_fields`, which drops None
+        and "" — so going through the API can't reproduce a legacy record;
+        it has to be constructed directly.
+
+        `_load_profiles` must strip such markers on load. Without that
+        canonicalization, `reasoning_parser: ""` stays in the stored
+        profile. `current_settings.reasoning_parser` defaults to None, and
+        `ModelSettings.to_dict()` drops None fields, so "reasoning_parser"
+        is absent from `candidate` in routes.py's drift check. That trips
+        the `key not in candidate` branch — which unconditionally treats a
+        missing key as drift, never reaching any value-equivalence check —
+        clearing `active_profile_name` on the very first save afterward,
+        even one that never touches reasoning_parser.
+        """
+        c, mgr = client
+        now = "2024-01-01T00:00:00+00:00"
+        # Bypass save_profile's filter_profile_fields (which would drop the
+        # "" itself) to plant a legacy on-disk shape directly.
+        mgr._profiles["model-a"] = {
+            "coding": {
+                "name": "coding",
+                "display_name": "Coding",
+                "api_name": "coding",
+                "description": None,
+                "created_at": now,
+                "updated_at": now,
+                "settings": {"temperature": 0.7, "reasoning_parser": ""},
+                "source_template": None,
+                "expose_as_model": False,
+            }
+        }
+        mgr._save_profiles()
+
+        # Fresh manager over the same directory: this is where
+        # _load_profiles' migration/canonicalization runs.
+        mgr2 = ModelSettingsManager(tmp_path)
+        assert mgr2._profiles["model-a"]["coding"]["settings"] == {"temperature": 0.7}
+
+        on_disk = json.loads(mgr2.profiles_file.read_text(encoding="utf-8"))
+        assert on_disk["profiles"]["model-a"]["coding"]["settings"] == {
+            "temperature": 0.7
+        }
+
+        admin_routes._get_settings_manager = lambda: mgr2
+
         c.post("/admin/api/models/model-a/profiles/coding/apply")
-        r = c.put(
-            "/admin/api/models/model-a/settings",
-            json={
-                "temperature": 0.7,
-                "thinking_budget_tokens": 0,
-                "max_tool_result_tokens": 0,
-                "index_cache_freq": 0,
-            },
-        )
+        # Save an unrelated field — reasoning_parser is untouched and stays
+        # at its None default — this must NOT be seen as drift.
+        r = c.put("/admin/api/models/model-a/settings", json={"temperature": 0.7})
         assert r.status_code == 200
         assert r.json()["settings"]["active_profile_name"] == "coding"
 

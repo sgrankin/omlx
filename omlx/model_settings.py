@@ -689,6 +689,22 @@ class ModelSettingsManager:
                         del settings["ttl_seconds"]
                         changed = True
                         model_changed = True
+                    if settings:
+                        # Legacy records may carry explicit None/"" "unset"
+                        # markers; canonicalize by dropping them so saved
+                        # settings (which never contain these) can compare
+                        # equal to the profile without a separate
+                        # equivalence helper. Numeric 0 is a real value
+                        # (e.g. min_p=0) and is left alone.
+                        cleaned = {
+                            k: v
+                            for k, v in settings.items()
+                            if v is not None and v != ""
+                        }
+                        if cleaned != settings:
+                            profile["settings"] = cleaned
+                            changed = True
+                            model_changed = True
                     current_api_name = profile.get("api_name")
                     if current_api_name:
                         try:
