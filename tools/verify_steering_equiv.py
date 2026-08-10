@@ -16,9 +16,9 @@ import mlx.core as mx
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
+import omlx.patches.steering as steering_mod
 from omlx.cli import _load_steering_model
 from omlx.patches.steering import (
-    _SteeredLayer,
     apply_steering_patch,
     model_hidden_size,
     remove_steering_patch,
@@ -26,13 +26,13 @@ from omlx.patches.steering import (
 from omlx.steering import SteeringSpec, SteeringVector
 
 
-def _legacy_steer(self: _SteeredLayer, h: mx.array) -> mx.array:
-    if self._steer_add is not None:
-        add = self._steer_add
+def _legacy_steer(layer: Any, h: mx.array) -> mx.array:
+    if layer._steer_add is not None:
+        add = layer._steer_add
         if add.dtype != h.dtype:
             add = add.astype(h.dtype)
         h = h + add
-    for unit, strength in self._steer_proj:
+    for unit, strength in layer._steer_proj:
         u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
         coeff = (h * u).sum(axis=-1, keepdims=True)
         h = h - strength * coeff * u
@@ -116,17 +116,20 @@ def main() -> int:
             SteeringSpec(vector=v2, strength=args.strength, mode="project"),
         ]),
     ]
-    saved_steer = _SteeredLayer._steer
+    # ``_steered_call`` resolves ``_steer`` from module globals at call time,
+    # so rebinding the module attribute (not a class attribute — there is no
+    # wrapper class anymore) redirects every steered layer.
+    saved_steer = steering_mod._steer
     all_ok = True
     for label, specs in configs:
         apply_steering_patch(model, specs)
 
         # In-tree (compile-fused) path.
-        _SteeredLayer._steer = saved_steer
+        steering_mod._steer = saved_steer
         in_tree = _decode(model, tokenizer, prompt_ids, args.tokens)
 
         # Legacy direct loop.
-        _SteeredLayer._steer = _legacy_steer
+        steering_mod._steer = _legacy_steer
         legacy = _decode(model, tokenizer, prompt_ids, args.tokens)
 
         matches = in_tree == legacy

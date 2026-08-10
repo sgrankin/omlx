@@ -1,10 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Monkey-patch: apply a steering vector to a loaded mlx-lm / mlx-vlm model.
 
-Each transformer block is wrapped so that, after it produces its
-residual-stream output ``h``, one or more steering specs are applied —
-an additive bias and/or directional projections (see
-:class:`~omlx.steering.SteeringSpec` and :class:`_SteeredLayer`).
+Each transformer block's *class* is swapped for a per-base-class steered
+subclass so that, after the block produces its residual-stream output
+``h``, one or more steering specs are applied — an additive bias and/or
+directional projections (see :class:`~omlx.steering.SteeringSpec` and
+:func:`_steer_block`).
 
 Applied once at load time by ``apply_post_load_transforms`` and reversible
 via :func:`remove_steering_patch`, so a cached model object can be re-used
@@ -13,6 +14,7 @@ without steering after the setting is cleared.
 
 from __future__ import annotations
 
+import contextlib
 import logging
 from typing import Any
 
@@ -55,7 +57,8 @@ def _residual_dtype(container: Any) -> Any:
     dtype is the model's compute dtype even on int4/int8 checkpoints.
     Falls back to ``fp32`` when no norm module is found (e.g. on
     synthetic test blocks): correct but slower (per-call downcast in
-    ``_SteeredLayer._steer``). Real models hit the probe path.
+    :func:`_steer`, the module-level steering body). Real models hit the
+    probe path.
     """
     layers = getattr(container, "layers", None) or []
     if not layers:
@@ -115,8 +118,97 @@ def model_hidden_size(model: Any) -> int | None:
     return None
 
 
-class _SteeredLayer(nn.Module):
-    """Wraps a transformer block, steering its residual-stream output.
+# Cache of base class -> steered subclass. One subclass per block class is
+# enough; all per-layer state lives on the instance.
+_STEERED_CLASS_CACHE: dict[type, type] = {}
+
+
+def _steer(layer: Any, h: mx.array) -> mx.array:
+    """Apply ``layer``'s steering to a residual-stream tensor.
+
+    Module-level rather than a method so the class swap in
+    :func:`_steered_class` stays a two-line trampoline, and so the dev tools
+    under ``tools/`` can A/B alternative bodies by rebinding this name.
+    """
+    fn = layer._steer_fn
+    if fn is not None:
+        try:
+            return fn(h)
+        except Exception as e:  # noqa: BLE001 — perf path must never fail a forward
+            # shapeless compilation covers a changing sequence length but not
+            # a changing rank. Drop to the traced-Python body permanently for
+            # this layer rather than failing the forward pass.
+            logger.warning(
+                "steering: compiled projection body failed (%s); "
+                "falling back to the uncompiled path",
+                e,
+            )
+            object.__setattr__(layer, "_steer_fn", None)
+    body = layer._steer_body
+    if body is not None:
+        return body(h)
+    # Add-only layer (or no-op). Steering data is pre-cast to the model's
+    # compute dtype at patch time (see apply_steering_patch); the cast here is
+    # a safety net for the rare path where set_dtype() ran after the patch.
+    add = layer._steer_add
+    if add is not None:
+        return h + (add if add.dtype == h.dtype else add.astype(h.dtype))
+    return h
+
+
+def _steered_class(cls: type) -> type:
+    """Return (and memoize) a subclass of ``cls`` that steers its output."""
+    steered = _STEERED_CLASS_CACHE.get(cls)
+    if steered is not None:
+        return steered
+
+    def _steered_call(self, *args: Any, **kwargs: Any) -> Any:
+        # Resolved dynamically (not closed over at mint time) so a later
+        # class-level __call__ shim on the base class — e.g.
+        # patches/block_compile.py's ``cls.__call__ = patched`` — is still
+        # picked up by every steered instance, including ones minted before
+        # the shim runs.
+        base_call = type(self)._omlx_steer_base.__call__
+        out = base_call(self, *args, **kwargs)
+        # A block returns either the hidden state directly or a tuple whose
+        # first element is the hidden state (some architectures also return
+        # cache/aux entries).
+        if isinstance(out, tuple):
+            return (_steer(self, out[0]),) + tuple(out[1:])
+        return _steer(self, out)
+
+    steered = type(
+        f"Steered{cls.__name__}",
+        (cls,),
+        {"__call__": _steered_call, "_omlx_steer_base": cls},
+    )
+    _STEERED_CLASS_CACHE[cls] = steered
+    return steered
+
+
+def is_steered(obj: Any) -> bool:
+    """True when ``obj`` is a transformer block carrying a steering patch."""
+    return getattr(type(obj), "_omlx_steer_base", None) is not None
+
+
+def _unsteer_block(block: Any) -> Any:
+    """Restore ``block``'s original class and drop its steering state."""
+    base = getattr(type(block), "_omlx_steer_base", None)
+    if base is None:
+        return block
+    block.__class__ = base
+    for name in ("_steer_add", "_steer_proj", "_steer_body", "_steer_fn"):
+        with contextlib.suppress(AttributeError):
+            object.__delattr__(block, name)
+    return block
+
+
+def _steer_block(
+    block: Any,
+    add_bias: mx.array | None,
+    projections: list[tuple[mx.array, float]],
+) -> Any:
+    """Steer ``block``'s residual-stream output in place; returns ``block``.
 
     Applies, in order, an optional additive bias and any number of
     directional projections::
@@ -128,98 +220,70 @@ class _SteeredLayer(nn.Module):
     this layer; projections are kept separate because they are not linear in
     the activation. See :func:`apply_steering_patch`.
 
-    A real ``nn.Module`` (not a bare proxy): the wrapped block is registered
-    as a child module, so its parameters stay visible to MLX's tree
-    traversal — ``parameters()``, ``set_dtype``, weight save — even though
-    the wrapper sits in the model's ``.layers`` list for the model's whole
-    lifetime. Unlike the transient ``_AttentionCapture`` in
-    ``patches/specprefill`` (removed in a ``finally``), this patch is
-    persistent, so correct parameter tracking matters.
+    The block's *class* is swapped for a steered subclass rather than the
+    block being wrapped in a proxy object. A proxy delegates reads but
+    swallows writes — ``patches/specprefill`` installs its attention capture
+    with ``layer.self_attn = module`` and ``Scheduler.deep_reset`` clears
+    ``layer.cache``; both silently no-opped against a wrapper. The swap also
+    leaves parameter paths and ``isinstance`` dispatch pointing at the real
+    block.
 
-    Steering data is stored via ``object.__setattr__`` so MLX does not
-    register it as a trainable parameter — it is fixed configuration, not a
-    weight, and must not be quantized or serialised with the model.
+    Steering data is stored with ``object.__setattr__`` so MLX does not
+    register it as a parameter — it is fixed configuration, not a weight, and
+    must not be quantized or serialised with the model.
     """
+    _unsteer_block(block)
+    proj_copy = [(u, float(s)) for u, s in projections]
+    body = None
+    compiled = None
+    # Build a compiled forward fn for the projection chain. Each projection
+    # contributes (mul, sum, mul, sub) — four dispatches — and at P ×
+    # N_layers per forward pass that adds up to a 3–20 % decode regression on
+    # tested models (Qwen3.6, Gemma 4). mx.compile traces the loop into a
+    # single graph with the projection arrays as constants. shapeless=True so
+    # prefill ([B, S, D]) and decode ([B, 1, D]) share one trace instead of
+    # retracing per sequence length; the body is elementwise plus a last-axis
+    # reduction, so it is rank- but not shape-dependent. Add-only layers are
+    # not compiled: the trace cost exceeds the saving on a single elementwise
+    # op.
+    if proj_copy:
+        add_const = add_bias
 
-    def __init__(
-        self,
-        block: Any,
-        add_bias: mx.array | None,
-        projections: list[tuple[mx.array, float]],
-    ):
-        super().__init__()
-        # Register the block as a dict-child directly: when it is a real
-        # nn.Module, MLX's traversal recurses into it for parameters();
-        # when it is a plain object it is just a leaf entry.
-        self["block"] = block
-        object.__setattr__(self, "_steer_add", add_bias)
-        object.__setattr__(self, "_steer_proj", projections)
-        # Build a compiled forward fn for the projection chain. Each
-        # projection contributes (mul, sum, mul, sub) — four dispatches —
-        # and at P × N_layers per forward pass that adds up to a 3–20 %
-        # decode regression on tested models (Qwen3.6, Gemma 4). mx.compile
-        # traces the loop into a single graph captured per-instance with
-        # the projection arrays as constants, removing the per-op Python /
-        # dispatch overhead. Add-only layers are not compiled: the trace
-        # cost exceeds the saving on a single elementwise op.
-        if projections:
-            proj_copy = [(u, float(s)) for u, s in projections]
-            add_const = add_bias
+        if add_const is not None:
 
-            if add_const is not None:
-                def _body(h: mx.array) -> mx.array:
-                    a = add_const if add_const.dtype == h.dtype else add_const.astype(h.dtype)
-                    h = h + a
-                    for unit, strength in proj_copy:
-                        u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
-                        coeff = (h * u).sum(axis=-1, keepdims=True)
-                        h = h - strength * coeff * u
-                    return h
-            else:
-                def _body(h: mx.array) -> mx.array:
-                    for unit, strength in proj_copy:
-                        u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
-                        coeff = (h * u).sum(axis=-1, keepdims=True)
-                        h = h - strength * coeff * u
-                    return h
+            def body(h: mx.array) -> mx.array:
+                a = (
+                    add_const
+                    if add_const.dtype == h.dtype
+                    else add_const.astype(h.dtype)
+                )
+                h = h + a
+                for unit, strength in proj_copy:
+                    u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
+                    coeff = (h * u).sum(axis=-1, keepdims=True)
+                    h = h - strength * coeff * u
+                return h
 
-            object.__setattr__(self, "_steer_fn", mx.compile(_body))
         else:
-            object.__setattr__(self, "_steer_fn", None)
 
-    def _steer(self, h: mx.array) -> mx.array:
-        # Compiled fast path: projection-bearing layers go through the
-        # mx.compile-fused body built in __init__.
-        if self._steer_fn is not None:
-            return self._steer_fn(h)
-        # Add-only layer (or no-op). Direct path, no compile overhead.
-        # Steering data is pre-cast to the model's compute dtype at patch
-        # time (see apply_steering_patch); the cast here is a safety net
-        # for the rare path where set_dtype() ran after the patch.
-        if self._steer_add is not None:
-            add = self._steer_add
-            if add.dtype != h.dtype:
-                add = add.astype(h.dtype)
-            h = h + add
-        return h
+            def body(h: mx.array) -> mx.array:
+                for unit, strength in proj_copy:
+                    u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
+                    coeff = (h * u).sum(axis=-1, keepdims=True)
+                    h = h - strength * coeff * u
+                return h
 
-    def __call__(self, *args: Any, **kwargs: Any) -> Any:
-        out = self["block"](*args, **kwargs)
-        # A block returns either the hidden state directly or a tuple whose
-        # first element is the hidden state (some architectures also return
-        # cache/aux entries).
-        if isinstance(out, tuple):
-            return (self._steer(out[0]),) + tuple(out[1:])
-        return self._steer(out)
+        compiled = mx.compile(body, shapeless=True)
 
-    def __getattr__(self, name: str) -> Any:
-        # Reached for names absent from the wrapper; delegate to the block
-        # so callers probing layer internals (e.g. ``layer.self_attn``)
-        # still see through the wrapper.
-        try:
-            return super().__getattr__(name)
-        except AttributeError:
-            return getattr(self["block"], name)
+    # Class swap first: on an exotic block (__slots__, C type) this raises
+    # TypeError before any steering state is written, so a refused swap
+    # leaves the block completely untouched rather than half-steered.
+    block.__class__ = _steered_class(type(block))
+    object.__setattr__(block, "_steer_add", add_bias)
+    object.__setattr__(block, "_steer_proj", proj_copy)
+    object.__setattr__(block, "_steer_body", body)
+    object.__setattr__(block, "_steer_fn", compiled)
+    return block
 
 
 def apply_steering_patch(
@@ -310,7 +374,17 @@ def apply_steering_patch(
             steer_arrays.append(bias)
         layer_projections = projections.get(il, [])
         steer_arrays.extend(unit for unit, _ in layer_projections)
-        layers[il] = _SteeredLayer(layers[il], bias, layer_projections)
+        try:
+            _steer_block(layers[il], bias, layer_projections)
+        except TypeError as e:
+            logger.warning(
+                "steering: layer %d block %s does not accept a class swap "
+                "(%s); skipping",
+                il,
+                type(layers[il]).__name__,
+                e,
+            )
+            continue
         patched += 1
 
     if patched:
@@ -329,6 +403,21 @@ def apply_steering_patch(
             len(specs),
             "" if len(specs) == 1 else "s",
         )
+
+    # Written unconditionally (not just on success): specs non-empty but
+    # patched == 0 — every target layer out of range, or every class swap
+    # refused — is exactly the silently-unsteered case this status exists to
+    # surface. See ``_engine_steering_status`` / admin's model list.
+    object.__setattr__(
+        model,
+        "_omlx_steering_status",
+        {
+            "active": patched > 0,
+            "layers": patched,
+            "specs": len(specs),
+            "error": None if patched else "no layer could be steered",
+        },
+    )
     return patched
 
 
@@ -342,9 +431,9 @@ def remove_steering_patch(model: Any) -> bool:
     container = find_layers_container(model)
     if container is not None:
         layers = container.layers
-        for i in range(len(layers)):
-            # Unwrap defensively in case wrappers ever nested.
-            while isinstance(layers[i], _SteeredLayer):
-                layers[i] = layers[i]["block"]
+        for layer in layers:
+            _unsteer_block(layer)
     model._omlx_steering_active = False
+    object.__setattr__(model, "_omlx_steering_status", None)
+    object.__setattr__(model, "_omlx_steering_digest", "")
     return True

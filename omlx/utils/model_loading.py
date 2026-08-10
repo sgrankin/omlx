@@ -1131,9 +1131,25 @@ def _maybe_apply_steering(model: Any, model_settings: Any) -> None:
                 layer_end=entry.get("layer_end"),
             )))
         if not parsed:
+            object.__setattr__(
+                model,
+                "_omlx_steering_status",
+                {
+                    "active": False,
+                    "layers": 0,
+                    "specs": 0,
+                    "error": "no steering vector could be loaded",
+                },
+            )
             return
         specs = [s for _, s in parsed]
         patched = apply_steering_patch(model, specs)
+        if patched:
+            from ..steering import steering_config_digest
+
+            object.__setattr__(
+                model, "_omlx_steering_digest", steering_config_digest(parsed)
+            )
         # One line per spec — shows the user exactly what was applied.
         details = []
         for i, (path, spec) in enumerate(parsed, 1):
@@ -1157,6 +1173,11 @@ def _maybe_apply_steering(model: Any, model_settings: Any) -> None:
         )
     except Exception as e:
         logger.error("Failed to apply steering vectors: %s", e)
+        object.__setattr__(
+            model,
+            "_omlx_steering_status",
+            {"active": False, "layers": 0, "specs": 0, "error": str(e)},
+        )
 
 
 def maybe_load_custom_quantization(

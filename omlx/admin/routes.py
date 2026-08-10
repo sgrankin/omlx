@@ -1969,6 +1969,7 @@ async def list_models(is_admin: bool = Depends(require_admin)):
             "model_context_length": model_info.get("model_context_length"),
             "thinking_default": model_info.get("thinking_default"),
             "preserve_thinking_default": model_info.get("preserve_thinking_default"),
+            "steering": model_info.get("steering"),
             "source_type": model_info.get("source_type", "local"),
             "source_repo_id": model_info.get("source_repo_id"),
             "last_access": model_info.get("last_access"),
@@ -4912,9 +4913,15 @@ def _build_runtime_cache_observability(
             ssd_stats = {}
 
         ssd_manager = getattr(scheduler, "paged_ssd_cache_manager", None)
-        scheduler_model_name = getattr(
-            getattr(scheduler, "config", None), "model_name", ""
-        )
+        # Steered models record blocks under a digest-suffixed identity.
+        # isinstance-checked (not just truthiness) so a duck-typed/mocked
+        # scheduler without a real cache_model_name string falls through to
+        # config.model_name instead of picking up a stray truthy attribute.
+        scheduler_model_name = getattr(scheduler, "cache_model_name", None)
+        if not isinstance(scheduler_model_name, str) or not scheduler_model_name:
+            scheduler_model_name = getattr(
+                getattr(scheduler, "config", None), "model_name", ""
+            )
         if ssd_manager is not None and hasattr(ssd_manager, "get_stats_for_model"):
             try:
                 scoped_ssd_stats = ssd_manager.get_stats_for_model(

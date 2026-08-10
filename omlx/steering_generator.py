@@ -36,9 +36,9 @@ class _HiddenCapture(nn.Module):
 
     Forward behaviour is unchanged; the layer's output for the last
     position is written into ``sink[layer_idx]`` on every call. A real
-    ``nn.Module`` (see :class:`~omlx.patches.steering._SteeredLayer`) so the
-    wrapped block's parameters stay visible during the capture pass; the
-    wrapper is transient and removed once capture finishes.
+    ``nn.Module`` so the wrapped block's parameters stay visible during the
+    capture pass; the wrapper is transient and removed once capture
+    finishes.
     """
 
     def __init__(self, block: Any, sink: dict[int, mx.array], layer_idx: int):

@@ -14,9 +14,10 @@ import pytest
 from mlx.utils import tree_flatten
 
 from omlx.patches.steering import (
-    _SteeredLayer,
+    _steer_block,
     apply_steering_patch,
     find_layers_container,
+    is_steered,
     model_hidden_size,
     remove_steering_patch,
 )
@@ -24,6 +25,7 @@ from omlx.steering import (
     STEERING_FORMAT_VERSION,
     SteeringSpec,
     SteeringVector,
+    steering_config_digest,
 )
 from omlx.steering_generator import generate_steering_vector
 
@@ -499,7 +501,7 @@ def test_post_load_applies_steering_from_settings(tmp_path):
     )
     apply_post_load_transforms(model, settings)
     assert getattr(model, "_omlx_steering_active", False) is True
-    assert isinstance(model.model.layers[1], _SteeredLayer)
+    assert is_steered(model.model.layers[1])
 
 
 def test_post_load_no_op_when_steering_empty():
@@ -576,7 +578,7 @@ def test_post_load_isolates_one_bad_vector(tmp_path, caplog):
         apply_post_load_transforms(model, settings)
     # The good one was still applied.
     assert getattr(model, "_omlx_steering_active", False) is True
-    assert isinstance(model.model.layers[2], _SteeredLayer)
+    assert is_steered(model.model.layers[2])
     # The bad one warned and named the missing file.
     msg = "\n".join(r.message for r in caplog.records)
     assert "missing.safetensors" in msg
@@ -640,7 +642,7 @@ def test_apply_patch_adds_direction():
     assert model._omlx_steering_active is True
 
     layer = model.model.layers[2]
-    assert isinstance(layer, _SteeredLayer)
+    assert is_steered(layer)
     h = mx.zeros((1, 1, N_EMBD))
     out = layer(h)
     # FakeBlock for layer index 2 has bias seed == 3.
@@ -733,7 +735,7 @@ def test_patch_precasts_add_bias_to_norm_dtype():
     model = NormedModel(2, N_EMBD, norm_dtype=mx.bfloat16)
     apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD, dtype=mx.float32)})])
     layer = model.layers[0]
-    assert isinstance(layer, _SteeredLayer)
+    assert is_steered(layer)
     assert layer._steer_add.dtype == mx.bfloat16
 
 
@@ -747,7 +749,7 @@ def test_patch_precasts_projection_unit_to_norm_dtype():
         )],
     )
     layer = model.layers[0]
-    assert isinstance(layer, _SteeredLayer)
+    assert is_steered(layer)
     assert len(layer._steer_proj) == 1
     unit, _strength = layer._steer_proj[0]
     assert unit.dtype == mx.float16
@@ -779,31 +781,31 @@ def test_remove_patch_restores_blocks():
 
 
 def test_apply_patch_is_idempotent():
-    """Re-applying replaces the prior patch rather than nesting wrappers."""
+    """Re-applying replaces the prior patch rather than nesting swaps."""
     model = FakeModel(N_LAYERS, N_EMBD)
     apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)})])
     apply_steering_patch(model, [_spec({1: mx.ones(N_EMBD)}, strength=5.0)])
     layer = model.model.layers[1]
-    assert isinstance(layer, _SteeredLayer)
-    assert not isinstance(layer["block"], _SteeredLayer)
+    assert is_steered(layer)
+    assert type(layer)._omlx_steer_base is FakeBlock
+    assert mx.allclose(layer._steer_add, mx.full((N_EMBD,), 5.0))
 
 
 def test_patch_keeps_wrapped_block_params_visible():
-    """The wrapper must not hide the wrapped block's parameters from MLX."""
+    """The class swap must not hide the block's parameters from MLX."""
     model = RealModel(3, N_EMBD)
-    before = len(tree_flatten(model.parameters()))
+    before = {k for k, _ in tree_flatten(model.parameters())}
 
     patched = apply_steering_patch(
         model, [_spec({1: mx.ones(N_EMBD), 2: mx.ones(N_EMBD)})]
     )
     assert patched == 2
 
-    after = tree_flatten(model.parameters())
-    # Steering directions are not parameters; the wrapped Linear weights are
-    # still all present — just routed through the wrapper's 'block' child.
-    assert len(after) == before
-    assert any("layers.1.block" in k for k, _ in after)
-    # A full parameter walk must still succeed.
+    after = {k for k, _ in tree_flatten(model.parameters())}
+    # The class swap leaves the block in place, so parameter paths are
+    # identical to the unsteered model (the old wrapper prefixed them with
+    # ".block", which would break any name-keyed weight load/save).
+    assert after == before
     mx.eval(model.parameters())
 
 
@@ -847,10 +849,10 @@ def test_apply_patch_layer_range():
     )
     patched = apply_steering_patch(model, [spec])
     assert patched == 2
-    assert isinstance(model.model.layers[1], _SteeredLayer)
-    assert isinstance(model.model.layers[2], _SteeredLayer)
-    assert not isinstance(model.model.layers[0], _SteeredLayer)
-    assert not isinstance(model.model.layers[3], _SteeredLayer)
+    assert is_steered(model.model.layers[1])
+    assert is_steered(model.model.layers[2])
+    assert not is_steered(model.model.layers[0])
+    assert not is_steered(model.model.layers[3])
 
 
 # ---------------------------------------------------------------------------
@@ -861,7 +863,7 @@ def test_apply_patch_layer_range():
 def test_projection_removes_component():
     """mode='project', strength=1.0 ablates the direction from the output."""
     d = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
-    layer = _SteeredLayer(IdentityBlock(), None, [(d / mx.linalg.norm(d), 1.0)])
+    layer = _steer_block(IdentityBlock(), None, [(d / mx.linalg.norm(d), 1.0)])
     h = mx.random.normal((1, 3, N_EMBD))
     out = layer(h)
     u = d / mx.linalg.norm(d)
@@ -872,7 +874,7 @@ def test_projection_removes_component():
 def test_projection_partial_strength_halves_component():
     d = mx.ones(N_EMBD)
     u = d / mx.linalg.norm(d)
-    layer = _SteeredLayer(IdentityBlock(), None, [(u, 0.5)])
+    layer = _steer_block(IdentityBlock(), None, [(u, 0.5)])
     h = mx.random.normal((1, 4, N_EMBD))
     before = (h * u).sum(axis=-1)
     after = (layer(h) * u).sum(axis=-1)
@@ -882,7 +884,7 @@ def test_projection_partial_strength_halves_component():
 def test_projection_negative_strength_amplifies():
     d = mx.ones(N_EMBD)
     u = d / mx.linalg.norm(d)
-    layer = _SteeredLayer(IdentityBlock(), None, [(u, -1.0)])
+    layer = _steer_block(IdentityBlock(), None, [(u, -1.0)])
     h = mx.random.normal((1, 4, N_EMBD))
     before = (h * u).sum(axis=-1)
     after = (layer(h) * u).sum(axis=-1)
@@ -916,7 +918,7 @@ def test_steer_matches_sequential_loop_form():
         ref = ref - strengths[i] * coeff * u
 
     proj_list = [(units[i], strengths[i]) for i in range(P)]
-    layer = _SteeredLayer(IdentityBlock(), add, proj_list)
+    layer = _steer_block(IdentityBlock(), add, proj_list)
     got = layer(h)
 
     assert mx.allclose(got, ref, atol=1e-5, rtol=1e-5), (
@@ -1013,8 +1015,266 @@ def test_multi_vector_disjoint_layers():
     s2 = _spec({2: mx.ones(N_EMBD)})
     patched = apply_steering_patch(model, [s1, s2])
     assert patched == 2
-    assert isinstance(model.model.layers[0], _SteeredLayer)
-    assert isinstance(model.model.layers[2], _SteeredLayer)
+    assert is_steered(model.model.layers[0])
+    assert is_steered(model.model.layers[2])
+
+
+# ---------------------------------------------------------------------------
+# Class swap — attribute writes, isinstance, shapeless compile, digest, status
+# ---------------------------------------------------------------------------
+
+
+def test_steered_layer_forwards_attribute_writes():
+    """Writes must reach the block, not a wrapper.
+
+    patches/specprefill installs its attention capture with
+    ``layer.self_attn = module``; against the old wrapper that write was
+    swallowed and capture silently never fired.
+    """
+
+    class AttnBlock:
+        def __init__(self):
+            self.self_attn = "orig"
+
+        def __call__(self, h, *args, **kwargs):
+            return h + (1.0 if self.self_attn == "orig" else 100.0)
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = AttnBlock()
+    apply_steering_patch(model, [_spec({0: mx.zeros(N_EMBD)})])
+    layer = model.model.layers[0]
+    assert is_steered(layer)
+    layer.self_attn = "sentinel"
+    assert layer.self_attn == "sentinel"
+    out = layer(mx.zeros((1, 1, N_EMBD)))
+    assert mx.allclose(out, mx.full((1, 1, N_EMBD), 100.0))
+
+
+def test_steered_module_attribute_write_reaches_module_state():
+    """Writing a submodule through a steered layer lands in MLX's tree."""
+    model = RealModel(2, N_EMBD)
+    apply_steering_patch(model, [_spec({0: mx.zeros(N_EMBD)})])
+    replacement = nn.Linear(N_EMBD, N_EMBD)
+    model.layers[0].proj = replacement
+    assert model.layers[0].proj is replacement
+    keys = {k for k, _ in tree_flatten(model.parameters())}
+    assert "layers.0.proj.weight" in keys
+
+
+def test_steered_layer_preserves_isinstance():
+    """A steered block must still satisfy isinstance against its base class."""
+    model = RealModel(2, N_EMBD)
+    apply_steering_patch(model, [_spec({0: mx.zeros(N_EMBD)})])
+    assert isinstance(model.layers[0], RealBlock)
+
+
+def test_steered_layer_shapeless_across_sequence_lengths():
+    """The compiled body must not retrace (or misbehave) per sequence length."""
+    d = mx.arange(N_EMBD, dtype=mx.float32) + 1.0
+    u = d / mx.linalg.norm(d)
+    layer = _steer_block(IdentityBlock(), None, [(u, 1.0)])
+    for shape in ((1, 1, N_EMBD), (2, 7, N_EMBD), (1, 3, N_EMBD)):
+        h = mx.random.normal(shape)
+        out = layer(h)
+        residual = (out * u).sum(axis=-1)
+        assert float(mx.abs(residual).max()) < 1e-4, shape
+
+
+def test_steered_layer_falls_back_on_rank_change():
+    """A rank change (3-D then 2-D) must not break the forward pass.
+
+    shapeless=True compilation covers a changing sequence length but not a
+    changing rank; ``_steer`` catches the compiled-body failure and falls
+    back to the uncompiled Python body for subsequent calls on that layer.
+    """
+    d = mx.ones(N_EMBD)
+    u = d / mx.linalg.norm(d)
+    layer = _steer_block(IdentityBlock(), None, [(u, 1.0)])
+
+    h3 = mx.random.normal((1, 3, N_EMBD))
+    out3 = layer(h3)
+    assert float(mx.abs((out3 * u).sum(axis=-1)).max()) < 1e-4
+
+    h2 = mx.random.normal((3, N_EMBD))
+    out2 = layer(h2)
+    assert float(mx.abs((out2 * u).sum(axis=-1)).max()) < 1e-4
+
+
+def test_class_swap_refusal_is_soft():
+    """An exotic block that rejects a __class__ swap is skipped, not fatal."""
+
+    class SlottedBlock:
+        __slots__ = ()
+
+        def __call__(self, h, *args, **kwargs):
+            return h
+
+    block = SlottedBlock()
+    with pytest.raises(TypeError):
+        block.__class__ = type("X", (SlottedBlock,), {})
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = block
+    patched = apply_steering_patch(model, [_spec({0: mx.ones(N_EMBD)})])
+    assert patched == 0
+    assert model.model.layers[0] is block
+    assert not is_steered(model.model.layers[0])
+
+
+def test_digest_empty_for_no_config():
+    assert steering_config_digest([]) == ""
+
+
+def test_digest_changes_with_spec_fields(tmp_path):
+    vec_path = tmp_path / "v.safetensors"
+    SteeringVector({0: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    base = _spec({0: mx.ones(N_EMBD)})
+    d0 = steering_config_digest([(str(vec_path), base)])
+
+    for kwargs in (
+        {"strength": 2.0},
+        {"mode": "project"},
+        {"layer_start": 1},
+        {"layer_end": 2},
+    ):
+        variant = _spec({0: mx.ones(N_EMBD)}, **kwargs)
+        d = steering_config_digest([(str(vec_path), variant)])
+        assert d != d0, kwargs
+
+
+def test_digest_changes_with_vector_file_content(tmp_path):
+    vec_path = tmp_path / "v.safetensors"
+    SteeringVector({0: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    spec = _spec({0: mx.ones(N_EMBD)})
+    d1 = steering_config_digest([(str(vec_path), spec)])
+
+    # Overwrite with a different-size file (two layers instead of one) so
+    # the digest cannot be relying on mtime alone.
+    SteeringVector({0: mx.ones(N_EMBD), 1: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(
+        str(vec_path)
+    )
+    d2 = steering_config_digest([(str(vec_path), spec)])
+    assert d1 != d2
+
+
+def test_digest_recorded_on_model_after_apply(tmp_path):
+    """apply_post_load_transforms records a non-empty digest on success."""
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    vec_path = tmp_path / "v.safetensors"
+    SteeringVector({1: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    settings = SimpleNamespace(
+        steering_vectors=[{"path": str(vec_path), "strength": 0.5, "mode": "add"}],
+        index_cache_freq=None,
+    )
+    apply_post_load_transforms(model, settings)
+    assert getattr(model, "_omlx_steering_digest", "") != ""
+
+
+def test_digest_unset_without_steering():
+    """No steering_vectors -> the digest attribute stays unset/empty."""
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    apply_post_load_transforms(
+        model, SimpleNamespace(steering_vectors=None, index_cache_freq=None)
+    )
+    assert getattr(model, "_omlx_steering_digest", "") == ""
+
+
+def test_scheduler_cache_identity_unchanged_without_steering(
+    mock_model, mock_tokenizer
+):
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    s = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(model_name="m"),
+    )
+    assert s.cache_model_name == "m"
+
+
+def test_scheduler_cache_identity_includes_steering_digest(mock_model, mock_tokenizer):
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    mock_model._omlx_steering_digest = "deadbeefcafe"
+    s = Scheduler(
+        model=mock_model,
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(model_name="m"),
+    )
+    assert s.cache_model_name == "m+steer.deadbeefcafe"
+
+
+def test_scheduler_cache_identity_sees_digest_through_vlm_adapter(
+    mock_model, mock_tokenizer
+):
+    """The VLM engine hands the Scheduler a VLMModelAdapter; the digest is
+    stamped on the inner _vlm_model, so the identity probe must fall
+    through the adapter or a steered VLM keeps the unsteered SSD cache."""
+    from omlx.scheduler import Scheduler, SchedulerConfig
+
+    mock_model._omlx_steering_digest = "deadbeefcafe"
+
+    class AdapterLike:
+        """Digest reachable only via _vlm_model, like VLMModelAdapter."""
+
+        def __init__(self, inner):
+            self._vlm_model = inner
+            self.config = inner.config
+
+    s = Scheduler(
+        model=AdapterLike(mock_model),
+        tokenizer=mock_tokenizer,
+        config=SchedulerConfig(model_name="m"),
+    )
+    assert s.cache_model_name == "m+steer.deadbeefcafe"
+
+
+def test_status_recorded_on_successful_apply(tmp_path):
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    vec_path = tmp_path / "v.safetensors"
+    SteeringVector({1: mx.ones(N_EMBD)}, n_embd=N_EMBD).save(str(vec_path))
+    settings = SimpleNamespace(
+        steering_vectors=[{"path": str(vec_path), "strength": 0.5, "mode": "add"}],
+        index_cache_freq=None,
+    )
+    apply_post_load_transforms(model, settings)
+    assert model._omlx_steering_status == {
+        "active": True,
+        "layers": 1,
+        "specs": 1,
+        "error": None,
+    }
+
+
+def test_status_recorded_on_load_failure(tmp_path):
+    """Every vector path missing -> status is inactive with a non-empty error."""
+    from types import SimpleNamespace
+
+    from omlx.utils.model_loading import apply_post_load_transforms
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    settings = SimpleNamespace(
+        steering_vectors=[
+            {"path": str(tmp_path / "missing.safetensors"), "strength": 1.0}
+        ],
+        index_cache_freq=None,
+    )
+    apply_post_load_transforms(model, settings)
+    status = model._omlx_steering_status
+    assert status["active"] is False
+    assert status["error"]
 
 
 # ---------------------------------------------------------------------------

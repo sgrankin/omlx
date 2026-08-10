@@ -1693,6 +1693,22 @@ class Scheduler:
         self.tokenizer = copy.deepcopy(tokenizer)
         self.config = copy.copy(config) if config else SchedulerConfig()
         self._stream = stream if stream is not None else _default_generation_stream
+        # KV-cache identity. Steering rewrites the residual stream, so blocks
+        # computed under one steering config must never be reused under
+        # another — the hot tier dies on reload but the SSD tier persists.
+        # An unsteered model has an empty digest, so the identity (and every
+        # existing cache) is unchanged. The VLM engine passes a
+        # VLMModelAdapter whose nn.Module.__getattr__ never reaches the
+        # wrapped model, and the digest is stamped on the inner _vlm_model —
+        # probe there too.
+        _steer_digest = getattr(self.model, "_omlx_steering_digest", "") or ""
+        if not _steer_digest:
+            _inner = getattr(self.model, "_vlm_model", None)
+            if _inner is not None:
+                _steer_digest = getattr(_inner, "_omlx_steering_digest", "") or ""
+        self.cache_model_name = (self.config.model_name or "") + (
+            f"+steer.{_steer_digest}" if _steer_digest else ""
+        )
         self._serialize_llama4_requests = _model_declares_llama4(model)
         if self._serialize_llama4_requests and self.config.max_num_seqs > 1:
             logger.info(
@@ -2067,7 +2083,7 @@ class Scheduler:
             self.paged_cache_manager = PagedCacheManager(
                 block_size=self.config.paged_cache_block_size,
                 max_blocks=max_blocks,
-                model_name=self.config.model_name,
+                model_name=self.cache_model_name,
                 initial_blocks=self.config.initial_cache_blocks,
             )
             self.block_aware_cache = BlockAwarePrefixCache(
@@ -12454,7 +12470,7 @@ class Scheduler:
                 hot_cache_only=self.config.hot_cache_only,
                 hot_cache_budget=self.config.hot_cache_budget,
                 gdn_ssd_split_enabled=self.config.gdn_ssd_split_enabled,
-                expected_model_name=self.config.model_name or "",
+                expected_model_name=self.cache_model_name,
                 expected_num_layers=expected_num_layers,
                 expected_block_size=self.config.paged_cache_block_size,
                 expected_block_size_tokens=self.config.paged_cache_block_size,

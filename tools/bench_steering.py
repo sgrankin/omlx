@@ -25,7 +25,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from omlx.cli import _load_steering_model
 from omlx.patches.steering import (
-    _SteeredLayer,
     apply_steering_patch,
     model_hidden_size,
     remove_steering_patch,
@@ -33,30 +32,35 @@ from omlx.patches.steering import (
 from omlx.steering import SteeringSpec, SteeringVector
 
 
-def _legacy_steer(self: _SteeredLayer, h: mx.array) -> mx.array:
+def _legacy_steer(layer: Any, h: mx.array) -> mx.array:
     """Pre-fusion implementation: iterate _steer_proj list of (unit, strength)."""
-    if self._steer_add is not None:
-        add = self._steer_add
+    if layer._steer_add is not None:
+        add = layer._steer_add
         if add.dtype != h.dtype:
             add = add.astype(h.dtype)
         h = h + add
-    for unit, strength in self._steer_proj:
+    for unit, strength in layer._steer_proj:
         u = unit if unit.dtype == h.dtype else unit.astype(h.dtype)
         coeff = (h * u).sum(axis=-1, keepdims=True)
         h = h - strength * coeff * u
     return h
 
 
-def _new_steer(self: _SteeredLayer, h: mx.array) -> mx.array:
-    """Current in-tree implementation, pinned here for explicit A/B."""
-    if self._steer_add is not None:
-        add = self._steer_add
+def _new_steer(layer: Any, h: mx.array) -> mx.array:
+    """Current in-tree implementation, pinned here for explicit A/B.
+
+    Known pre-existing staleness: ``_steer_units`` / ``_steer_strengths`` no
+    longer exist (that stacked-tensor implementation was replaced by the
+    compiled body) — leaving as-is, not fixed by this change.
+    """
+    if layer._steer_add is not None:
+        add = layer._steer_add
         if add.dtype != h.dtype:
             add = add.astype(h.dtype)
         h = h + add
-    units = self._steer_units
+    units = layer._steer_units
     if units is not None:
-        strengths = self._steer_strengths
+        strengths = layer._steer_strengths
         if units.dtype != h.dtype:
             units = units.astype(h.dtype)
             strengths = strengths.astype(h.dtype)
@@ -73,15 +77,15 @@ def _new_steer(self: _SteeredLayer, h: mx.array) -> mx.array:
 _COMPILED_CACHE: dict[int, Any] = {}
 
 
-def _compiled_steer(self: _SteeredLayer, h: mx.array) -> mx.array:
+def _compiled_steer(layer: Any, h: mx.array) -> mx.array:
     """mx.compile-fused variant: the Python loop over projections traces
     once into a single graph, eliminating per-op dispatch overhead."""
-    key = id(self)
+    key = id(layer)
     fn = _COMPILED_CACHE.get(key)
     if fn is None:
         # Capture Python ints/floats and array references at trace time.
-        proj = [(u, float(s)) for u, s in self._steer_proj]
-        add = self._steer_add
+        proj = [(u, float(s)) for u, s in layer._steer_proj]
+        add = layer._steer_add
 
         if add is not None and proj:
             def body(h):
@@ -178,7 +182,12 @@ def _run_one(
 ) -> dict:
     """Run a single configuration: warmup + measurement; return stats dict."""
     if steer_fn is not None:
-        _SteeredLayer._steer = steer_fn
+        # ``_steered_call`` resolves ``_steer`` from module globals at call
+        # time, so rebinding the module attribute (not a class attribute —
+        # there is no wrapper class anymore) redirects every steered layer.
+        import omlx.patches.steering as steering_mod
+
+        steering_mod._steer = steer_fn
 
     _decode_steps(model, tokenizer, prompt_ids, n_warmup)
     s1 = _decode_steps(model, tokenizer, prompt_ids, n_steps)

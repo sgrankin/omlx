@@ -7,12 +7,16 @@ model's behaviour, without retraining. Configured per model via
 `apply_post_load_transforms` and uniformly to every request.
 
 - Core types — `omlx/steering.py` (`SteeringVector`, `SteeringSpec`)
-- Application patch — `omlx/patches/steering.py` (`_SteeredLayer`)
+- Application patch — `omlx/patches/steering.py` (swaps each steered
+  block's class via `_steer_block` / `_steered_class`)
 - Generator — `omlx/steering_generator.py`
 - Eval / strength sweeps — `omlx/steering_eval.py`
 - CLI — `omlx steering generate` / `eval` / `layers` / `datasets`
 - Vector files live in `~/.omlx/steering/` — `generate` writes there by
   default (`<model>__<prompts>.safetensors`) and the admin UI lists it
+- The applied steering config is digested (`steering_config_digest`) and
+  folded into the model's KV-cache identity, so cached blocks from a
+  different (or no) steering config are never reused.
 
 ## Mechanism
 

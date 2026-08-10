@@ -470,6 +470,74 @@ class TestEnginePoolStatus:
         assert pool.get_loaded_model_ids() == []
 
 
+class TestEngineSteeringStatus:
+    """Tests for _engine_steering_status — probes _model / _vlm_model /
+    _target_model since batched, VLM, and dFlash engines each name their
+    loaded model differently."""
+
+    def test_none_engine_returns_none(self):
+        from omlx.engine_pool import _engine_steering_status
+
+        assert _engine_steering_status(None) is None
+
+    def test_engine_with_no_known_model_attr_returns_none(self):
+        from omlx.engine_pool import _engine_steering_status
+
+        class BareEngine:
+            pass
+
+        assert _engine_steering_status(BareEngine()) is None
+
+    def test_finds_status_on_model_attr(self):
+        from omlx.engine_pool import _engine_steering_status
+
+        class Model:
+            _omlx_steering_status = {
+                "active": True,
+                "layers": 1,
+                "specs": 1,
+                "error": None,
+            }
+
+        class Engine:
+            _model = Model()
+
+        assert _engine_steering_status(Engine()) == {
+            "active": True,
+            "layers": 1,
+            "specs": 1,
+            "error": None,
+        }
+
+    def test_finds_status_on_vlm_model_attr(self):
+        from omlx.engine_pool import _engine_steering_status
+
+        class Model:
+            _omlx_steering_status = {
+                "active": False,
+                "layers": 0,
+                "specs": 0,
+                "error": "x",
+            }
+
+        class Engine:
+            _model = None
+            _vlm_model = Model()
+
+        assert _engine_steering_status(Engine())["active"] is False
+
+    def test_model_without_status_attr_returns_none(self):
+        from omlx.engine_pool import _engine_steering_status
+
+        class Model:
+            pass
+
+        class Engine:
+            _model = Model()
+
+        assert _engine_steering_status(Engine()) is None
+
+
 class TestEngineEntry:
     """Tests for EngineEntry dataclass."""
 

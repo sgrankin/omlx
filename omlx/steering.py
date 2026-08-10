@@ -25,7 +25,9 @@ direction; layers without one are simply left unsteered.
 
 from __future__ import annotations
 
+import hashlib
 import logging
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -277,3 +279,34 @@ class SteeringSpec:
                 continue
             out[il] = vec
         return out
+
+
+def steering_config_digest(items: list[tuple[str, SteeringSpec]]) -> str:
+    """Short digest of an applied steering configuration.
+
+    Folded into KV-cache identity (see ``Scheduler.cache_model_name``): a
+    steered model produces different residual states, so its cached KV blocks
+    must not be reused under a different steering config — or under none.
+    Covers each vector file's identity (path + size + mtime, so regenerating
+    a vector in place invalidates), plus strength, mode and layer band.
+    Order is significant — projections apply in sequence — so the list is not
+    sorted.
+
+    Returns "" for an empty config, which keeps an unsteered model's cache
+    identity unchanged and existing caches valid.
+    """
+    if not items:
+        return ""
+    hasher = hashlib.sha256()
+    hasher.update(b"omlx-steering-v1")
+    for path, spec in items:
+        try:
+            st = os.stat(path)
+            stamp = f"{st.st_size}:{st.st_mtime_ns}"
+        except OSError:
+            stamp = "?"
+        hasher.update(
+            f"|{path}|{stamp}|{spec.mode}|{spec.strength!r}"
+            f"|{spec.layer_start}|{spec.layer_end}".encode()
+        )
+    return hasher.hexdigest()[:12]

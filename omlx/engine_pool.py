@@ -21,7 +21,7 @@ import time
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Any, Literal
 
 if TYPE_CHECKING:
     from .cluster.deployment import ClusterDeployment
@@ -239,6 +239,21 @@ class EngineEntry:
     load_failed: bool = False  # Sticky until the next discovery refresh
     load_failure_message: str | None = None
     load_failure_at: float | None = None
+
+
+def _engine_steering_status(engine: Any) -> dict | None:
+    """Steering summary for a loaded engine (None when unsteered/unloaded).
+
+    Engines name their loaded model differently — batched ``_model``, VLM
+    ``_vlm_model``, dFlash ``_target_model`` — so probe all three.
+    """
+    if engine is None:
+        return None
+    for attr in ("_model", "_vlm_model", "_target_model"):
+        model = getattr(engine, attr, None)
+        if model is not None:
+            return getattr(model, "_omlx_steering_status", None)
+    return None
 
 
 class EnginePool:
@@ -2875,6 +2890,7 @@ class EnginePool:
                     "is_helper": e.is_helper,
                     "thinking_default": e.thinking_default,
                     "preserve_thinking_default": e.preserve_thinking_default,
+                    "steering": _engine_steering_status(e.engine),
                     "source_type": e.source_type,
                     "source_repo_id": e.source_repo_id,
                     "last_access": e.last_access if e.last_access > 0 else None,
