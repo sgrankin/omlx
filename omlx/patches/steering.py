@@ -293,6 +293,7 @@ def apply_steering_patch(
                 )
 
     patched = 0
+    steer_arrays: list[mx.array] = []
     for il in sorted(set(add_bias) | set(projections)):
         if il < 0 or il >= n_layers:
             logger.warning(
@@ -306,10 +307,20 @@ def apply_steering_patch(
         bias = add_bias.get(il)
         if bias is not None:
             bias = bias.astype(compute_dtype)
-        layers[il] = _SteeredLayer(layers[il], bias, projections.get(il, []))
+            steer_arrays.append(bias)
+        layer_projections = projections.get(il, [])
+        steer_arrays.extend(unit for unit, _ in layer_projections)
+        layers[il] = _SteeredLayer(layers[il], bias, layer_projections)
         patched += 1
 
     if patched:
+        # Materialize on the calling (loader) thread. These arrays are
+        # hidden from MLX parameter traversal (object.__setattr__ storage,
+        # tuples inside a plain list), so materialize_lazy_state never
+        # reaches them; left lazy they stay bound to this thread's stream
+        # and the first forward on a per-engine inference thread dies with
+        # "There is no Stream(gpu, N) in current thread".
+        mx.eval(steer_arrays)
         model._omlx_steering_active = True
         logger.info(
             "Steering patch applied to %d/%d layers (%d spec%s)",

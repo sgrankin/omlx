@@ -936,6 +936,48 @@ def test_apply_patch_project_mode_normalizes_direction():
     assert float(mx.abs((out * u).sum(axis=-1)).max()) < 1e-4
 
 
+def test_patched_layers_usable_from_another_thread():
+    """Steering arrays must be concrete before other threads run forward.
+
+    The server loads models (and applies this patch) on a loader executor
+    thread, but inference runs on per-engine threads. Lazy arrays keep a
+    reference to the stream of the thread that recorded their ops, and
+    evaluating them elsewhere raises "There is no Stream(...) in current
+    thread". Simulate that: apply the patch under a fresh CPU stream, then
+    run the steered forward in a worker thread.
+    """
+    import threading
+
+    model = FakeModel(N_LAYERS, N_EMBD)
+    model.model.layers[0] = IdentityBlock()
+    model.model.layers[1] = IdentityBlock()
+
+    loader_stream = mx.new_stream(mx.cpu)
+    with mx.stream(loader_stream):
+        apply_steering_patch(
+            model,
+            [
+                _spec({0: mx.arange(N_EMBD, dtype=mx.float32) + 3.0}, mode="project"),
+                _spec({1: mx.ones(N_EMBD)}, mode="add", strength=2.0),
+            ],
+        )
+
+    errors: list[Exception] = []
+
+    def worker():
+        try:
+            h = mx.zeros((1, 1, N_EMBD))
+            out = model.model.layers[1](model.model.layers[0](h))
+            mx.eval(out)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=worker)
+    thread.start()
+    thread.join()
+    assert not errors, f"steered forward failed cross-thread: {errors[0]}"
+
+
 # ---------------------------------------------------------------------------
 # Steering patch — multiple vectors
 # ---------------------------------------------------------------------------
