@@ -8,12 +8,18 @@ import sys
 import types
 from types import SimpleNamespace
 
+import pytest
+
 from omlx.adapter.gemma4 import (
     Gemma4OutputParserSession,
     _Gemma4LegacyOutputParserSession,
 )
 from omlx.adapter.harmony import load_harmony_gpt_oss_encoding
-from omlx.adapter.output_parser import detect_output_parser
+from omlx.adapter.output_parser import (
+    OutputParserFactory,
+    detect_output_parser,
+    select_text_parser_session,
+)
 
 
 class FakeDetokenizer:
@@ -1419,6 +1425,80 @@ class TestOutputParserFactory:
         assert factory is not None
         session = factory.create_session(tokenizer)
         assert isinstance(session, Gemma4OutputParserSession)
+
+    def test_gemma4_factory_provides_text_session(self, monkeypatch):
+        """The diffusion text lane needs ``process_text``.
+
+        The default token-ID session lacks it, so the factory must expose
+        a text-capable session for engines that emit detokenized text.
+        """
+        monkeypatch.delenv("OMLX_GEMMA4_PARSER", raising=False)
+        tokenizer = GemmaTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "google/diffusiongemma-26B-A4B-it",
+            tokenizer,
+            {"model_type": "diffusion_gemma"},
+        )
+        assert factory is not None
+        assert factory.kind == "gemma4"
+        assert factory.create_text_session is not None
+        session = factory.create_text_session(tokenizer)
+        assert isinstance(session, _Gemma4LegacyOutputParserSession)
+
+    def test_select_text_parser_session_falls_back_for_gemma4(self, monkeypatch):
+        """Default gemma4 session is token-ID only; selection must fall
+        back to the legacy text session and still parse thought channels."""
+        monkeypatch.delenv("OMLX_GEMMA4_PARSER", raising=False)
+        tokenizer = GemmaTokenizer({1: "x"})
+        factory = detect_output_parser(
+            "google/diffusiongemma-26B-A4B-it",
+            tokenizer,
+            {"model_type": "diffusion_gemma"},
+        )
+        session = select_text_parser_session(factory, tokenizer)
+        assert isinstance(session, _Gemma4LegacyOutputParserSession)
+
+        result = session.process_text("<|channel>thought\nreasoning<channel|>answer")
+        text = result.visible_text + session.finalize().visible_text
+        assert text == "<think>reasoning</think>answer"
+
+    def test_select_text_parser_session_prefers_default(self):
+        """When the default session is text-capable, the fallback builder
+        must not be consulted at all."""
+
+        class TextCapableSession:
+            def process_token(self, token_id):
+                raise NotImplementedError
+
+            def process_text(self, text):
+                raise NotImplementedError
+
+            def finalize(self):
+                raise NotImplementedError
+
+        default_session = TextCapableSession()
+        factory = OutputParserFactory(
+            kind="text-default",
+            create_session=lambda tokenizer: default_session,
+            create_text_session=lambda tokenizer: pytest.fail(
+                "fallback text session must not be used"
+            ),
+        )
+        assert select_text_parser_session(factory, object()) is default_session
+
+    def test_select_text_parser_session_none_without_text_session(self):
+        class TokenOnlySession:
+            def process_token(self, token_id):
+                raise NotImplementedError
+
+            def finalize(self):
+                raise NotImplementedError
+
+        factory = OutputParserFactory(
+            kind="token-only",
+            create_session=lambda tokenizer: TokenOnlySession(),
+        )
+        assert select_text_parser_session(factory, object()) is None
 
     def test_harmony_wrapper_regression(self):
         encoding = load_harmony_gpt_oss_encoding()

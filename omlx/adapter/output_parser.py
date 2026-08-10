@@ -68,6 +68,10 @@ class OutputParserFactory:
     create_session_with_tools: (
         Callable[[Any, list[dict] | None], OutputParserSession] | None
     ) = None
+    # Session builder for engines that emit detokenized text instead of
+    # token ids (the serial diffusion lane). Only needed when the default
+    # ``create_session`` product lacks ``process_text``.
+    create_text_session: Callable[[Any], OutputParserSession] | None = None
     stop_token_ids: set[int] = field(default_factory=set)
     thinking_start_text: str | None = None
     thinking_start_output_text: str | None = None
@@ -79,6 +83,33 @@ class OutputParserFactory:
     # lane) preserve the token ids of these markers and let the parser
     # session remove them instead.
     protocol_marker_texts: tuple[str, ...] = ()
+
+
+def select_text_parser_session(
+    factory: OutputParserFactory, tokenizer: Any
+) -> OutputParserSession | None:
+    """Create a parser session that can consume detokenized text.
+
+    Text-lane engines (the serial diffusion lane) feed the parser text
+    segments via ``process_text`` instead of token ids. The factory's
+    default session may be token-ID based (gemma4's default), so fall back
+    to ``create_text_session`` when the default lacks ``process_text``.
+    Returns ``None`` — with a warning, since the caller has no session to
+    convert protocol structure — when neither session is text-capable.
+    """
+    session = factory.create_session(tokenizer)
+    if hasattr(session, "process_text"):
+        return session
+    if factory.create_text_session is not None:
+        session = factory.create_text_session(tokenizer)
+        if hasattr(session, "process_text"):
+            return session
+    logger.warning(
+        "output parser %r has no text-capable session; protocol output "
+        "(thought channels, tool calls) will reach clients unparsed",
+        factory.kind,
+    )
+    return None
 
 
 class HarmonyOutputParserSession:
@@ -1299,15 +1330,17 @@ def detect_output_parser(
             Gemma4OutputParserSession,
         )
 
+        legacy_session_cls: Callable[[Any], OutputParserSession] = functools.partial(
+            _Gemma4LegacyOutputParserSession, model_path=session_model_path
+        )
+
         # OMLX_GEMMA4_PARSER=legacy keeps the old text-based parser for
         # A/B comparison. Default ("new" or unset) uses the token-ID
         # streaming parser with parse_response() tool-call extraction.
         flag = os.environ.get("OMLX_GEMMA4_PARSER", "new").strip().lower()
         if flag == "legacy":
             logger.info("gemma4 parser: using legacy text-based session")
-            session_cls: Callable[[Any], OutputParserSession] = functools.partial(
-                _Gemma4LegacyOutputParserSession, model_path=session_model_path
-            )
+            session_cls: Callable[[Any], OutputParserSession] = legacy_session_cls
         else:
             if flag not in ("new", ""):
                 logger.warning(
@@ -1322,6 +1355,9 @@ def detect_output_parser(
         return OutputParserFactory(
             kind="gemma4",
             create_session=session_cls,
+            # The token-ID session can't consume detokenized text; text-lane
+            # engines (diffusion) fall back to the legacy text-based session.
+            create_text_session=legacy_session_cls,
             stop_token_ids=set(),
             thinking_start_text="<|channel>thought",
             thinking_start_output_text="<think>\n",

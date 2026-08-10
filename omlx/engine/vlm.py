@@ -4187,17 +4187,21 @@ class VLMBatchedEngine(BaseEngine):
 
         # Detect a protocol output parser (e.g. gemma4 channel markers).
         # The diffusion lane emits detokenized text segments, so only
-        # sessions exposing ``process_text`` can be used here.
+        # sessions exposing ``process_text`` can be used here;
+        # select_text_parser_session falls back to the factory's text
+        # session when the default one is token-ID based.
         parser_session = None
         try:
-            from ..adapter.output_parser import detect_output_parser
+            from ..adapter.output_parser import (
+                detect_output_parser,
+                select_text_parser_session,
+            )
 
             model_config = {"model_type": self.model_type} if self.model_type else None
             factory = detect_output_parser(self._model_name, tokenizer, model_config)
             if factory is not None:
-                session = factory.create_session(tokenizer)
-                if hasattr(session, "process_text"):
-                    parser_session = session
+                parser_session = select_text_parser_session(factory, tokenizer)
+                if parser_session is not None:
                     preserved_marker_texts.extend(factory.protocol_marker_texts)
         except Exception as e:
             logger.debug("Diffusion output parser unavailable: %s", e)
