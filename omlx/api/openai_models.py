@@ -91,8 +91,7 @@ class Message(BaseModel):
 
     role: str
     content: Optional[Union[str, List[ContentPart], List[dict]]] = None
-    # Reasoning trace echoed back by clients (Pi, Claude Code) so
-    # preserve_thinking templates have prior <think> blocks to keep.
+    # Reasoning/thinking content from <think> blocks (OpenAI reasoning_content field)
     reasoning_content: Optional[str] = None
     # For assistant messages with tool calls
     tool_calls: Optional[List[dict]] = None

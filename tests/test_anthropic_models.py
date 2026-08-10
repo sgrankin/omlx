@@ -18,6 +18,7 @@ from omlx.api.anthropic_models import (
     AnthropicUsage,
     ContentBlockDeltaEvent,
     ContentBlockDocument,
+    ContentBlockRedactedThinking,
     ContentBlockStartEvent,
     ContentBlockStopEvent,
     ContentBlockText,
@@ -170,6 +171,34 @@ class TestContentBlocks:
 
         assert len(msg.content) == 2
         assert msg.content[1].type == "document"
+
+    def test_content_block_redacted_thinking(self):
+        """Redacted thinking blocks are accepted with an opaque payload."""
+        block = ContentBlockRedactedThinking(data="EncryptedBlob")
+
+        assert block.type == "redacted_thinking"
+        assert block.data == "EncryptedBlob"
+        assert block.signature is None
+
+    def test_message_accepts_redacted_thinking_block(self):
+        """Clients echoing redacted_thinking must not 422 the request."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                {
+                    "role": "assistant",
+                    "content": [
+                        {"type": "redacted_thinking", "data": "EncryptedBlob"},
+                        {"type": "text", "text": "Answer"},
+                    ],
+                },
+            ],
+        )
+
+        blocks = request.messages[0].content
+        assert isinstance(blocks[0], ContentBlockRedactedThinking)
+        assert blocks[0].data == "EncryptedBlob"
 
 
 class TestSystemContent:

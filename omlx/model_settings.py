@@ -213,7 +213,7 @@ class ModelSettings:
         None  # Explicit toggle for thinking/reasoning mode (None = auto)
     )
     preserve_thinking: Optional[bool] = (
-        None  # Keep <think> from prior turns (Qwen 3.6+); None = auto-on when thinking active
+        None  # Keep <think> blocks in historical turns (None = auto, True when template supports it)
     )
     thinking_budget_enabled: bool = False
     thinking_budget_tokens: Optional[int] = None

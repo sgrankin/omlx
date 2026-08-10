@@ -884,7 +884,7 @@ def _apply_reasoning_reconstruction(
     content: Any,
     reasoning: str | None,
     native: bool,
-) -> tuple[Any, str | None]:
+) -> tuple[Any, str | None, bool]:
     """Reconstruct reasoning on a historical assistant message.
 
     External clients echo reasoning back via the OpenAI ``reasoning_content``
@@ -897,31 +897,37 @@ def _apply_reasoning_reconstruction(
     * ``native=False`` — template only parses ``<think>...</think>`` embedded
       in content.  Reasoning is inlined into content as a fallback.
 
-    Returns ``(new_content, reasoning_out)`` where ``reasoning_out`` is the
-    string to attach as a ``reasoning_content`` field, or ``None`` to skip.
+    Returns ``(new_content, reasoning_out, preserve_boundary)``.
+    ``reasoning_out`` is the string to attach as a ``reasoning_content``
+    field, or ``None`` to skip.  ``preserve_boundary`` asks the caller to
+    stamp ``_PRESERVE_BOUNDARY_KEY`` so two reasoning turns never merge
+    into one message carrying two ``<think>`` blocks.
     """
+    from .thinking import extract_thinking
+
     if role != "assistant" or not reasoning:
         if role != "assistant" or not native:
-            return content, None
+            return content, None, False
         text = content if isinstance(content, str) else ""
         if isinstance(content, list):
             text = _extract_text_from_content_list(content)
-        from .thinking import extract_thinking
-
         inline_reasoning, inline_content = extract_thinking(text)
         if inline_reasoning:
-            return inline_content, inline_reasoning
-        return content, None
+            return inline_content, inline_reasoning, True
+        return content, None, False
     text = content if isinstance(content, str) else ""
     if isinstance(content, list):
         text = _extract_text_from_content_list(content)
     # Client already inlined <think>...</think> into content — trust their
-    # form and skip reconstruction to avoid emitting two consecutive blocks.
-    if "<think>" in text and "</think>" in text:
-        return content, None
+    # form over the echoed reasoning field instead of emitting two blocks.
+    inline_reasoning, inline_content = extract_thinking(text)
+    if inline_reasoning:
+        if native:
+            return inline_content, inline_reasoning, True
+        return content, None, True
     if native:
-        return text, reasoning
-    return f"<think>\n{reasoning}\n</think>\n\n{text}", None
+        return text, reasoning, True
+    return f"<think>\n{reasoning}\n</think>\n\n{text}", None, True
 
 
 def extract_text_content(
@@ -965,7 +971,7 @@ def extract_text_content(
         # mode passes reasoning as a separate field; fallback inlines it as
         # <think>...</think> in content.
         reasoning = getattr(msg, "reasoning_content", None)
-        content, reasoning_out = _apply_reasoning_reconstruction(
+        content, reasoning_out, preserve_boundary = _apply_reasoning_reconstruction(
             role, content, reasoning, native_reasoning_content
         )
 
@@ -1086,10 +1092,8 @@ def extract_text_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
-        # Reasoning assistants must not merge — each turn has its own
-        # <think>…</think> block, and merging concatenates two into one
-        # message.
-        if role == "assistant" and reasoning:
+        # Each reasoning turn owns its <think> block — never merge two.
+        if preserve_boundary:
             _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         # Handle None content
@@ -1148,7 +1152,7 @@ def extract_multimodal_content(
 
         # Reconstruct reasoning (see extract_text_content).
         reasoning = getattr(msg, "reasoning_content", None)
-        content, reasoning_out = _apply_reasoning_reconstruction(
+        content, reasoning_out, preserve_boundary = _apply_reasoning_reconstruction(
             role, content, reasoning, native_reasoning_content
         )
 
@@ -1260,10 +1264,8 @@ def extract_multimodal_content(
             _extra["partial"] = True
         if reasoning_out is not None:
             _extra["reasoning_content"] = reasoning_out
-        # Reasoning assistants must not merge — each turn has its own
-        # <think>…</think> block, and merging concatenates two into one
-        # message.
-        if role == "assistant" and reasoning:
+        # Each reasoning turn owns its <think> block — never merge two.
+        if preserve_boundary:
             _extra[_PRESERVE_BOUNDARY_KEY] = True
 
         if content is None:

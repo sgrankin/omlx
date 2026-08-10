@@ -553,6 +553,33 @@ class TestReasoningContentReconstruction:
         result = extract_text_content(messages)
         assert result[0]["content"] == "A"
 
+    def test_inline_think_and_echoed_reasoning_native_recovers_field(self):
+        """Native mode: inline <think> wins, and the reasoning still lands in the field."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="<think>\nX\n</think>\n\nA",
+            ),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "X"
+        assert "<think>" not in result[0]["content"]
+
+    def test_think_tags_out_of_order_are_not_treated_as_inline(self):
+        """Bare mentions of the tags must not suppress reconstruction."""
+        messages = [
+            Message(
+                role="assistant",
+                reasoning_content="R",
+                content="Put </think> after <think> in the prompt.",
+            ),
+        ]
+        result = extract_text_content(messages)
+        assert result[0]["content"].startswith("<think>\nR\n</think>\n\n")
+        assert "Put </think> after <think> in the prompt." in result[0]["content"]
+
 
 class TestExtractTextContentNativeReasoningContent:
     """Tests that extract_text_content forwards reasoning_content as a field
@@ -659,6 +686,19 @@ class TestExtractTextContentNativeReasoningContent:
         assert len(result) == 1
         assert result[0]["content"] == "A"
         assert result[0]["reasoning_content"] == "R"
+
+    def test_consecutive_inline_history_assistants_not_merged(self):
+        """Inline-<think> history recovered natively must keep per-turn boundaries."""
+        messages = [
+            Message(role="assistant", content="<think>\nR1\n</think>\n\nA1"),
+            Message(role="assistant", content="<think>\nR2\n</think>\n\nA2"),
+        ]
+        result = extract_text_content(messages, native_reasoning_content=True)
+        assert len(result) == 2
+        assert result[0]["content"] == "A1"
+        assert result[0]["reasoning_content"] == "R1"
+        assert result[1]["content"] == "A2"
+        assert result[1]["reasoning_content"] == "R2"
 
 
 class TestUsesNativeReasoningContent:
@@ -1379,6 +1419,80 @@ class TestConvertAnthropicToInternalNativeReasoning:
 
         assert result[0]["content"] == "Just a reply"
         assert "reasoning_content" not in result[0]
+
+    def test_consecutive_thinking_assistants_not_merged(self):
+        """Two assistant turns with thinking blocks must stay two messages."""
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="T1", signature=""
+                        ),
+                        ContentBlockText(text="A1"),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="T2", signature=""
+                        ),
+                        ContentBlockText(text="A2"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(request, native_reasoning_content=True)
+
+        assert len(result) == 2
+        assert result[0]["reasoning_content"] == "T1"
+        assert result[1]["reasoning_content"] == "T2"
+
+    def test_native_tool_calling_consecutive_thinking_assistants_not_merged(self):
+        """Same, on the native-tool-calling assistant branch."""
+
+        class NativeToolTokenizer:
+            has_tool_calling = True
+
+        request = MessagesRequest(
+            model="claude-3",
+            max_tokens=1024,
+            messages=[
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="T1", signature=""
+                        ),
+                        ContentBlockText(text="A1"),
+                    ],
+                ),
+                AnthropicMessage(
+                    role="assistant",
+                    content=[
+                        ContentBlockThinking(
+                            type="thinking", thinking="T2", signature=""
+                        ),
+                        ContentBlockText(text="A2"),
+                    ],
+                ),
+            ],
+        )
+
+        result = convert_anthropic_to_internal(
+            request,
+            tokenizer=NativeToolTokenizer(),
+            native_reasoning_content=True,
+        )
+
+        assert len(result) == 2
+        assert result[0]["reasoning_content"] == "T1"
+        assert result[1]["reasoning_content"] == "T2"
 
 
 class TestConvertAnthropicToolsToInternal:
@@ -2963,6 +3077,15 @@ class TestMergeConsecutiveRoles:
 
 class TestExtractMultimodalContent:
     """Tests for extract_multimodal_content normalization."""
+
+    def test_native_inline_history_stamps_preserve_boundary(self):
+        messages = [
+            Message(role="assistant", content="<think>\nR\n</think>\n\nA"),
+        ]
+        result = extract_multimodal_content(messages, native_reasoning_content=True)
+        assert result[0]["content"] == "A"
+        assert result[0]["reasoning_content"] == "R"
+        assert result[0]["_preserve_role_boundary"] is True
 
     def test_tool_message_with_content_part_list(self):
         """Test that tool messages with ContentPart list content are converted to string."""
