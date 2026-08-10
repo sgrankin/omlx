@@ -584,6 +584,28 @@ class TestGemma4OutputParserSession:
         stream, _, _ = self._run(tok, [100, 200, 201, 101, 203])
         assert stream == "<think></think>answer"
 
+    def test_prefilled_thought_closes_before_visible_content(self):
+        """A prompt-side opener must seed the parser before generation.
+
+        Gemma 4 tool continuations start generation inside the thought
+        channel, so the generated stream carries only the body, the close
+        marker, and the visible answer — no ``<|channel>`` token ever
+        arrives to move the state machine into the thought state.
+        """
+        tok = TokenIdGemmaTokenizer(
+            token_map={202: "reasoning", 203: "answer"},
+            marker_ids=_GEMMA4_MARKER_IDS,
+        )
+        session = Gemma4OutputParserSession(tok)
+        session.notify_prefilled_thought()
+
+        parts = []
+        for token_id in [202, 101, 203]:
+            parts.append(session.process_token(token_id).stream_text)
+        parts.append(session.finalize().stream_text)
+
+        assert "".join(parts) == "reasoning</think>answer"
+
     def test_collision_literal_marker_in_thought_content(self):
         """Regular-token text that spells out ``<channel|>`` must not flip state.
 
@@ -1015,7 +1037,7 @@ class TestGemma4LegacyOutputParserSession:
             3: "answer",
         }
         tokenizer = GemmaTokenizer(token_map)
-        session = Gemma4OutputParserSession(tokenizer)
+        session = _Gemma4LegacyOutputParserSession(tokenizer)
         session.notify_prefilled_thought()
 
         parts = []
@@ -1023,7 +1045,7 @@ class TestGemma4LegacyOutputParserSession:
             parts.append(session.process_token(token_id).stream_text)
         parts.append(session.finalize().stream_text)
 
-        assert "".join(parts) == "reasoning</think>\nanswer"
+        assert "".join(parts) == "reasoning</think>answer"
 
     def test_stray_open_marker_inside_thought_dropped(self):
         """A nested ``<|channel>thought\\n`` while already inside a thought

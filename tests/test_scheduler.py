@@ -5144,6 +5144,11 @@ class TestOutputParserSmoke:
             self.eos_token_id = 2
             self.pad_token_id = 0
             self.bos_token_id = 1
+            # Real tokenizers map unknown strings onto the unk id rather than
+            # a fresh id. Callers that probe with convert_tokens_to_ids rely
+            # on that to detect "this marker isn't a single token" and fall
+            # back to encode().
+            self.unk_token_id = -1
 
         def _decode_one(self, token_id):
             if token_id in self._id_to_marker:
@@ -5256,12 +5261,17 @@ class TestOutputParserSmoke:
         """
         mock_model.config.model_type = "gemma4"
         tokenizer = self._GemmaTokenizer(
-            {
+            token_map={
                 13: "reasoning",
-                14: "<channel|>",
                 15: "answer",
-                16: "<turn|>",
-            }
+            },
+            marker_ids={
+                "<|channel>": 100,
+                "<channel|>": 101,
+                "<turn|>": 106,
+                "<|tool_call>": 48,
+                "<tool_call|>": 49,
+            },
         )
         scheduler = Scheduler(
             model=mock_model,
@@ -5288,18 +5298,18 @@ class TestOutputParserSmoke:
 
         responses = [
             type("Resp", (), {"uid": 99, "token": 13, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 14, "finish_reason": None})(),
+            type("Resp", (), {"uid": 99, "token": 101, "finish_reason": None})(),
             type("Resp", (), {"uid": 99, "token": 15, "finish_reason": None})(),
-            type("Resp", (), {"uid": 99, "token": 16, "finish_reason": "stop"})(),
+            type("Resp", (), {"uid": 99, "token": 106, "finish_reason": "stop"})(),
         ]
 
         outputs, finished_ids = scheduler._process_batch_responses(responses)
 
         assert finished_ids == {request.request_id}
         assert "".join(output.new_text for output in outputs) == (
-            "<think>\nreasoning</think>\nanswer"
+            "<think>\nreasoning</think>answer"
         )
-        assert outputs[-1].output_text == "<think>\nreasoning</think>\nanswer"
+        assert outputs[-1].output_text == "<think>\nreasoning</think>answer"
 
         disabled = Request(
             request_id="gemma-thinking-disabled",
