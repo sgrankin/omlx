@@ -12,7 +12,6 @@ from __future__ import annotations
 import functools
 import json
 import logging
-import os
 from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
@@ -50,13 +49,34 @@ class OutputParserFinalizeResult:
 
 
 class OutputParserSession(Protocol):
-    """Protocol implemented by per-request output parser sessions."""
+    """Protocol implemented by per-request output parser sessions.
+
+    ``process_token`` and ``finalize`` are required. Two further hooks are
+    optional and discovered by capability sniffing at the call site; see
+    ``OPTIONAL_SESSION_HOOKS``.
+    """
 
     def process_token(self, token_id: int) -> OutputParserTokenResult:
         """Process one generated token."""
 
     def finalize(self) -> OutputParserFinalizeResult:
         """Flush any buffered output when generation ends."""
+
+
+# Optional session hooks, looked up with getattr/hasattr rather than declared
+# on the Protocol so sessions that do not need them stay conformant:
+#
+# ``notify_prefilled_thought()`` — Scheduler._get_output_parser_session
+#   (omlx/scheduler.py:2668) calls it when the prompt already opened the
+#   model's thinking channel.
+# ``process_text(text)`` — text-lane engines (the serial diffusion lane in
+#   omlx/engine/vlm.py) feed decoded text instead of token ids; see
+#   ``select_text_parser_session``.
+#
+# A hook implemented by one session of a factory must be implemented by every
+# session that factory can produce — a getattr-dispatched hook that is missing
+# fails silently. Guarded by tests/test_output_parser.py.
+OPTIONAL_SESSION_HOOKS = ("notify_prefilled_thought", "process_text")
 
 
 @dataclass(frozen=True)
@@ -1334,33 +1354,17 @@ def detect_output_parser(
             _Gemma4LegacyOutputParserSession, model_path=session_model_path
         )
 
-        # OMLX_GEMMA4_PARSER=legacy keeps the old text-based parser for
-        # A/B comparison. Default ("new" or unset) uses the token-ID
-        # streaming parser with parse_response() tool-call extraction.
-        flag = os.environ.get("OMLX_GEMMA4_PARSER", "new").strip().lower()
-        if flag == "legacy":
-            logger.info("gemma4 parser: using legacy text-based session")
-            session_cls: Callable[[Any], OutputParserSession] = legacy_session_cls
-        else:
-            if flag not in ("new", ""):
-                logger.warning(
-                    "OMLX_GEMMA4_PARSER=%r not recognized; falling back to "
-                    "'new'. Expected 'new' or 'legacy'.",
-                    flag,
-                )
-            # The token-ID parser keys off special-token IDs only — it needs
-            # no streaming detokenizer, hence no model_path.
-            session_cls = Gemma4OutputParserSession
-
         return OutputParserFactory(
             kind="gemma4",
-            create_session=session_cls,
+            create_session=functools.partial(
+                Gemma4OutputParserSession, model_path=session_model_path
+            ),
             # The token-ID session can't consume detokenized text; text-lane
             # engines (diffusion) fall back to the legacy text-based session.
             create_text_session=legacy_session_cls,
             stop_token_ids=set(),
             thinking_start_text="<|channel>thought",
-            thinking_start_output_text="<think>\n",
+            thinking_start_output_text="<think>",
             thinking_end_text="<channel|>",
             protocol_marker_texts=(
                 _OPEN_MARKER_BARE,

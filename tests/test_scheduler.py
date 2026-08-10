@@ -5307,9 +5307,9 @@ class TestOutputParserSmoke:
 
         assert finished_ids == {request.request_id}
         assert "".join(output.new_text for output in outputs) == (
-            "<think>\nreasoning</think>answer"
+            "<think>reasoning</think>answer"
         )
-        assert outputs[-1].output_text == "<think>\nreasoning</think>answer"
+        assert outputs[-1].output_text == "<think>reasoning</think>answer"
 
         disabled = Request(
             request_id="gemma-thinking-disabled",

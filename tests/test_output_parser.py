@@ -70,6 +70,12 @@ class TokenIdGemmaTokenizer:
             attribute (truthy value enables the finalize tool-call path).
         parse_response_fn: Optional callable(full_text) -> dict mimicking
             transformers' ``parse_response``.
+        tool_parser: Optional callable(text, tools=None) -> dict mimicking an
+            mlx-lm tool parser, used by ``omlx.api.tool_calling`` when this
+            tokenizer's tool-call markers are found. When provided,
+            ``has_tool_calling``/``tool_call_start``/``tool_call_end`` are
+            also set so it exercises the span-based fallback path (Finding
+            1) without needing a ``response_schema``.
     """
 
     def __init__(
@@ -79,6 +85,7 @@ class TokenIdGemmaTokenizer:
         *,
         response_schema=None,
         parse_response_fn=None,
+        tool_parser=None,
     ):
         overlap = set(token_map) & set(marker_ids.values())
         if overlap:
@@ -88,6 +95,11 @@ class TokenIdGemmaTokenizer:
         self._id_to_marker = {tid: name for name, tid in marker_ids.items()}
         self.response_schema = response_schema
         self._parse_response_fn = parse_response_fn
+        if tool_parser is not None:
+            self.has_tool_calling = True
+            self.tool_call_start = "<|tool_call>"
+            self.tool_call_end = "<tool_call|>"
+            self.tool_parser = tool_parser
 
     def convert_tokens_to_ids(self, token: str) -> int:
         return self._marker_ids.get(token, -1)
@@ -703,7 +715,98 @@ class TestGemma4OutputParserSession:
         assert final.tool_calls == [{"name": "foo", "arguments": '{"x": 1}'}]
         assert final.finish_reason == "tool_calls"
 
-    def test_tool_calls_noop_without_response_schema(self):
+    def test_tool_calls_extracted_from_spans_without_response_schema(self):
+        """A tokenizer with no ``response_schema`` must not lose the call.
+
+        The scheduler builds ``request.output_text`` from ``visible_text``
+        only, and the session suppresses tool-call markup there — so the
+        finalize result is the only surviving carrier.
+        """
+
+        def fake_tool_parser(text, tools=None):
+            assert text.strip() == 'call:foo{"x":1}'
+            return {"name": "foo", "arguments": {"x": 1}}
+
+        tok = TokenIdGemmaTokenizer(
+            token_map={
+                200: "thought",
+                201: "\n",
+                202: "r",
+                203: "done",
+                300: 'call:foo{"x":1}',
+            },
+            marker_ids=_GEMMA4_MARKER_IDS,
+            tool_parser=fake_tool_parser,
+        )
+        _, visible, final = self._run(
+            tok, [100, 200, 201, 202, 101, 48, 300, 49, 203, 106]
+        )
+        assert "call:foo" not in visible  # still suppressed downstream
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "foo"
+        assert json.loads(final.tool_calls[0]["arguments"]) == {"x": 1}
+        assert final.tool_calls[0]["id"]
+        assert final.finish_reason == "tool_calls"
+
+    def test_unterminated_tool_call_span_still_extracted(self):
+        """A tool call cut off by max-tokens (no closing marker) is recovered."""
+
+        def fake_tool_parser(text, tools=None):
+            assert text.strip() == 'call:foo{"x":1}'
+            return {"name": "foo", "arguments": {"x": 1}}
+
+        tok = TokenIdGemmaTokenizer(
+            token_map={
+                200: "thought",
+                201: "\n",
+                202: "r",
+                300: 'call:foo{"x":1}',
+            },
+            marker_ids=_GEMMA4_MARKER_IDS,
+            tool_parser=fake_tool_parser,
+        )
+        _, _, final = self._run(tok, [100, 200, 201, 202, 101, 48, 300])
+        assert len(final.tool_calls) == 1
+        assert final.tool_calls[0]["name"] == "foo"
+
+    def test_parse_response_takes_precedence_over_spans(self):
+        """When ``parse_response`` succeeds, the span fallback is not consulted."""
+
+        def fake_parse(text):
+            assert "<|tool_call>" in text
+            return {
+                "role": "assistant",
+                "thinking": "r",
+                "content": "done",
+                "tool_calls": [
+                    {
+                        "type": "function",
+                        "function": {"name": "foo", "arguments": {"x": 1}},
+                    }
+                ],
+            }
+
+        def span_tool_parser(text, tools=None):
+            return {"name": "span_foo", "arguments": {}}
+
+        tok = TokenIdGemmaTokenizer(
+            token_map={
+                200: "thought",
+                201: "\n",
+                202: "r",
+                203: "done",
+                300: 'call:foo{"x":1}',
+            },
+            marker_ids=_GEMMA4_MARKER_IDS,
+            response_schema={"type": "object"},  # truthy
+            parse_response_fn=fake_parse,
+            tool_parser=span_tool_parser,
+        )
+        _, _, final = self._run(tok, [100, 200, 201, 202, 101, 48, 300, 49, 203, 106])
+        assert final.tool_calls == [{"name": "foo", "arguments": '{"x": 1}'}]
+        assert final.finish_reason == "tool_calls"
+
+    def test_no_tool_calls_without_tool_markup(self):
         tok = TokenIdGemmaTokenizer(
             token_map={200: "thought", 201: "\n", 202: "r", 203: "done"},
             marker_ids=_GEMMA4_MARKER_IDS,
@@ -888,8 +991,48 @@ class TestGemma4OutputParserSession:
         )
 
 
+class TestSessionHookCoverage:
+    """The scheduler and the diffusion lane reach optional hooks through
+    ``getattr``; a missing hook no-ops silently. This has regressed twice."""
+
+    def test_all_sessions_implement_protocol_core(self):
+        import inspect
+
+        import omlx.adapter.gemma4 as gemma4_module
+        import omlx.adapter.output_parser as output_parser_module
+
+        classes = [
+            obj
+            for module in (output_parser_module, gemma4_module)
+            for _, obj in inspect.getmembers(module, inspect.isclass)
+            if obj.__module__ == module.__name__
+            and obj.__name__.endswith("OutputParserSession")
+        ]
+        assert classes  # guard against the filter silently matching nothing
+        for cls in classes:
+            assert callable(getattr(cls, "process_token", None)), cls
+            assert callable(getattr(cls, "finalize", None)), cls
+
+    def test_gemma4_factory_sessions_agree_on_optional_hooks(self):
+        tokenizer = TokenIdGemmaTokenizer(token_map={}, marker_ids=_GEMMA4_MARKER_IDS)
+        factory = detect_output_parser(
+            "google/gemma-4b", tokenizer, {"model_type": "gemma4"}
+        )
+        default = factory.create_session(tokenizer)
+        text_lane = factory.create_text_session(tokenizer)
+        # notify_prefilled_thought is getattr-dispatched by the scheduler
+        # (omlx/scheduler.py:2668) — both products must carry it.
+        for session in (default, text_lane):
+            assert callable(getattr(session, "notify_prefilled_thought", None))
+        # process_text is the text lane's discriminator; the token-ID
+        # session must NOT have it or select_text_parser_session picks wrong.
+        assert not hasattr(default, "process_text")
+        assert hasattr(text_lane, "process_text")
+
+
 class TestGemma4LegacyOutputParserSession:
-    """Tests for the original text-based parser, kept behind the legacy flag."""
+    """Tests for the original text-based parser, kept as the text-lane
+    (diffusion) session."""
 
     def test_normal_reasoning_block(self):
         token_map = {
@@ -1335,7 +1478,7 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
         assert factory.thinking_start_text == "<|channel>thought"
-        assert factory.thinking_start_output_text == "<think>\n"
+        assert factory.thinking_start_output_text == "<think>"
         assert factory.thinking_end_text == "<channel|>"
 
     def test_session_receives_model_path_when_provided(self, monkeypatch):
@@ -1402,20 +1545,7 @@ class TestOutputParserFactory:
         assert factory is not None
         assert factory.kind == "gemma4"
 
-    def test_gemma4_flag_selects_legacy_parser(self, monkeypatch):
-        monkeypatch.setenv("OMLX_GEMMA4_PARSER", "legacy")
-        tokenizer = GemmaTokenizer({1: "x"})
-        factory = detect_output_parser(
-            "google/gemma-4b",
-            tokenizer,
-            {"model_type": "gemma4"},
-        )
-        assert factory is not None
-        session = factory.create_session(tokenizer)
-        assert isinstance(session, _Gemma4LegacyOutputParserSession)
-
-    def test_gemma4_default_selects_new_parser(self, monkeypatch):
-        monkeypatch.delenv("OMLX_GEMMA4_PARSER", raising=False)
+    def test_gemma4_selects_token_id_parser(self):
         tokenizer = TokenIdGemmaTokenizer(token_map={}, marker_ids=_GEMMA4_MARKER_IDS)
         factory = detect_output_parser(
             "google/gemma-4b",
@@ -1426,13 +1556,38 @@ class TestOutputParserFactory:
         session = factory.create_session(tokenizer)
         assert isinstance(session, Gemma4OutputParserSession)
 
-    def test_gemma4_factory_provides_text_session(self, monkeypatch):
+    def test_gemma4_token_id_session_receives_model_path(self, monkeypatch):
+        """``detect_output_parser`` imports ``Gemma4OutputParserSession``
+        inside the function, so patching the module attribute on
+        ``output_parser`` would be a no-op — patch the detokenizer factory
+        in the gemma4 module instead."""
+        import omlx.adapter.gemma4 as gemma4_module
+
+        seen = {}
+
+        def recording_factory(tokenizer, model_path=None):
+            seen["model_path"] = model_path
+            return None
+
+        monkeypatch.setattr(
+            gemma4_module, "create_streaming_detokenizer", recording_factory
+        )
+        tokenizer = TokenIdGemmaTokenizer(token_map={}, marker_ids=_GEMMA4_MARKER_IDS)
+        factory = detect_output_parser(
+            "gemma-4-e2b",
+            tokenizer,
+            {"model_type": "gemma4"},
+            model_path="/models/gemma-4-E2B-it",
+        )
+        factory.create_session(tokenizer)
+        assert seen["model_path"] == "/models/gemma-4-E2B-it"
+
+    def test_gemma4_factory_provides_text_session(self):
         """The diffusion text lane needs ``process_text``.
 
         The default token-ID session lacks it, so the factory must expose
         a text-capable session for engines that emit detokenized text.
         """
-        monkeypatch.delenv("OMLX_GEMMA4_PARSER", raising=False)
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(
             "google/diffusiongemma-26B-A4B-it",
@@ -1445,10 +1600,9 @@ class TestOutputParserFactory:
         session = factory.create_text_session(tokenizer)
         assert isinstance(session, _Gemma4LegacyOutputParserSession)
 
-    def test_select_text_parser_session_falls_back_for_gemma4(self, monkeypatch):
+    def test_select_text_parser_session_falls_back_for_gemma4(self):
         """Default gemma4 session is token-ID only; selection must fall
         back to the legacy text session and still parse thought channels."""
-        monkeypatch.delenv("OMLX_GEMMA4_PARSER", raising=False)
         tokenizer = GemmaTokenizer({1: "x"})
         factory = detect_output_parser(
             "google/diffusiongemma-26B-A4B-it",

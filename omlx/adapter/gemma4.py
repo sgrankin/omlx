@@ -305,7 +305,7 @@ def _matching_prefix_len(text: str, marker: str) -> int:
 
 
 class _Gemma4LegacyOutputParserSession:
-    """Legacy text-based parser. Kept behind a flag for A/B comparison.
+    """Legacy text-based parser. Kept as the text-lane (diffusion) session.
 
     Pattern-matches decoded marker strings. Has a structural limitation:
     reasoning content that happens to contain the literal marker strings
@@ -599,16 +599,16 @@ class Gemma4OutputParserSession:
     At finalize, the full raw token stream is decoded and handed to
     ``tokenizer.parse_response`` so tool calls extracted from the
     ``response_schema`` ``x-regex-iterator`` / ``x-parser`` chain flow through
-    as ``OutputParserFinalizeResult.tool_calls``. Works only when the tokenizer
-    ships a ``response_schema``; otherwise tool-call extraction is a no-op and
-    streaming behavior is unchanged.
+    as ``OutputParserFinalizeResult.tool_calls``. When the tokenizer has no
+    ``response_schema``, the tracked ``<|tool_call>`` spans are decoded and
+    parsed instead, so calls are never silently dropped.
     """
 
     _STATE_NORMAL = 0
     _STATE_HEADER = 1
     _STATE_THOUGHT = 2
 
-    def __init__(self, tokenizer: Any):
+    def __init__(self, tokenizer: Any, model_path: str | None = None):
         self._tokenizer = tokenizer
 
         self._channel_open_id = _resolve_token_id(tokenizer, _CHANNEL_OPEN_TOKEN)
@@ -650,7 +650,7 @@ class Gemma4OutputParserSession:
         self._header_buffer = ""
         self._raw_token_ids: list[int] = []
 
-        self._detokenizer = create_streaming_detokenizer(tokenizer)
+        self._detokenizer = create_streaming_detokenizer(tokenizer, model_path)
 
         if self._detokenizer is not None:
             self._detokenizer.reset()
@@ -760,7 +760,7 @@ class Gemma4OutputParserSession:
             return ""
         return self._detokenizer.last_segment or ""
 
-    def _extract_tool_calls(self) -> list[dict[str, str]]:
+    def _extract_tool_calls_via_parse_response(self) -> list[dict[str, str]]:
         parse_response = getattr(self._tokenizer, "parse_response", None)
         if parse_response is None:
             return []
@@ -795,6 +795,94 @@ class Gemma4OutputParserSession:
         if not isinstance(parsed, dict):
             return []
         return _normalize_parse_response_tool_calls(parsed)
+
+    def _tool_call_spans(self) -> list[list[int]]:
+        """Token ids between each ``<|tool_call>`` / ``<tool_call|>`` pair.
+
+        The markers are suppressed from ``visible_text`` during streaming, so
+        ``request.output_text`` — the only thing the server's
+        ``parse_tool_calls`` sees — never contains the tool-call markup. The
+        raw ids are the sole surviving record of the call.
+        """
+        if self._tool_call_open_id is None:
+            return []
+        spans: list[list[int]] = []
+        current: list[int] | None = None
+        for token_id in self._raw_token_ids:
+            if token_id == self._tool_call_open_id:
+                current = []
+                continue
+            if current is None:
+                continue
+            if token_id == self._tool_call_close_id:
+                spans.append(current)
+                current = None
+                continue
+            if token_id in self._marker_ids:
+                # Channel/turn markers can interleave inside a tool-call span
+                # (process_token ignores them while _in_tool_call but still
+                # records every token id); drop them here so the decoded
+                # payload isn't polluted with unrelated marker text.
+                continue
+            current.append(token_id)
+        if current:
+            # Unterminated span (max-tokens hit mid-call). Recover it rather
+            # than dropping: a payload that does not parse is discarded by
+            # ``parse_tool_calls`` anyway.
+            spans.append(current)
+        return spans
+
+    def _extract_tool_calls_from_spans(self) -> list[dict[str, str]]:
+        """Parse tool calls from the tracked marker spans.
+
+        Fallback for tokenizers with no ``response_schema`` (locally converted
+        checkpoints frequently drop it), where ``parse_response`` cannot run.
+        """
+        spans = self._tool_call_spans()
+        if not spans:
+            return []
+
+        parts: list[str] = []
+        for span in spans:
+            try:
+                payload = self._tokenizer.decode(span, skip_special_tokens=False)
+            except TypeError:
+                payload = self._tokenizer.decode(span)
+            except Exception:
+                logger.warning(
+                    "gemma4: failed to decode tool-call span; skipped",
+                    exc_info=True,
+                )
+                continue
+            if payload.strip():
+                parts.append(_TOOL_CALL_OPEN_TOKEN + payload + _TOOL_CALL_CLOSE_TOKEN)
+        if not parts:
+            return []
+
+        from ..api.tool_calling import parse_tool_calls
+
+        try:
+            _, calls = parse_tool_calls("".join(parts), self._tokenizer)
+        except Exception:
+            logger.warning(
+                "gemma4: tool-call span parsing failed; skipped", exc_info=True
+            )
+            return []
+
+        return [
+            {
+                "id": getattr(call, "id", ""),
+                "name": call.function.name,
+                "arguments": call.function.arguments,
+            }
+            for call in calls or []
+        ]
+
+    def _extract_tool_calls(self) -> list[dict[str, str]]:
+        return (
+            self._extract_tool_calls_via_parse_response()
+            or self._extract_tool_calls_from_spans()
+        )
 
     def finalize(self) -> OutputParserFinalizeResult:
         trailing = self._finalize_detokenizer()
