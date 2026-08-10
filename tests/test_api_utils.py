@@ -54,6 +54,7 @@ from omlx.api.utils import (
     extract_text_content,
     merge_reasoning_effort_chat_template_kwargs,
     prepare_system_messages_for_template,
+    summarize_message_content,
     uses_native_reasoning_content,
 )
 
@@ -3588,3 +3589,115 @@ class TestToolResultWithToolAwareTokenizer:
         assert result[0]["tool_calls"][0]["function"]["name"] == "get_weather"
         # Arguments are parsed into dict for the chat template.
         assert result[0]["tool_calls"][0]["function"]["arguments"] == {"city": "Seoul"}
+
+
+class TestSummarizeMessageContent:
+    """Tests for summarize_message_content."""
+
+    def test_empty_messages(self):
+        assert summarize_message_content([]) == ""
+
+    def test_string_content(self):
+        messages = [{"role": "user", "content": "hi"}]
+        assert summarize_message_content(messages) == "user=[text]"
+
+    def test_none_content_is_empty(self):
+        messages = [{"role": "user", "content": None}]
+        assert summarize_message_content(messages) == "user=[empty]"
+
+    def test_empty_string_content_is_empty(self):
+        messages = [{"role": "user", "content": ""}]
+        assert summarize_message_content(messages) == "user=[empty]"
+
+    def test_empty_list_content_is_empty(self):
+        """Regression: an empty content list must summarize as [empty], not [].
+
+        The old check ``content == ""`` never matched an empty list.
+        """
+        messages = [{"role": "user", "content": []}]
+        assert summarize_message_content(messages) == "user=[empty]"
+
+    def test_single_block_no_multiplier(self):
+        messages = [{"role": "user", "content": [{"type": "text"}]}]
+        assert summarize_message_content(messages) == "user=[text]"
+
+    def test_repeated_blocks_get_count_suffix(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [{"type": "text"}, {"type": "text"}, {"type": "image"}],
+            }
+        ]
+        assert summarize_message_content(messages) == "user=[text×2,image]"
+
+    def test_tool_result_nested_content(self):
+        messages = [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "content": [{"type": "text"}, {"type": "image"}],
+                    }
+                ],
+            }
+        ]
+        assert summarize_message_content(messages) == "user=[tool_result(text,image)]"
+
+    def test_tool_result_without_list_content_uses_bare_type(self):
+        messages = [
+            {"role": "user", "content": [{"type": "tool_result", "content": "ok"}]}
+        ]
+        assert summarize_message_content(messages) == "user=[tool_result]"
+
+    def test_tool_use_block_includes_name(self):
+        messages = [
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "tool_use", "name": "get_weather", "id": "1", "input": {}}
+                ],
+            }
+        ]
+        result = summarize_message_content(messages)
+        assert result == "assistant=[tool_use(get_weather)]"
+
+    def test_tool_use_block_without_name_falls_back_to_bare_type(self):
+        messages = [{"role": "assistant", "content": [{"type": "tool_use"}]}]
+        assert summarize_message_content(messages) == "assistant=[tool_use]"
+
+    def test_pydantic_content_blocks_via_attribute_access(self):
+        messages = [
+            AnthropicMessage(
+                role="assistant",
+                content=[
+                    ContentBlockText(text="hello"),
+                    ContentBlockToolUse(id="1", name="lookup", input={}),
+                ],
+            )
+        ]
+        result = summarize_message_content(messages)
+        assert result == "assistant=[text,tool_use(lookup)]"
+
+    def test_unknown_block_type_defaults_to_question_mark(self):
+        messages = [{"role": "user", "content": [{}]}]
+        assert summarize_message_content(messages) == "user=[?]"
+
+    def test_non_list_non_str_content_defaults_to_question_mark(self):
+        messages = [{"role": "user", "content": 42}]
+        assert summarize_message_content(messages) == "user=[?]"
+
+    def test_tail_default_shows_last_three_with_elided_count(self):
+        messages = [{"role": "user", "content": f"msg{i}"} for i in range(5)]
+        assert (
+            summarize_message_content(messages)
+            == "[2 earlier] user=[text] user=[text] user=[text]"
+        )
+
+    def test_messages_within_tail_have_no_elided_prefix(self):
+        messages = [{"role": "user", "content": "hi"}] * 2
+        assert summarize_message_content(messages) == "user=[text] user=[text]"
+
+    def test_custom_tail(self):
+        messages = [{"role": "user", "content": f"msg{i}"} for i in range(4)]
+        assert summarize_message_content(messages, tail=1) == "[3 earlier] user=[text]"

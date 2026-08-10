@@ -1681,9 +1681,11 @@ def _format_generation_speed_for_log(
     tokens_per_sec: float,
     *,
     is_diffusion: bool,
+    ttft: float | None = None,
 ) -> str:
+    suffix = f", ttft {ttft:.2f}s" if ttft is not None else ""
     if not is_diffusion:
-        return f"{tokens_per_sec:.1f} tok/s"
+        return f"{tokens_per_sec:.1f} tok/s{suffix}"
 
     parts = [f"{tokens_per_sec:.1f} tok/s e2e"]
     output_tps = float(getattr(output, "generation_tps", 0.0) or 0.0)
@@ -1701,7 +1703,7 @@ def _format_generation_speed_for_log(
     steps = int(getattr(output, "diffusion_denoising_steps", 0) or 0)
     if steps > 0:
         parts.append(f"steps={steps}")
-    return ", ".join(parts)
+    return ", ".join(parts) + suffix
 
 
 def _resolve_metric_durations(
@@ -3456,12 +3458,14 @@ async def create_chat_completion(
     ```
     """
     # Log incoming request summary at debug, message content at trace
+    tools_count = len(request.tools) if request.tools else 0
     logger.debug(
         f"Chat completion request received: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
-        f"max_tokens={request.max_tokens}, temp={request.temperature}"
+        f"max_tokens={request.max_tokens}, temp={request.temperature}, "
+        f"tools={tools_count}, tool_choice={request.tool_choice}"
     )
-    logger.info(
+    logger.debug(
         "Chat completion content: %s",
         summarize_message_content(request.messages),
     )
@@ -3845,10 +3849,17 @@ async def create_chat_completion(
             elapsed = time.perf_counter() - start_time
             tokens_per_sec = output.completion_tokens / elapsed if elapsed > 0 else 0
             is_diffusion = getattr(engine, "is_diffusion_model", False)
+            first_token_at = getattr(output, "first_token_at", None)
+            ttft = (
+                (first_token_at - start_time)
+                if first_token_at is not None
+                else 0.0
+            )
             speed_text = _format_generation_speed_for_log(
                 output,
                 tokens_per_sec,
                 is_diffusion=is_diffusion,
+                ttft=ttft if ttft > 0 else None,
             )
             logger.info(
                 f"Chat completion: model={resolved_model}, "
@@ -3856,12 +3867,6 @@ async def create_chat_completion(
                 f"({speed_text}), prompt: {output.prompt_tokens}, "
                 f"finish_reason={output.finish_reason}, max_tokens={max_tokens}, "
                 f"request_max_tokens={request.max_tokens}"
-            )
-            first_token_at = getattr(output, "first_token_at", None)
-            ttft = (
-                (first_token_at - start_time)
-                if first_token_at is not None
-                else 0.0
             )
             gen_duration = elapsed - ttft if ttft > 0 else elapsed
             metric_prefill_duration, metric_gen_duration = _resolve_metric_durations(
@@ -4512,6 +4517,7 @@ async def stream_completion(
             last_output,
             tokens_per_sec,
             is_diffusion=is_diffusion,
+            ttft=ttft,
         )
         logger.info(
             f"Completion: model={serving_model}, "
@@ -5003,11 +5009,12 @@ async def stream_chat_completion(
             last_output,
             tokens_per_sec,
             is_diffusion=is_diffusion,
+            ttft=ttft,
         )
         logger.info(
             f"Chat completion: model={resolved_model or request.model}, "
             f"{last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({speed_text}, ttft {ttft:.2f}s), "
+            f"{total_duration:.2f}s ({speed_text}), "
             f"prompt: {last_output.prompt_tokens}, finish_reason={finish_reason}, "
             f"max_tokens={kwargs.get('max_tokens')}, "
             f"request_max_tokens={request.max_tokens}"
@@ -5434,7 +5441,8 @@ async def stream_anthropic_messages(
         end_time = time.perf_counter()
         total_duration = end_time - start_time
         ttft = (first_token_time - start_time) if first_token_time else total_duration
-        if getattr(engine, "is_diffusion_model", False):
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
@@ -5447,18 +5455,20 @@ async def stream_anthropic_messages(
             generation_duration=gen_duration,
             model_id=serving_model,
         )
+        speed_duration = total_duration if is_diffusion else gen_duration
         tokens_per_sec = (
-            last_output.completion_tokens / total_duration if total_duration > 0 else 0
+            last_output.completion_tokens / speed_duration if speed_duration > 0 else 0
+        )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+            ttft=ttft,
         )
         logger.info(
             f"Anthropic message: model={serving_model}, "
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
-            f"({tokens_per_sec:.1f} tok/s)"
-        )
-        gen_tps = last_output.completion_tokens / gen_duration if gen_duration > 0 else 0
-        logger.info(
-            f"Anthropic message (stream): {last_output.completion_tokens} tokens in "
-            f"{total_duration:.2f}s ({gen_tps:.1f} tok/s gen, ttft {ttft:.2f}s)"
+            f"({speed_text})"
         )
 
     # 7. Send message_stop
@@ -5490,12 +5500,14 @@ async def create_anthropic_message(
 
     Streaming is supported with `stream: true`.
     """
+    tools_count = len(request.tools) if request.tools else 0
     logger.debug(
         f"Anthropic Messages request: model={request.model}, "
         f"messages={len(request.messages)}, stream={request.stream}, "
-        f"max_tokens={request.max_tokens}"
+        f"max_tokens={request.max_tokens}, "
+        f"tools={tools_count}, tool_choice={request.tool_choice}"
     )
-    logger.info(
+    logger.debug(
         "Anthropic Messages content: %s",
         summarize_message_content(request.messages),
     )
@@ -7079,7 +7091,8 @@ async def stream_responses_api(
         end_time = time.perf_counter()
         total_duration = end_time - start_time
         ttft = (first_token_time - start_time) if first_token_time else total_duration
-        if getattr(engine, "is_diffusion_model", False):
+        is_diffusion = getattr(engine, "is_diffusion_model", False)
+        if is_diffusion:
             gen_duration = total_duration
         else:
             gen_duration = end_time - (first_token_time or start_time)
@@ -7095,10 +7108,16 @@ async def stream_responses_api(
         tokens_per_sec = (
             last_output.completion_tokens / total_duration if total_duration > 0 else 0
         )
+        speed_text = _format_generation_speed_for_log(
+            last_output,
+            tokens_per_sec,
+            is_diffusion=is_diffusion,
+            ttft=ttft,
+        )
         logger.info(
             f"Responses API: model={serving_model}, "
             f"{last_output.completion_tokens} tokens in {total_duration:.2f}s "
-            f"({tokens_per_sec:.1f} tok/s)"
+            f"({speed_text})"
         )
         reasoning_token_count = (
             len(engine.tokenizer.encode(reasoning_text)) if reasoning_text else 0

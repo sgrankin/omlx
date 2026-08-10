@@ -6,6 +6,7 @@ Utility functions for text processing.
 
 import json
 import re
+from collections import Counter
 from typing import Any, List
 
 from .openai_models import Message
@@ -110,7 +111,6 @@ def summarize_message_content(messages: List[Any], tail: int = 3) -> str:
     Example (9-turn conversation, tail=3):
         [6 earlier] u=[tool_result(text,image)] a=[text] u=[text]
     """
-    from collections import Counter
 
     def _g(obj, key, default=None):
         if isinstance(obj, dict):
@@ -124,12 +124,16 @@ def summarize_message_content(messages: List[Any], tail: int = 3) -> str:
             if isinstance(inner, list) and inner:
                 inner_types = [_g(sub, "type") or "?" for sub in inner]
                 return f"tool_result({','.join(inner_types)})"
+        if btype == "tool_use":
+            name = _g(block, "name")
+            if name:
+                return f"tool_use({name})"
         return btype
 
     def _fmt_msg(msg) -> str:
         role = _g(msg, "role", "?")
         content = _g(msg, "content")
-        if content is None or content == "":
+        if not content:
             return f"{role}=[empty]"
         if isinstance(content, str):
             return f"{role}=[text]"
