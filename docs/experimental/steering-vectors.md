@@ -1,5 +1,8 @@
 # Steering vectors
 
+> Mechanism and method comparison. For the end-to-end how-to — generate a
+> vector, sweep strength, wire it into serving — see [`../steering.md`](../steering.md).
+
 Model-level **steering (control) vectors**: a per-layer additive (or
 projective) intervention on the residual stream that nudges a loaded
 model's behaviour, without retraining. Configured per model via

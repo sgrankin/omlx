@@ -3,7 +3,8 @@
 A behavioural survey of the bundled and user-local steering datasets on a
 real model, plus an options matrix (generation method, mode, strength)
 and a multi-vector test. Companion to `steering-vectors.md`, which covers
-the mechanism.
+the mechanism, and [`../steering.md`](../steering.md), which is the
+end-to-end how-to.
 
 ## Setup
 

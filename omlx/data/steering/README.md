@@ -4,7 +4,8 @@ Contrastive prompt datasets for `omlx steering generate`. Each `*.json`
 file is `{"positive": [...], "negative": [...]}` — two equal-length lists
 of prompts. The generator runs each prompt through a model, captures the
 per-layer hidden state, and contrasts the two classes into a steering
-vector (see `docs/experimental/steering-vectors.md`).
+vector (see `docs/steering.md` for the full workflow, or
+`docs/experimental/steering-vectors.md` for the mechanism).
 
 Pass one by name:
 
