@@ -388,11 +388,14 @@ def _per_layer_metrics(
 
     Shared by :func:`analyze_layers` and :func:`generate_steering_vector`
     so the "is this dataset clean?" signal is computed the same way.
+
+    Both callers pass the captured hidden states at the model's own dtype,
+    so cast through MLX first — NumPy cannot read a bfloat16 buffer.
     """
     import numpy as np
 
-    p = np.asarray(pos, dtype=np.float32)
-    n = np.asarray(neg, dtype=np.float32)
+    p = np.asarray(pos.astype(mx.float32))
+    n = np.asarray(neg.astype(mx.float32))
     diff = p - n
     mean_diff = diff.mean(axis=0)
     md_norm = float(np.linalg.norm(mean_diff))

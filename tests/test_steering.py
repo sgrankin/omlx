@@ -462,6 +462,32 @@ def test_per_layer_metrics_keeps_orthogonal_contrast():
     assert ortho_sep > 0.9 * sep  # axis preserved
 
 
+def test_per_layer_metrics_accepts_bfloat16():
+    """Callers pass captured hidden states at the model's own dtype.
+
+    NumPy cannot read a bfloat16 buffer, so the metrics must cast through
+    MLX first — otherwise every bf16 checkpoint fails 'steering layers'.
+    """
+    import mlx.core as mx
+    import numpy as np
+
+    from omlx.steering_generator import _per_layer_metrics
+
+    rng = np.random.default_rng(2)
+    d, n = 16, 32
+    neg_np = rng.normal(scale=0.3, size=(n, d)).astype(np.float32)
+    pos_np = neg_np + 5.0
+
+    f32 = _per_layer_metrics(mx.array(pos_np), mx.array(neg_np))
+    bf16 = _per_layer_metrics(
+        mx.array(pos_np).astype(mx.bfloat16),
+        mx.array(neg_np).astype(mx.bfloat16),
+    )
+    assert all(np.isfinite(v) for v in bf16)
+    for got, want in zip(bf16, f32):
+        assert got == pytest.approx(want, rel=0.05)
+
+
 def test_quality_summary_skips_ortho_warning_when_peak_weak():
     """If everything is weak, the ortho warning is redundant — suppressed."""
     from omlx.steering_generator import _quality_summary
